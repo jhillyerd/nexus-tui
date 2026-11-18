@@ -1,0 +1,459 @@
+use maki_agent::template::Vars;
+use maki_agent::tools::{
+    Authority, DescriptionContext, ToolAudience, ToolFilter, ToolReach, ToolRegistry,
+};
+use maki_config::{Permission, PluginFileConfig, PluginsConfig};
+use regex::Regex;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
+use std::sync::Arc;
+
+use maki_lua::{OptionType, PluginHost};
+
+use crate::lua_util::in_registration_window;
+
+const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+const PERMISSION_LABEL: &str = "**Permission:**";
+const INERT_REACH: &str = "none";
+const UNDECLARED_REACH: &str = "undeclared";
+/// Tools a plugin registers only when one of its boolean options is on, as
+/// (plugin, option, tool).
+const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
+
+pub(crate) const SECTIONS: &[(&str, &[&str])] = &[
+    (
+        "File Operations",
+        &[
+            "bash",
+            "list",
+            "read",
+            "write",
+            "edit",
+            "multiedit",
+            "edit_lines",
+            "insert_lines",
+            "glob",
+            "grep",
+            "index",
+            "view_image",
+        ],
+    ),
+    (
+        "Execution & Control",
+        &["batch", "code_execution", "question"],
+    ),
+    (
+        "Agent & Knowledge",
+        &[
+            "task",
+            "task_stop",
+            "task_message",
+            "todo_write",
+            "memory",
+            "skill",
+        ],
+    ),
+    ("Web", &["webfetch", "websearch"]),
+];
+
+struct Param {
+    name: String,
+    ty: String,
+    required: bool,
+    default: String,
+    description: String,
+}
+
+fn extract_default(desc: &str) -> (String, String) {
+    for pattern in ["(default: ", "(default "] {
+        if let Some(start) = desc.find(pattern) {
+            let after = &desc[start + pattern.len()..];
+            if let Some(end) = after.find(')') {
+                let default_val = after[..end].to_string();
+                let cleaned = format!(
+                    "{}{}",
+                    desc[..start].trim_end(),
+                    &desc[start + pattern.len() + end + 1..]
+                )
+                .trim()
+                .to_string();
+                return (default_val, cleaned);
+            }
+        }
+    }
+    (String::new(), desc.to_string())
+}
+
+fn first_paragraph(desc: &str) -> &str {
+    desc.split("\n\n").next().unwrap_or(desc)
+}
+
+fn extract_params(schema: &Value) -> Vec<Param> {
+    let properties = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut params = Vec::new();
+    for (name, prop) in properties {
+        let raw_type = prop.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+        let raw_desc = prop
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let is_required = required.contains(&name.as_str());
+        let (default, description) = extract_default(raw_desc);
+        params.push(Param {
+            name: name.clone(),
+            ty: raw_type.to_string(),
+            required: is_required,
+            default,
+            description,
+        });
+    }
+    params
+}
+
+fn write_param_table(out: &mut String, params: &[Param]) {
+    let has_defaults = params.iter().any(|p| !p.default.is_empty());
+    let header = if has_defaults {
+        "| Parameter | Type | Required | Default | Description |\n|-----------|------|----------|---------|-------------|"
+    } else {
+        "| Parameter | Type | Required | Description |\n|-----------|------|----------|-------------|"
+    };
+    writeln!(out, "{header}").unwrap();
+    for p in params {
+        let desc = p.description.replace('|', "\\|").replace('\n', "<br>");
+        let required = if p.required { "yes" } else { "no" };
+        if has_defaults {
+            writeln!(
+                out,
+                "| `{}` | {} | {} | {} | {} |",
+                p.name, p.ty, required, p.default, desc
+            )
+            .unwrap();
+        } else {
+            writeln!(out, "| `{}` | {} | {} | {} |", p.name, p.ty, required, desc).unwrap();
+        }
+    }
+}
+
+fn undeclared_exempt() -> String {
+    Permission::ALL
+        .iter()
+        .filter(|&&perm| !Authority::Unbounded.requires(perm))
+        .map(|perm| format!("`{}`", perm.manifest_key()))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+fn reach_label(reach: Option<ToolReach>) -> String {
+    match reach {
+        None => UNDECLARED_REACH.to_owned(),
+        Some(ToolReach::Inert) => INERT_REACH.to_owned(),
+        Some(ToolReach::Capability { permission, .. }) => {
+            format!("`{}`", permission.manifest_key())
+        }
+    }
+}
+
+fn write_tool_entry(
+    out: &mut String,
+    name: &str,
+    (def, reach): &(Value, Option<ToolReach>),
+    opt_in: &HashSet<String>,
+) {
+    let description = def
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    let schema = def.get("input_schema").cloned().unwrap_or(Value::Null);
+    let params = extract_params(&schema);
+    let summary = first_paragraph(description);
+
+    writeln!(out).unwrap();
+    let mut badges = String::new();
+    if opt_in.contains(name) {
+        badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
+    }
+    writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{summary}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{PERMISSION_LABEL} {}", reach_label(*reach)).unwrap();
+    writeln!(out).unwrap();
+    write_param_table(out, &params);
+}
+
+/// Replace `target` with `placeholder`. Empty `target` is a no-op.
+fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
+    if target.is_empty() {
+        input.to_string()
+    } else {
+        input.replace(target, placeholder)
+    }
+}
+
+/// A plugin may bake env-specific values (the cwd, today's date) into its
+/// `description` at registration. Scrub both so `gen-docs-check` is stable
+/// across machines and days. CWD is replaced before HOME so a cwd nested under ~
+/// doesn't get partially mangled.
+fn redact_env_and_dates(input: &str) -> String {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|c| c.to_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut out = redact_path(input, &cwd, "<cwd>");
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        out = redact_path(&out, &home, "~");
+    }
+    DATE_RE.replace_all(&out, DATE_PLACEHOLDER).into_owned()
+}
+
+fn redact_def(def: &Value) -> Value {
+    let Some(d) = def.get("description").and_then(|v| v.as_str()) else {
+        return def.clone();
+    };
+    let redacted = redact_env_and_dates(d);
+    if redacted == d {
+        def.clone()
+    } else {
+        let mut out = def.clone();
+        out["description"] = Value::String(redacted);
+        out
+    }
+}
+
+fn write_front_matter(out: &mut String) {
+    writeln!(out, "+++").unwrap();
+    writeln!(out, "title = \"Tools\"").unwrap();
+    writeln!(out, "weight = 4").unwrap();
+    writeln!(out, "[extra]").unwrap();
+    writeln!(out, "group = \"Reference\"").unwrap();
+    writeln!(out, "+++").unwrap();
+}
+
+/// Loads every builtin with all sub-tools and option-gated tools on, so the
+/// reference documents opt-in tools too. "Opt-in" means the plugin declares
+/// the tool, or the option gating it, as a boolean option defaulting to false,
+/// so the badge cannot drift from the defaults.
+fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
+    let mut edit = PluginFileConfig::default();
+    for &sub in maki_config::EDIT_SUB_TOOLS {
+        edit.opts.insert(sub.to_owned(), Value::Bool(true));
+    }
+    let mut plugins = HashMap::from([("edit".to_owned(), edit)]);
+    for &(plugin, option, _) in OPTION_GATED_TOOLS {
+        plugins
+            .entry(plugin.to_owned())
+            .or_default()
+            .opts
+            .insert(option.to_owned(), Value::Bool(true));
+    }
+    let config = PluginsConfig::from_plugins(plugins);
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = in_registration_window(|| {
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
+        host.load_builtins(&config)
+            .expect("loading builtin plugins");
+        host
+    });
+
+    let mut opt_in: HashSet<String> = host
+        .plugin_options()
+        .expect("collecting plugin options")
+        .into_values()
+        .flatten()
+        .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
+        .map(|o| o.name)
+        .collect();
+    let gated: Vec<String> = OPTION_GATED_TOOLS
+        .iter()
+        .filter(|(_, option, _)| opt_in.contains(*option))
+        .map(|(_, _, tool)| (*tool).to_owned())
+        .collect();
+    opt_in.extend(gated);
+    (registry, opt_in)
+}
+
+pub fn generate() -> String {
+    let vars = Vars::new()
+        .set("{cwd}", "<cwd>")
+        .set("{platform}", "linux")
+        .set("{date}", "YYYY-MM-DD");
+
+    let (registry, opt_in) = load_registry_with_builtins();
+    let defs = registry.definitions(
+        &vars,
+        &DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        },
+        false,
+    );
+    let def_map: HashMap<String, &Value> = defs
+        .as_array()
+        .expect("definitions should be an array")
+        .iter()
+        .filter_map(|t| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| (n.to_string(), t))
+        })
+        .collect();
+
+    let snapshot = registry.iter();
+    let tools: HashMap<&str, (Value, Option<ToolReach>)> = snapshot
+        .iter()
+        .filter_map(|entry| {
+            let def = redact_def(def_map.get(entry.name())?);
+            Some((entry.name(), (def, entry.tool.reach())))
+        })
+        .collect();
+
+    let total = tools.len();
+    let mut out = String::new();
+    write_front_matter(&mut out);
+    writeln!(out).unwrap();
+    writeln!(out, "# Tools").unwrap();
+    writeln!(out).unwrap();
+    let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
+    let default_n = total - opt_in_n;
+    writeln!(
+        out,
+        "Maki ships with {total} built-in tools in this reference \
+         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
+         Tools marked **opt-in** are off until you enable them under `plugins` \
+         in [Configuration](/docs/configuration/)."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "**Permission** is the [plugin permission](/docs/lua-api/#plugin-permissions) \
+         a tool declares. A plugin must hold it to [hook](/docs/hooks/#rules) the tool \
+         or to give the tool to a `maki.agent` session. A tool marked {INERT_REACH} \
+         reaches nothing past the conversation. A tool marked {UNDECLARED_REACH} \
+         may reach anything, so it costs every permission except {}.",
+        undeclared_exempt()
+    )
+    .unwrap();
+
+    let mut rendered: HashSet<&str> = HashSet::new();
+
+    for (section_name, tool_names) in SECTIONS {
+        let present: Vec<&str> = tool_names
+            .iter()
+            .copied()
+            .filter(|n| tools.contains_key(*n))
+            .collect();
+        if present.is_empty() {
+            continue;
+        }
+        writeln!(out).unwrap();
+        writeln!(out, "## {section_name}").unwrap();
+        for name in present {
+            let def = tools.get(name).expect("checked above");
+            write_tool_entry(&mut out, name, def, &opt_in);
+            rendered.insert(name);
+        }
+    }
+
+    let mut leftovers: Vec<&str> = tools
+        .keys()
+        .filter(|n| !rendered.contains(*n))
+        .copied()
+        .collect();
+    leftovers.sort_unstable();
+    if !leftovers.is_empty() {
+        writeln!(out).unwrap();
+        writeln!(out, "## Additional tools").unwrap();
+        for name in leftovers {
+            let def = tools.get(name).expect("checked above");
+            write_tool_entry(&mut out, name, def, &opt_in);
+        }
+    }
+
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+static DATE_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("valid date regex"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case("2026-07-05", "YYYY-MM-DD"; "simple date")]
+    #[test_case("today is 2026-07-05 here", "today is YYYY-MM-DD here"; "embedded date")]
+    #[test_case("v2024-01-15", "vYYYY-MM-DD"; "prefix embedded")]
+    #[test_case("2026-7-5", "2026-7-5"; "single digit not matched")]
+    #[test_case("no date here", "no date here"; "no date")]
+    #[test_case("2026-07-05 and 2025-12-31", "YYYY-MM-DD and YYYY-MM-DD"; "two dates")]
+    fn redacts_date(input: &str, expected: &str) {
+        // redact_env_and_dates also scrubs HOME/cwd; isolate date logic by
+        // calling the regex replacement directly.
+        assert_eq!(
+            DATE_RE.replace_all(input, DATE_PLACEHOLDER).as_ref(),
+            expected
+        );
+    }
+
+    #[test_case("/home/user/repo", "/home/user", "~", "~/repo"; "path under home")]
+    #[test_case("/home/user", "/home/user", "~", "~"; "exact home")]
+    #[test_case("/elsewhere", "/home/user", "~", "/elsewhere"; "unrelated path")]
+    #[test_case("any", "", "<cwd>", "any"; "empty target no-op")]
+    #[test_case("", "/home/user", "~", ""; "empty input")]
+    fn redacts_path(input: &str, target: &str, placeholder: &str, expected: &str) {
+        assert_eq!(redact_path(input, target, placeholder), expected);
+    }
+
+    #[test_case("$(default: foo)", "foo", "$"; "colon form")]
+    #[test_case("desc (default bar) suffix", "bar", "desc suffix"; "space form")]
+    #[test_case("prefix (default: baz) extra", "baz", "prefix extra"; "in middle")]
+    #[test_case("plain description", "", "plain description"; "no default")]
+    fn extracts_default(input: &str, expected_default: &str, remaining_prefix: &str) {
+        let (default, cleaned) = extract_default(input);
+        assert_eq!(default, expected_default);
+        assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
+    }
+
+    #[test]
+    fn sections_partition_registered_tools() {
+        let (registry, _) = load_registry_with_builtins();
+        let snapshot = registry.iter();
+        let registered: HashSet<&str> = snapshot.iter().map(|e| e.name()).collect();
+
+        let mut sectioned: HashSet<&str> = HashSet::new();
+        for (_, names) in SECTIONS {
+            for &n in *names {
+                assert!(
+                    registered.contains(n),
+                    "SECTIONS references \"{n}\" which isn't a registered tool"
+                );
+                assert!(sectioned.insert(n), "\"{n}\" appears in multiple sections");
+            }
+        }
+
+        let unsectioned: Vec<&str> = registered.difference(&sectioned).copied().collect();
+        assert!(
+            unsectioned.is_empty(),
+            "registered tools missing from SECTIONS: {unsectioned:?}"
+        );
+    }
+}

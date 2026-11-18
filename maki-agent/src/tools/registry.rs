@@ -1,0 +1,788 @@
+//! Single source of truth for all Lua plugin tools. One registry, one lookup path, no parallel
+//! lists that can drift. MCP tools are not in here, they live in [`crate::mcp`].
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use bitflags::bitflags;
+use maki_config::Permission;
+use serde_json::{Value, json};
+
+use crate::template::Vars;
+use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
+
+use super::hook::ToolHook;
+use super::schema::sanitize_tool_input_schema;
+use super::{DescriptionContext, ToolContext, ToolFilter};
+use crate::agent::AgentHook;
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ToolAudience: u8 {
+        const MAIN         = 0b0000_0001;
+        const RESEARCH_SUB = 0b0000_0010;
+        const GENERAL_SUB  = 0b0000_0100;
+        const INTERPRETER  = 0b0000_1000;
+        const WORKFLOW     = 0b0001_0000;
+        /// Every audience a model speaks from, and none of the ones a sandbox
+        /// calls from: the default for a tool whose owner never opted into
+        /// being called by a script.
+        const MODEL = Self::MAIN.bits() | Self::RESEARCH_SUB.bits() | Self::GENERAL_SUB.bits();
+    }
+}
+
+/// What a tool declares it reaches: the price of hooking it, pre-approving it
+/// or handing it to a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolReach {
+    /// Declared to reach nothing past the conversation it runs in.
+    Inert,
+    /// `permission` is the capability it exposes to the model. `prompted`
+    /// tells whether a call ever meets the permission prompt, because a rule
+    /// pre-approving a tool that never prompts would never be consulted.
+    Capability {
+        permission: Permission,
+        prompted: bool,
+    },
+}
+
+impl ToolReach {
+    pub fn permission(self) -> Option<Permission> {
+        match self {
+            Self::Inert => None,
+            Self::Capability { permission, .. } => Some(permission),
+        }
+    }
+}
+
+impl Default for ToolAudience {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+pub const AUDIENCE_NAMES: &[(ToolAudience, &str)] = &[
+    (ToolAudience::MAIN, "main"),
+    (ToolAudience::RESEARCH_SUB, "research_sub"),
+    (ToolAudience::GENERAL_SUB, "general_sub"),
+    (ToolAudience::INTERPRETER, "interpreter"),
+    (ToolAudience::WORKFLOW, "workflow"),
+];
+
+impl ToolAudience {
+    pub fn name(self) -> Option<&'static str> {
+        AUDIENCE_NAMES
+            .iter()
+            .find(|(flag, _)| *flag == self)
+            .map(|(_, name)| *name)
+    }
+
+    pub fn parse_name(name: &str) -> Option<Self> {
+        AUDIENCE_NAMES
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(flag, _)| *flag)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSource {
+    pub plugin: Arc<str>,
+}
+
+impl ToolSource {
+    pub fn as_log_field(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("lua:{}", self.plugin))
+    }
+}
+
+pub type ParseError = super::schema::ToolInputError;
+
+pub struct ToolExecResult {
+    pub output: Result<ToolOutput, String>,
+    pub annotation: Option<String>,
+    pub written_path: Option<String>,
+    /// Set when `output` is a receipt: the call moved and finishes in the
+    /// background.
+    pub moved: Option<MovedCall>,
+}
+
+/// Settles a moved call with its filtered final reply, `None` when there is
+/// none to give.
+pub type MovedLand = Box<dyn FnOnce(Option<ToolDoneEvent>) + Send>;
+
+/// The rest of a call that moved to the background. Dispatch runs the receipt
+/// and then `result` through the output pipeline every call's output takes,
+/// and hands the result to `land`, so no output of a moved call reaches the
+/// model unfiltered.
+pub struct MovedCall {
+    /// `None` when the work ended without a reply.
+    pub result: BoxFuture<'static, Option<ToolExecResult>>,
+    /// Dropped uncalled exactly when the receipt was never published to the
+    /// model: the call never moved as far as anyone was told. Once published,
+    /// it is called exactly once, with `None` when the work or the pipeline
+    /// died, so the model hears what became of the call.
+    pub land: MovedLand,
+}
+
+impl From<Result<ToolOutput, String>> for ToolExecResult {
+    fn from(output: Result<ToolOutput, String>) -> Self {
+        Self {
+            output,
+            annotation: None,
+            written_path: None,
+            moved: None,
+        }
+    }
+}
+
+impl ToolExecResult {
+    pub fn with_written_path(mut self, path: Option<String>) -> Self {
+        if self.output.is_ok() {
+            self.written_path = path;
+        }
+        self
+    }
+}
+
+pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = ToolExecResult> + Send + 'a>>;
+
+#[derive(Debug, Clone)]
+pub enum HeaderResult {
+    Plain(String),
+    Styled(BufferSnapshot),
+}
+
+impl HeaderResult {
+    pub fn plain(text: String) -> Self {
+        Self::Plain(text)
+    }
+
+    pub fn text(&self) -> String {
+        match self {
+            Self::Plain(t) => t.clone(),
+            Self::Styled(snap) => snap.first_line_text(),
+        }
+    }
+
+    pub fn snapshot(self) -> Option<BufferSnapshot> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Styled(snap) => Some(snap),
+        }
+    }
+
+    pub fn into_snapshot(self) -> BufferSnapshot {
+        match self {
+            Self::Plain(text) => BufferSnapshot::plain_text(text),
+            Self::Styled(snap) => snap,
+        }
+    }
+}
+
+pub enum HeaderFuture {
+    Ready(HeaderResult),
+    Pending {
+        fallback: String,
+        fut: Pin<Box<dyn Future<Output = HeaderResult> + Send>>,
+    },
+}
+
+impl HeaderFuture {
+    pub fn into_ready(self) -> HeaderResult {
+        match self {
+            Self::Ready(r) => r,
+            Self::Pending { fallback, .. } => HeaderResult::plain(fallback),
+        }
+    }
+}
+
+impl Future for HeaderFuture {
+    type Output = HeaderResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<HeaderResult> {
+        match self.get_mut() {
+            Self::Ready(r) => Poll::Ready(std::mem::replace(r, HeaderResult::plain(String::new()))),
+            Self::Pending { fut, .. } => fut.as_mut().poll(cx),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PermissionScopes {
+    pub scopes: Vec<String>,
+    pub force_prompt: bool,
+}
+
+impl PermissionScopes {
+    pub fn single(scope: String) -> Self {
+        Self {
+            scopes: vec![scope],
+            force_prompt: false,
+        }
+    }
+
+    pub fn force_prompt(scope: String) -> Self {
+        Self {
+            scopes: vec![scope],
+            force_prompt: true,
+        }
+    }
+}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Holds the parsed input so start-event and `execute` share one parse pass.
+/// `permission_scopes` and `mutable_path` belong here because only the parsed
+/// call knows which file it will touch.
+pub trait ToolInvocation: Send + Sync {
+    fn start_header(&self) -> HeaderFuture;
+    fn start_annotation(&self) -> Option<String> {
+        None
+    }
+    fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
+        None
+    }
+    fn mutable_path(&self) -> Option<&Path> {
+        None
+    }
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        Box::pin(std::future::ready(None))
+    }
+    /// Runs after `ToolStart` but before permission enforcement, so a tool
+    /// can paint a preview while the prompt is still up. Some call paths skip
+    /// it, so `execute` must never rely on it having run.
+    fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a>;
+}
+
+pub trait Tool: Send + Sync + 'static {
+    fn name(&self) -> &str;
+    fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
+    fn schema(&self) -> Value;
+    /// The schema the model is shown, or `None` to leave the tool out of its
+    /// array. `background` is whether the model can move a call to the
+    /// background itself. A tool that offers a parameter only for that
+    /// narrows it here, so the decision is made when the array is built and
+    /// the array never changes after.
+    fn offered_schema(&self, _background: bool) -> Option<Value> {
+        Some(self.schema())
+    }
+    fn examples(&self) -> Option<Value> {
+        None
+    }
+    fn audience(&self) -> ToolAudience {
+        ToolAudience::default()
+    }
+    fn tool_kind(&self) -> Option<&str> {
+        None
+    }
+    /// `None` is undeclared reach, which every consumer prices as everything.
+    /// Only an explicit [`ToolReach::Inert`] is free.
+    fn reach(&self) -> Option<ToolReach> {
+        None
+    }
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
+}
+
+#[derive(Clone)]
+pub struct RegisteredTool {
+    pub tool: Arc<dyn Tool>,
+    pub source: ToolSource,
+}
+
+impl RegisteredTool {
+    pub fn name(&self) -> &str {
+        self.tool.name()
+    }
+
+    /// Parse without naming `ParseError`, handy for crates outside `maki-agent`.
+    pub fn try_parse(&self, input: &serde_json::Value) -> Option<Box<dyn ToolInvocation>> {
+        self.tool.parse(input).ok()
+    }
+}
+
+/// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
+pub struct ToolRegistry {
+    tools: ArcSwap<Vec<RegisteredTool>>,
+    /// Whoever may rewrite or stop a call before and after it runs. One per
+    /// registry rather than one per tool, so a tool arriving from a new place
+    /// is hookable the day it lands.
+    hook: ArcSwapOption<Box<dyn ToolHook>>,
+    /// The agent loop's own slots. They live here because the registry is the
+    /// one handle every run already carries.
+    agent_hook: ArcSwapOption<Box<dyn AgentHook>>,
+}
+
+/// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
+/// it at every call site.
+pub type InstalledHook = Arc<Box<dyn ToolHook>>;
+pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("tool '{name}' is already registered (existing source: {existing})")]
+    NameConflict { name: String, existing: String },
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self {
+            tools: ArcSwap::from_pointee(Vec::new()),
+            hook: ArcSwapOption::empty(),
+            agent_hook: ArcSwapOption::empty(),
+        }
+    }
+
+    /// Installed by the plugin host once its Lua thread is up. Last writer
+    /// wins, so a registry outliving the host that hooked it points at the
+    /// host that replaced it, never at the dead one.
+    pub fn set_hook(&self, hook: impl ToolHook) {
+        let boxed: Box<dyn ToolHook> = Box::new(hook);
+        self.hook.store(Some(Arc::new(boxed)));
+    }
+
+    pub fn hook(&self) -> Option<InstalledHook> {
+        self.hook.load_full()
+    }
+
+    /// Same lifetime rule as [`Self::set_hook`].
+    pub fn set_agent_hook(&self, hook: impl AgentHook) {
+        let boxed: Box<dyn AgentHook> = Box::new(hook);
+        self.agent_hook.store(Some(Arc::new(boxed)));
+    }
+
+    pub fn agent_hook(&self) -> Option<InstalledAgentHook> {
+        self.agent_hook.load_full()
+    }
+
+    /// The process-wide registry. Every tool in it comes from a Lua plugin;
+    /// Rust itself registers nothing.
+    pub fn global() -> &'static Self {
+        Self::global_arc()
+    }
+
+    pub fn global_arc() -> &'static Arc<Self> {
+        static GLOBAL: LazyLock<Arc<ToolRegistry>> =
+            LazyLock::new(|| Arc::new(ToolRegistry::new()));
+        &GLOBAL
+    }
+
+    pub fn get(&self, name: &str) -> Option<RegisteredTool> {
+        self.tools.load().iter().find(|t| t.name() == name).cloned()
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.tools.load().iter().any(|t| t.name() == name)
+    }
+
+    pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
+        let name = tool.name().to_owned();
+        let mut conflict = None;
+        self.tools.rcu(|current| {
+            conflict = None;
+            if let Some(existing) = current.iter().find(|t| t.name() == name) {
+                conflict = Some(existing.source.as_log_field().into_owned());
+                return Vec::clone(current);
+            }
+            let mut next = Vec::with_capacity(current.len() + 1);
+            next.extend(current.iter().cloned());
+            next.push(RegisteredTool {
+                tool: Arc::clone(&tool),
+                source: source.clone(),
+            });
+            next
+        });
+        if let Some(existing) = conflict {
+            return Err(RegistryError::NameConflict { name, existing });
+        }
+        Ok(())
+    }
+
+    pub fn replace_plugin(
+        &self,
+        plugin: &str,
+        new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
+    ) -> Result<(), RegistryError> {
+        let mut conflict = None;
+        self.tools.rcu(|current| {
+            conflict = None;
+            let mut next: Vec<RegisteredTool> = current
+                .iter()
+                .filter(|t| t.source.plugin.as_ref() != plugin)
+                .cloned()
+                .collect();
+            for (tool, source) in &new_entries {
+                let name = tool.name();
+                if let Some(existing) = next.iter().find(|t| t.name() == name) {
+                    conflict = Some(RegistryError::NameConflict {
+                        name: name.to_owned(),
+                        existing: existing.source.as_log_field().into_owned(),
+                    });
+                    return Vec::clone(current);
+                }
+                next.push(RegisteredTool {
+                    tool: Arc::clone(tool),
+                    source: source.clone(),
+                });
+            }
+            next
+        });
+        if let Some(e) = conflict {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn clear_lua(&self) {
+        self.tools.store(Arc::default());
+    }
+
+    pub fn clear_plugin(&self, plugin: &str) {
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(|t| t.source.plugin.as_ref() != plugin)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
+
+    /// Human-friendly summary of an invocation; the raw tool name when
+    /// there is nothing better.
+    pub fn resolve_header(&self, name: &str, input: &Value) -> String {
+        self.start_header(name, input)
+            .map(|header| header.into_ready().text())
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The header of a call to `name`, which a plugin tool answers later.
+    pub fn start_header(&self, name: &str, input: &Value) -> Option<HeaderFuture> {
+        self.get(name)
+            .and_then(|e| e.try_parse(input))
+            .map(|inv| inv.start_header())
+    }
+
+    /// Plugins that registered tools of which `filter` lets none through.
+    pub fn plugins_filtered_out(&self, filter: &ToolFilter) -> Vec<Arc<str>> {
+        let tools = self.tools.load();
+        let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
+        for tool in tools.iter() {
+            *visible.entry(&tool.source.plugin).or_default() |= filter.matches(tool.name());
+        }
+        visible
+            .into_iter()
+            .filter(|(_, visible)| !visible)
+            .map(|(plugin, _)| Arc::clone(plugin))
+            .collect()
+    }
+
+    pub fn names(&self) -> Vec<Arc<str>> {
+        self.tools
+            .load()
+            .iter()
+            .map(|t| Arc::from(t.name()))
+            .collect()
+    }
+
+    pub fn definitions(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+    ) -> Value {
+        self.definitions_with_background(vars, ctx, supports_examples, true)
+    }
+
+    /// `background` is whether the session can move calls to the background.
+    /// Only the main agent ever moves one itself, so every other audience is
+    /// built as if it were off.
+    pub fn definitions_with_background(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        background: bool,
+    ) -> Value {
+        let background = background && ctx.audience.contains(ToolAudience::MAIN);
+        let snapshot = self.tools.load();
+        let mut out = Vec::with_capacity(snapshot.len());
+        for entry in snapshot.iter() {
+            if !entry.tool.audience().contains(ctx.audience) {
+                continue;
+            }
+            if !ctx.filter.matches(entry.name()) {
+                continue;
+            }
+            let Some(schema) = entry.tool.offered_schema(background) else {
+                continue;
+            };
+            let description = vars.apply(&entry.tool.description(ctx)).into_owned();
+            let mut def = json!({
+                "name": entry.name(),
+                "description": description,
+                "input_schema": sanitize_tool_input_schema(schema),
+            });
+            if let Some(examples) = entry.tool.examples() {
+                if supports_examples {
+                    def["input_examples"] = examples;
+                } else if let Some(text) = format_examples_as_text(&examples) {
+                    let merged =
+                        format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
+                    def["description"] = Value::String(merged);
+                }
+            }
+            out.push(def);
+        }
+        Value::Array(out)
+    }
+
+    pub fn iter(&self) -> RegistrySnapshot {
+        RegistrySnapshot(self.tools.load_full())
+    }
+}
+
+pub struct RegistrySnapshot(Arc<Vec<RegisteredTool>>);
+
+impl RegistrySnapshot {
+    pub fn iter(&self) -> std::slice::Iter<'_, RegisteredTool> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn format_examples_as_text(examples: &Value) -> Option<String> {
+    let arr = examples.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut text = String::from("Examples:");
+    for ex in arr {
+        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
+            text.push_str("\n```\n");
+            text.push_str(code);
+            text.push_str("\n```");
+        }
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::template::Vars;
+    use test_case::test_case;
+
+    use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
+
+    const ANY_TOOL_NAME: &str = "schemaless";
+    const EMPTY_SCHEMA_REJECTED: &str =
+        "strict providers reject a function whose parameters is empty";
+
+    fn mock(name: &str) -> Arc<dyn Tool> {
+        mock_tool(name, ToolAudience::all())
+    }
+
+    fn lua_source(plugin: &str) -> ToolSource {
+        ToolSource {
+            plugin: plugin.into(),
+        }
+    }
+
+    #[test]
+    fn name_conflict_is_rejected() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("dupe"), lua_source("p")).unwrap();
+        let err = reg.register(mock("dupe"), lua_source("p")).unwrap_err();
+        assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn definitions_never_send_an_empty_schema() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_tool_with_schema(ANY_TOOL_NAME, ToolAudience::all(), json!({})),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let filter = crate::tools::ToolFilter::All;
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let defs = reg.definitions(&Vars::new(), &ctx, false);
+        assert_eq!(
+            defs[0]["input_schema"],
+            json!({"type": "object", "properties": {}, "additionalProperties": true}),
+            "{EMPTY_SCHEMA_REJECTED}"
+        );
+    }
+
+    #[test]
+    fn definitions_reflects_mid_session_registration() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("late_plugin.probe"), lua_source("late_plugin"))
+            .unwrap();
+
+        let filter = crate::tools::ToolFilter::All;
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let vars = Vars::new();
+        let defs = reg.definitions(&vars, &ctx, false);
+        let arr = defs.as_array().expect("definitions returns array");
+        assert!(
+            arr.iter()
+                .any(|d| d["name"].as_str() == Some("late_plugin.probe")),
+            "mid-session tool missing from definitions"
+        );
+    }
+
+    /// `/reload` re-registers the same lua tool names, so anything
+    /// `clear_lua` leaves behind becomes a `NameConflict` that breaks every
+    /// later reload.
+    #[test]
+    fn clear_lua_removes_lua_and_allows_reregistration() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("lua_a"), lua_source("p1")).unwrap();
+        reg.register(mock("lua_b"), lua_source("p2")).unwrap();
+
+        reg.clear_lua();
+
+        assert!(!reg.has("lua_a"));
+        assert!(!reg.has("lua_b"));
+
+        reg.register(mock("lua_a"), lua_source("p1")).unwrap();
+        reg.register(mock("lua_b"), lua_source("p2")).unwrap();
+        assert!(reg.has("lua_a"));
+        assert!(reg.has("lua_b"));
+    }
+
+    #[test]
+    fn clear_plugin_removes_only_that_plugin() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("pluginA.foo"), lua_source("pluginA"))
+            .unwrap();
+        reg.register(mock("pluginB.bar"), lua_source("pluginB"))
+            .unwrap();
+
+        reg.clear_plugin("pluginA");
+
+        assert!(!reg.has("pluginA.foo"));
+        assert!(reg.has("pluginB.bar"));
+    }
+
+    #[test]
+    fn replace_plugin_swaps_own_tools() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("mytool"), lua_source("myplugin"))
+            .unwrap();
+
+        reg.replace_plugin("myplugin", vec![(mock("mytool"), lua_source("myplugin"))])
+            .unwrap();
+
+        let entry = reg.get("mytool").unwrap();
+        assert_eq!(entry.source.plugin.as_ref(), "myplugin");
+
+        reg.clear_plugin("myplugin");
+        assert!(!reg.has("mytool"));
+    }
+
+    #[test]
+    fn replace_plugin_rejects_conflict_with_other_plugin() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("shared"), lua_source("other")).unwrap();
+
+        let err = reg
+            .replace_plugin("myplugin", vec![(mock("shared"), lua_source("myplugin"))])
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn audience_names_round_trip() {
+        let mut union = ToolAudience::empty();
+        for (flag, name) in AUDIENCE_NAMES {
+            assert_eq!(flag.name(), Some(*name));
+            assert_eq!(ToolAudience::parse_name(name), Some(*flag));
+            union |= *flag;
+        }
+        assert_eq!(union, ToolAudience::all());
+        assert_eq!(ToolAudience::parse_name("nope"), None);
+        assert_eq!(ToolAudience::all().name(), None);
+    }
+
+    #[test]
+    fn definitions_excludes_wrong_audience() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_tool("main_only_tool", ToolAudience::MAIN),
+            lua_source("p"),
+        )
+        .unwrap();
+        reg.register(mock("everywhere"), lua_source("p")).unwrap();
+
+        let vars = Vars::new();
+        let filter = crate::tools::ToolFilter::All;
+        let names_for = |audience: ToolAudience| -> Vec<String> {
+            let ctx = DescriptionContext {
+                filter: &filter,
+                audience,
+                workflow: false,
+                mcp: false,
+            };
+            reg.definitions(&vars, &ctx, false)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            names_for(ToolAudience::MAIN),
+            vec!["main_only_tool", "everywhere"]
+        );
+        assert_eq!(names_for(ToolAudience::RESEARCH_SUB), vec!["everywhere"]);
+        assert_eq!(names_for(ToolAudience::GENERAL_SUB), vec!["everywhere"]);
+    }
+
+    #[test_case(Err("boom".into()), Some("/tmp/foo".into()), None          ; "clears_on_error")]
+    #[test_case(Ok(ToolOutput::Plain("ok".into())), Some("/tmp/foo".into()), Some("/tmp/foo") ; "sets_on_success")]
+    fn with_written_path(
+        base: Result<ToolOutput, String>,
+        path: Option<String>,
+        expected: Option<&str>,
+    ) {
+        let result: ToolExecResult = base.into();
+        let result = result.with_written_path(path);
+        assert_eq!(result.written_path.as_deref(), expected);
+    }
+}

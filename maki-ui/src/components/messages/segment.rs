@@ -1,0 +1,742 @@
+use crate::render_worker::RenderWorker;
+use crate::repaint::Dirty;
+use crate::terminal_image::InlineImage;
+use crate::theme;
+use crate::wrap;
+use maki_providers::ImageSource;
+use std::sync::Arc;
+
+use super::super::code_view::SectionFlags;
+use super::super::tool_display::{ElapsedSpan, HighlightRequest, ToolLines};
+use ratatui::text::{Line, Span};
+use std::cell::Cell;
+use std::mem;
+use std::ops::Range;
+use std::time::Duration;
+
+pub(crate) const GUTTER_COLS: u16 = 2;
+const INST_SUFFIX: &str = "__inst";
+const ELAPSED_STEP: Duration = Duration::from_secs(1);
+
+/// On a pane no wider than the gutter the body would get no room, so there
+/// the gutter steps aside. Everything that wraps, draws, copies or clicks asks
+/// here, so they always agree on where the body starts.
+fn gutter_cols(width: u16) -> u16 {
+    if width > GUTTER_COLS { GUTTER_COLS } else { 0 }
+}
+
+pub(crate) fn body_width(width: u16) -> u16 {
+    width - gutter_cols(width)
+}
+
+pub fn is_instruction_segment(id: &str) -> bool {
+    id.ends_with(INST_SUFFIX)
+}
+
+pub fn instruction_id(parent_id: &str) -> String {
+    format!("{parent_id}{INST_SUFFIX}")
+}
+
+pub fn instruction_parent(id: &str) -> Option<&str> {
+    id.strip_suffix(INST_SUFFIX)
+}
+
+#[derive(Clone, Copy, Default)]
+struct CachedHeight {
+    at_width: u16,
+    height: u16,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct HighlightKey {
+    has_output: bool,
+    theme_gen: u64,
+}
+
+impl HighlightKey {
+    /// The generation is read here rather than passed in: a theme only swaps
+    /// from `update`, never mid-`view`, and a missed call site would silently
+    /// splice old-palette lines back in.
+    fn from_request(hl: Option<&HighlightRequest>) -> Self {
+        Self {
+            has_output: hl.is_some_and(|h| h.output.is_some()),
+            theme_gen: theme::generation(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Segment {
+    lines: Vec<Line<'static>>,
+    pub images: Vec<InlineImage>,
+    pub tool_id: Option<String>,
+    /// Drawn on the first row only, left of the body. The height cache does
+    /// not see it, so set it before `set_lines`.
+    pub gutter: Option<Span<'static>>,
+    gutter_spins: bool,
+    /// Backlink to `self.messages`, set only by `with_lines`. A click on a
+    /// collapsed thinking view has no tool_id to route by, so this is how
+    /// the click finds its message. Rendering also reads it to give user
+    /// messages the `user_bg` base style.
+    pub msg_index: Option<usize>,
+    /// What a click can expand. On thinking, `output` means it is drawn
+    /// collapsed: the click answers what the reader sees, not the config.
+    pub truncation: SectionFlags,
+    cached_height: Cell<Option<CachedHeight>>,
+    pending_highlight: Option<u64>,
+    highlight_range: Option<(usize, usize)>,
+    highlight_key: HighlightKey,
+    pub spinner_lines: Vec<(usize, usize)>,
+    elapsed: Option<ElapsedSpan>,
+    snapshot_base: Option<usize>,
+    /// The lines were built for another width or theme, so code blocks and
+    /// tables are still wrapped to the old width and spans carry the old
+    /// palette. Only the content ages, never the height, so a segment the
+    /// reflow window never reaches merely looks dated; it cannot desync the
+    /// layout from what is painted.
+    ///
+    /// Cleared by `set_lines` (whole vector replaced) and up front by
+    /// `reflow_segment`; partial splices (`apply_highlight_result`) leave it
+    /// set so the segment still reflows later.
+    pub(super) stale: bool,
+}
+
+impl Segment {
+    pub fn with_tool(tool_id: String) -> Self {
+        Self {
+            tool_id: Some(tool_id),
+            ..Self::default()
+        }
+    }
+
+    pub fn spacer() -> Self {
+        Self {
+            lines: vec![Line::default()],
+            ..Self::default()
+        }
+    }
+
+    pub fn with_lines(lines: Vec<Line<'static>>, msg_index: Option<usize>) -> Self {
+        Self {
+            lines,
+            msg_index,
+            ..Self::default()
+        }
+    }
+
+    pub fn lines(&self) -> &[Line<'static>] {
+        &self.lines
+    }
+
+    pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.lines = lines;
+        self.stale = false;
+        self.invalidate_height();
+    }
+
+    /// Rows the lines take at `width`, measured at that width whatever
+    /// [`Self::stale`] says. Render, [`super::scroll::Layout`], the scrollbar
+    /// and the copy path all read this one number, so none of them can
+    /// disagree on how tall a segment is.
+    pub fn height(&self, width: u16) -> u16 {
+        self.images
+            .iter()
+            .fold(self.text_height(width), |height, image| {
+                height.saturating_add(image.height())
+            })
+    }
+
+    pub fn set_images(
+        &mut self,
+        sources: impl Iterator<Item = (ImageSource, Option<&'static str>)>,
+    ) {
+        let mut previous = mem::take(&mut self.images).into_iter();
+        self.images = sources
+            .map(|(source, fallback)| {
+                previous
+                    .next()
+                    .filter(|image| Arc::ptr_eq(&image.source().data, &source.data))
+                    .unwrap_or_else(|| InlineImage::new(source, fallback))
+            })
+            .collect();
+    }
+
+    pub fn poll_images(&mut self) -> Dirty {
+        Dirty::any(self.images.iter_mut().map(InlineImage::poll))
+    }
+
+    pub fn release_images(&mut self) {
+        for image in &mut self.images {
+            image.release();
+        }
+    }
+
+    pub fn gutter_cols(&self, width: u16) -> u16 {
+        self.gutter.as_ref().map_or(0, |_| gutter_cols(width))
+    }
+
+    pub fn body_width(&self, width: u16) -> u16 {
+        width - self.gutter_cols(width)
+    }
+
+    pub fn text_height(&self, width: u16) -> u16 {
+        if let Some(c) = self.cached_height.get()
+            && c.at_width == width
+        {
+            return c.height;
+        }
+        let h = wrap::total_rows(&self.lines, self.body_width(width));
+        self.cached_height.set(Some(CachedHeight {
+            at_width: width,
+            height: h,
+        }));
+        h
+    }
+
+    /// Maps a display row (after wrapping) back to the source line index.
+    pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
+        self.rows_from(rel_row, width).line()
+    }
+
+    /// A cursor parked on the source line that covers display row `start_row`.
+    pub fn rows_from(&self, start_row: u16, width: u16) -> RowWalk<'_> {
+        let mut walk = RowWalk {
+            lines: &self.lines,
+            measure: wrap::Measure::new(self.body_width(width)),
+            next_line: 0,
+            row: 0,
+        };
+        walk.seek(start_row);
+        walk
+    }
+
+    /// Maps a source line to a 1-based row in the tool's live buffer, or 0
+    /// for lines outside it (header etc.). The Lua click-row contract is
+    /// computed here and nowhere else, from the base recorded when the
+    /// buffer snapshot was laid out.
+    pub fn buf_row(&self, source_line: usize) -> usize {
+        match self.snapshot_base {
+            Some(base) if source_line >= base => source_line - base + 1,
+            _ => 0,
+        }
+    }
+
+    fn invalidate_height(&self) {
+        self.cached_height.set(None);
+    }
+
+    pub fn update_spinners(&mut self, span: &Span<'static>) {
+        if self.gutter_spins {
+            self.gutter = Some(span.clone());
+        }
+        for &(line_idx, span_idx) in &self.spinner_lines {
+            if let Some(line) = self.lines.get_mut(line_idx)
+                && line.spans.len() > span_idx
+            {
+                line.spans[span_idx] = span.clone();
+            }
+        }
+    }
+
+    /// How long until the elapsed time shown here goes stale: zero once it
+    /// has, else the rest of the current second.
+    pub fn elapsed_due(&self) -> Option<Duration> {
+        let elapsed = self.elapsed.as_ref()?;
+        let since = elapsed.since.elapsed();
+        if since.as_secs() != elapsed.shown_secs {
+            return Some(Duration::ZERO);
+        }
+        Some(ELAPSED_STEP.saturating_sub(Duration::from_nanos(u64::from(since.subsec_nanos()))))
+    }
+
+    /// Rewrites the elapsed time once per second. The text can change width,
+    /// so the cached height goes with it.
+    pub fn update_elapsed(&mut self) {
+        let Some(elapsed) = &mut self.elapsed else {
+            return;
+        };
+        let secs = elapsed.since.elapsed().as_secs();
+        if secs == elapsed.shown_secs {
+            return;
+        }
+        elapsed.shown_secs = secs;
+        if let Some(header) = self.lines.first_mut() {
+            elapsed.refit(header, secs);
+        }
+        self.invalidate_height();
+    }
+
+    fn reuse_highlight(
+        &self,
+        key: &HighlightKey,
+        new_range: (usize, usize),
+    ) -> Option<Vec<Line<'static>>> {
+        if self.pending_highlight.is_some() || self.highlight_key != *key {
+            return None;
+        }
+        let (s, e) = self.highlight_range?;
+        if s > e || e > self.lines.len() {
+            return None;
+        }
+        if (e - s) != (new_range.1 - new_range.0) {
+            return None;
+        }
+        Some(self.lines[s..e].to_vec())
+    }
+
+    pub fn apply_highlight(&mut self, tl: ToolLines, worker: &RenderWorker) {
+        self.pending_highlight = tl.send_highlight(worker);
+        self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
+        self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
+        self.spinner_lines = tl.spinner_lines;
+        self.gutter = Some(tl.gutter);
+        self.gutter_spins = tl.gutter_spins;
+        self.elapsed = tl.elapsed;
+        self.snapshot_base = tl.snapshot_base;
+        self.truncation = tl.truncation;
+        self.set_lines(tl.lines);
+    }
+
+    pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
+        let key = HighlightKey::from_request(tl.highlight.as_ref());
+        let reused = tl.highlight.as_ref().and_then(|req| {
+            let hl_lines = self.reuse_highlight(&key, req.range)?;
+            let (s, _) = req.range;
+            let new_end = s + hl_lines.len();
+            tl.lines.splice(s..req.range.1, hl_lines);
+            Some((s, new_end))
+        });
+        self.truncation = tl.truncation;
+        if let Some((s, e)) = reused {
+            self.gutter = Some(tl.gutter);
+            self.gutter_spins = tl.gutter_spins;
+            self.set_lines(tl.lines);
+            self.highlight_range = Some((s, e));
+            self.pending_highlight = None;
+            self.spinner_lines = tl.spinner_lines;
+            self.elapsed = tl.elapsed;
+            self.snapshot_base = tl.snapshot_base;
+        } else {
+            self.apply_highlight(tl, worker);
+        }
+    }
+
+    pub fn matches_pending_highlight(&self, id: u64) -> bool {
+        self.pending_highlight == Some(id)
+    }
+
+    pub fn apply_highlight_result(&mut self, lines: Vec<Line<'static>>) {
+        if let Some((start, end)) = self.highlight_range {
+            let new_end = start + lines.len();
+            self.lines.splice(start..end, lines);
+            self.highlight_range = Some((start, new_end));
+            self.shift_after(end, new_end as isize - end as isize);
+            self.invalidate_height();
+        }
+        self.pending_highlight = None;
+    }
+
+    /// Keeps recorded line positions (spinners, buffer base) in step when
+    /// a splice changes the number of lines before them.
+    fn shift_after(&mut self, from: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let shift = |v: &mut usize| {
+            if *v >= from {
+                *v = v.saturating_add_signed(delta);
+            }
+        };
+        for (line, _) in &mut self.spinner_lines {
+            shift(line);
+        }
+        if let Some(base) = &mut self.snapshot_base {
+            shift(base);
+        }
+    }
+}
+
+/// Cursor over a segment's display rows. It only moves forward and measures
+/// each source line once, so re-rendering a tall segment in pieces costs one
+/// measure of it, not one per piece.
+pub struct RowWalk<'a> {
+    lines: &'a [Line<'static>],
+    measure: wrap::Measure,
+    next_line: usize,
+    /// Display row the line at `next_line` starts on.
+    row: u16,
+}
+
+impl<'a> RowWalk<'a> {
+    /// The source line the cursor sits on, or `None` past the last row.
+    pub fn line(&self) -> Option<usize> {
+        (self.next_line < self.lines.len()).then_some(self.next_line)
+    }
+
+    /// The next source lines, covering `max_rows` display rows or the single
+    /// line that overshoots them, and the rows they cover. Wrapping is per
+    /// source line, so drawing this slice at `rows.start` draws exactly what
+    /// the whole segment would draw there.
+    ///
+    /// While a line is left one is always taken, so a loop over this moves and
+    /// ends even at `max_rows` of zero.
+    pub fn next_chunk(&mut self, max_rows: u16) -> Option<(&'a [Line<'static>], Range<u16>)> {
+        let (start, top) = (self.next_line, self.row);
+        while let Some(line) = self.lines.get(self.next_line) {
+            self.next_line += 1;
+            self.row = self.row.saturating_add(self.measure.rows(line));
+            // Rows are u16 everywhere above this, so nothing past the
+            // saturation point can be addressed, selected or copied anyway.
+            if self.row == u16::MAX || self.row - top >= max_rows {
+                break;
+            }
+        }
+        (self.next_line > start).then(|| (&self.lines[start..self.next_line], top..self.row))
+    }
+
+    /// Backs up to the start of the line covering `target`, or off the end.
+    fn seek(&mut self, target: u16) {
+        while let Some(line) = self.lines.get(self.next_line) {
+            let end = self.row.saturating_add(self.measure.rows(line));
+            if end > target {
+                break;
+            }
+            self.next_line += 1;
+            self.row = end;
+        }
+    }
+}
+
+pub(super) struct SegmentCache {
+    segments: Vec<Segment>,
+    msg_count: usize,
+}
+
+impl SegmentCache {
+    pub fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            msg_count: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.segments.clear();
+        self.msg_count = 0;
+    }
+
+    pub fn push(&mut self, seg: Segment) {
+        self.segments.push(seg);
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.segments.truncate(len);
+    }
+
+    /// Books the spacer and instruction slots a tool fills in later, when its
+    /// output finally arrives. Splicing them in at that point would shift
+    /// every segment after them, and plenty of things hold a segment index by
+    /// then: the scroll position, the search highlight, the scroll a search
+    /// restores, the anchors of a live selection. Empty segments take no rows,
+    /// so a pair nobody fills stays invisible.
+    pub fn reserve_instructions(&mut self, tool_id: &str) {
+        self.segments.push(Segment::default());
+        self.segments
+            .push(Segment::with_tool(instruction_id(tool_id)));
+    }
+
+    pub fn needs_rebuild(&self, msg_len: usize) -> bool {
+        self.msg_count != msg_len
+    }
+
+    pub fn mark_built(&mut self, count: usize) {
+        self.msg_count = count;
+    }
+
+    pub fn msg_count(&self) -> usize {
+        self.msg_count
+    }
+
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    pub fn segments_mut(&mut self) -> &mut [Segment] {
+        &mut self.segments
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&Segment> {
+        self.segments.get(idx)
+    }
+
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Segment> {
+        self.segments.get_mut(idx)
+    }
+
+    pub fn find_by_tool_id(&self, id: &str) -> Option<usize> {
+        self.segments
+            .iter()
+            .rposition(|s| s.tool_id.as_deref() == Some(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn push_spacer_if_needed(&mut self) {
+        if !self.segments.is_empty() {
+            self.segments.push(Segment::spacer());
+        }
+    }
+
+    pub fn mark_all_stale(&mut self) {
+        for seg in &mut self.segments {
+            seg.stale = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tool_display::append_right_info;
+    use super::*;
+    use std::time::{Duration, Instant};
+    use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
+
+    const OTHER_THEME: &str = "dracula";
+    const WIDTH: u16 = 20;
+
+    fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
+        Segment {
+            lines: (0..line_count)
+                .map(|i| Line::raw(format!("l{i}")))
+                .collect(),
+            snapshot_base: base,
+            ..Segment::default()
+        }
+    }
+
+    #[test_case(0, 0 ; "header_maps_to_zero")]
+    #[test_case(1, 1 ; "first_snapshot_line_is_row_one")]
+    #[test_case(4, 4 ; "later_line_offsets_from_base")]
+    fn buf_row_maps_source_lines_through_snapshot_base(source_line: usize, expected: usize) {
+        let seg = seg_with_base(5, Some(1));
+        assert_eq!(seg.buf_row(source_line), expected);
+    }
+
+    #[test]
+    fn buf_row_is_zero_without_snapshot() {
+        let seg = seg_with_base(3, None);
+        assert_eq!(seg.buf_row(2), 0);
+    }
+
+    #[test]
+    fn buf_row_tracks_base_when_lines_precede_snapshot() {
+        let seg = seg_with_base(6, Some(3));
+        assert_eq!(seg.buf_row(2), 0, "pre-snapshot lines map outside the buf");
+        assert_eq!(seg.buf_row(3), 1);
+        assert_eq!(seg.buf_row(5), 3);
+    }
+
+    #[test]
+    fn reuse_highlight_keys_on_theme_not_width() {
+        use crate::components::code_view::RenderLimits;
+        use maki_agent::ToolOutput;
+        use std::sync::Arc;
+
+        let output = Arc::new(ToolOutput::ReadCode {
+            path: "f.rs".into(),
+            start_line: 1,
+            lines: vec!["fn main() {}".into()],
+            total_lines: 1,
+            instructions: None,
+        });
+        let key = || {
+            HighlightKey::from_request(Some(&HighlightRequest {
+                range: (1, 3),
+                input: None,
+                output: Some(Arc::clone(&output)),
+                limits: RenderLimits {
+                    script: 0,
+                    output: 0,
+                },
+            }))
+        };
+        let seg = Segment {
+            highlight_key: key(),
+            highlight_range: Some((1, 3)),
+            lines: vec![
+                Line::raw("h"),
+                Line::raw("a"),
+                Line::raw("b"),
+                Line::raw("t"),
+            ],
+            ..Segment::default()
+        };
+
+        // Highlighted lines are source lines, not wrapped rows (the worker
+        // job carries no width), so the key deliberately omits width.
+        assert!(
+            seg.reuse_highlight(&key(), (1, 3)).is_some(),
+            "reuse must fire across a width change; highlight lines are width-independent"
+        );
+
+        theme::set(theme::load_by_name(OTHER_THEME).unwrap());
+        assert!(
+            seg.reuse_highlight(&key(), (1, 3)).is_none(),
+            "theme mismatch must force a fresh highlight, not splice old-palette lines"
+        );
+    }
+
+    fn ticking_since(ago: Duration, shown_secs: u64) -> Segment {
+        Segment {
+            elapsed: Some(ElapsedSpan {
+                span: 0,
+                since: Instant::now().checked_sub(ago).unwrap(),
+                shown_secs,
+                width: 0,
+            }),
+            ..Segment::default()
+        }
+    }
+
+    /// A moved row's clock changes once a second, so it is due at the next
+    /// second boundary, or at once when the text already lags.
+    #[test]
+    fn elapsed_due_waits_for_the_next_second_only() {
+        const SHOWN_SECS: u64 = 3;
+        const INTO_SECOND: Duration = Duration::from_millis(250);
+        let fresh = ticking_since(Duration::from_secs(SHOWN_SECS) + INTO_SECOND, SHOWN_SECS);
+        assert!(fresh.elapsed_due().unwrap() <= ELAPSED_STEP - INTO_SECOND);
+
+        let stale = ticking_since(Duration::from_secs(SHOWN_SECS + 2), SHOWN_SECS);
+        assert_eq!(stale.elapsed_due(), Some(Duration::ZERO));
+
+        assert_eq!(Segment::default().elapsed_due(), None);
+    }
+
+    const USAGE: &str = "10.6k↑ 148↓ $0.009";
+    const TIMESTAMP: &str = "12:41:53 AM";
+    const GROWN: Duration = Duration::from_secs(94);
+    const GROWN_MINUTES: &str = "1m";
+
+    /// A header laid out with {usage} and the timestamp at "0s", {slack}
+    /// columns to spare, whose clock now reads [`GROWN`].
+    fn ticking_header(usage: Option<&str>, slack: usize) -> (Segment, u16) {
+        let mut header = Line::from(vec![
+            Span::raw("↗ bash> Sleep 120s then echo"),
+            Span::raw(ElapsedSpan::text(0)),
+        ]);
+        let usage_width = usage.map_or(0, |usage| usage.width() + 2);
+        let width = (header.width() + 1 + usage_width + TIMESTAMP.width() + 1 + slack) as u16;
+        append_right_info(&mut header, None, usage, Some(TIMESTAMP), width);
+        let seg = Segment {
+            lines: vec![header],
+            elapsed: Some(ElapsedSpan {
+                span: 1,
+                since: Instant::now().checked_sub(GROWN).unwrap(),
+                shown_secs: 0,
+                width,
+            }),
+            ..Segment::default()
+        };
+        (seg, width)
+    }
+
+    #[test_case(Some(USAGE), 20, true,  true  ; "all_kept_when_growth_fits")]
+    #[test_case(Some(USAGE), 0,  false, true  ; "usage_dropped_when_growth_does_not_fit")]
+    #[test_case(None,        0,  false, false ; "all_dropped_when_nothing_fits")]
+    fn update_elapsed_never_overflows_the_right_info(
+        usage: Option<&str>,
+        slack: usize,
+        expect_usage: bool,
+        expect_timestamp: bool,
+    ) {
+        let (mut seg, width) = ticking_header(usage, slack);
+        seg.update_elapsed();
+
+        let header = &seg.lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains(GROWN_MINUTES), "{text:?}");
+        assert!(header.width() <= width as usize, "wrapped: {text:?}");
+        assert_eq!(text.contains(USAGE), expect_usage);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+    }
+    #[test_case(4, 6 ; "splice_grows")]
+    #[test_case(1, 3 ; "splice_shrinks")]
+    fn highlight_splice_shifts_spinners_and_base(replacement_lines: usize, expected_base: usize) {
+        let mut seg = seg_with_base(8, Some(4));
+        seg.highlight_range = Some((1, 3));
+        seg.spinner_lines = vec![(0, 0), (5, 1)];
+        seg.apply_highlight_result((0..replacement_lines).map(|_| Line::raw("hl")).collect());
+        let delta = expected_base as isize - 4;
+        assert_eq!(seg.snapshot_base, Some(expected_base));
+        assert_eq!(
+            seg.spinner_lines,
+            vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
+            "positions before the splice stay, after it shift by the delta"
+        );
+    }
+
+    fn tool_lines(gutter: Span<'static>, gutter_spins: bool) -> ToolLines {
+        ToolLines {
+            lines: vec![Line::raw("header")],
+            highlight: None,
+            spinner_lines: vec![],
+            gutter,
+            gutter_spins,
+            snapshot_base: None,
+            truncation: SectionFlags::default(),
+            elapsed: None,
+        }
+    }
+
+    #[test]
+    fn update_spinners_animates_gutter_only_while_spinning() {
+        let worker = RenderWorker::new();
+        let frame = Span::styled("*", theme::current().spinner);
+        let mut seg = Segment::with_tool("t".into());
+        seg.apply_highlight(tool_lines(Span::raw("-"), true), &worker);
+        seg.update_spinners(&frame);
+        assert_eq!(seg.gutter.as_ref(), Some(&frame));
+
+        let dot = Span::styled("●", theme::current().tool_success);
+        seg.update_with_reuse(tool_lines(dot.clone(), false), &worker);
+        seg.update_spinners(&frame);
+        assert_eq!(seg.gutter, Some(dot), "finished dot must not animate");
+    }
+
+    fn gutter_seg(lines: Vec<Line<'static>>) -> Segment {
+        Segment {
+            gutter: Some(Span::raw("● ")),
+            ..Segment::with_lines(lines, None)
+        }
+    }
+
+    #[test]
+    fn gutter_reduces_body_width_for_height() {
+        let lines = vec![Line::raw("x".repeat(100))];
+        let plain = Segment::with_lines(lines.clone(), None);
+        assert_eq!(
+            gutter_seg(lines).height(WIDTH),
+            plain.height(WIDTH - GUTTER_COLS)
+        );
+    }
+
+    #[test]
+    fn gutter_dropped_when_pane_too_narrow() {
+        let seg = gutter_seg(vec![Line::raw("x")]);
+        assert_eq!(seg.gutter_cols(GUTTER_COLS), 0);
+        assert_eq!(seg.gutter_cols(GUTTER_COLS + 1), GUTTER_COLS);
+    }
+
+    #[test]
+    fn rows_from_uses_body_width() {
+        let body = usize::from(WIDTH - GUTTER_COLS);
+        let seg = gutter_seg(vec![Line::raw("a".repeat(body + 1)), Line::raw("b")]);
+        assert_eq!(seg.source_line_at(0, WIDTH), Some(0));
+        assert_eq!(seg.source_line_at(1, WIDTH), Some(0));
+        assert_eq!(seg.source_line_at(2, WIDTH), Some(1));
+    }
+}

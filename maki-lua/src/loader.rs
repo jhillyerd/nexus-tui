@@ -1,0 +1,3521 @@
+use maki_agent::UiWaker;
+use std::collections::HashMap;
+use std::fmt::Display;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
+use include_dir::{Dir, File, include_dir};
+use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
+use maki_agent::tools::ToolRegistry;
+use maki_agent::{Cutter, SessionEndReason};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::plugin::{DeclAuthority, keep_granted};
+use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
+use tokio::time::timeout_at;
+
+use crate::agent_autocmd::HostEvent;
+use crate::api::keymap::{KeybindTicket, KeymapReader};
+use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::ui::marks::InputRulesReader;
+use crate::api::util::command::{
+    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
+};
+use crate::background::BackgroundTasks;
+use crate::error::PluginError;
+use crate::pack::{DiscoveredPackage, Interaction};
+use crate::plugin_permissions::{
+    MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
+    load_plugin_granted_providers, load_plugin_permissions,
+};
+use crate::runtime::{
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, MoveOutcome,
+    MoveRequest, Request, RestoreItem,
+};
+use maki_agent::prompt::ResolvedPrompts;
+use maki_storage::id::MakiId;
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The runtime a host built outside `main`'s gets, which is every test.
+/// `main` enters its own multi-thread runtime first, so this one is never
+/// built in production.
+pub(crate) static HOST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for plugin hosts")
+});
+/// A `#[tokio::test]` runtime is single-threaded and only advances while the
+/// test awaits, so a host on it could not wake a sleeping Lua task while the
+/// test thread blocks on the host; only a multi-thread runtime is kept.
+fn enter_test_runtime() -> Option<EnterGuard<'static>> {
+    let on_workers = Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread);
+    (!on_workers).then(|| HOST_RUNTIME.enter())
+}
+
+const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
+const USER_PLUGIN: &str = "user";
+pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
+/// Tests assert on this exact text, so a wording tweak here updates them too.
+pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
+     tool of the same name, together with any \"always allow\" you saved";
+pub const TRUST_SCOPE_WARNING: &str =
+    "trust is only read from the global init.lua; ignoring the trust table in";
+pub const INSTRUCTIONS_SCOPE_WARNING: &str =
+    "instructions is only read from the global init.lua; ignoring the instructions table in";
+
+/// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
+/// project folder nobody vouched for stops at the global file.
+///
+/// The project variant carries the path instead of a trust verdict, so the only
+/// way to build one is a `Some` out of [`ProjectConfig::gated_path`] and
+/// "trusted" cannot disagree with "which file".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitFiles {
+    Disabled,
+    Global,
+    GlobalAndProject(PathBuf),
+}
+
+impl InitFiles {
+    pub fn resolve(project_config: &ProjectConfig, no_plugins: bool) -> Self {
+        if no_plugins {
+            return InitFiles::Disabled;
+        }
+        match project_config.gated_path(GatedFile::InitLua) {
+            Some(path) => InitFiles::GlobalAndProject(path),
+            None => InitFiles::Global,
+        }
+    }
+}
+
+struct BundledPlugin {
+    name: &'static str,
+    dir: Dir<'static>,
+}
+
+/// `lib` is not a default builtin; it exists so plugins can
+/// `require()` shared modules across boundaries.
+static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "sessions",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
+        name: "thinking",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
+    },
+    BundledPlugin {
+        name: "index",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    },
+    BundledPlugin {
+        name: "webfetch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    },
+    BundledPlugin {
+        name: "websearch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    },
+    BundledPlugin {
+        name: "bash",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
+    },
+    BundledPlugin {
+        name: "batch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    },
+    BundledPlugin {
+        name: "grep",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
+    },
+    BundledPlugin {
+        name: "glob",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
+    },
+    BundledPlugin {
+        name: "skill",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
+    },
+    BundledPlugin {
+        name: "question",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
+    },
+    BundledPlugin {
+        name: "todo_write",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    },
+    BundledPlugin {
+        name: "read",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
+    },
+    BundledPlugin {
+        name: "write",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
+    },
+    BundledPlugin {
+        name: "edit",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
+    },
+    // Below the tools it pre-approves: `memory` allows writes into its own
+    // state dir, and a rule can only name a registered tool.
+    BundledPlugin {
+        name: "memory",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+    },
+    BundledPlugin {
+        name: "task",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
+    },
+    BundledPlugin {
+        name: "code_execution",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
+        name: "completion",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
+    },
+    BundledPlugin {
+        name: "view_image",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
+        name: "lib",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
+    },
+    BundledPlugin {
+        name: "list",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
+    // The rest register no tool. They declare a provider maki ships, on
+    // the same surface a third-party plugin declares one with, which is what
+    // keeps that surface honest.
+    BundledPlugin {
+        name: "synthetic",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
+    BundledPlugin {
+        name: "deepseek",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    },
+    BundledPlugin {
+        name: "mistral",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    },
+    BundledPlugin {
+        name: "tensorx",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    },
+    BundledPlugin {
+        name: "regolo",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    },
+    BundledPlugin {
+        name: "requesty",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    },
+    BundledPlugin {
+        name: "openrouter",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
+    },
+];
+
+/// Every bundled name, not just the default-enabled ones. An external package
+/// sharing an owner name with any of them would let one package's unload tear
+/// down the other's registrations.
+pub(crate) fn is_bundled(name: &str) -> bool {
+    BUNDLED_PLUGINS.iter().any(|p| p.name == name)
+}
+
+/// A bundled plugin declares its permissions the same way an external one
+/// does. Shipping inside the binary buys no implicit grant, so an unreadable
+/// manifest fails the load rather than quietly widening anything, and a newly
+/// guarded function stays denied until the plugin asks for it.
+fn bundled_permissions(plugin: &BundledPlugin) -> Result<PluginPermissions, PluginError> {
+    let fail = |message: String| PluginError::BundledManifest {
+        plugin: plugin.name.to_owned(),
+        message,
+    };
+    let source = plugin
+        .dir
+        .get_file(MANIFEST_FILE)
+        .and_then(File::contents_utf8)
+        .ok_or_else(|| fail(format!("no {MANIFEST_FILE} next to init.lua")))?;
+    toml::from_str::<toml::Value>(source)
+        .map(|manifest| Requested::from_manifest(&manifest).granted())
+        .map_err(|e| fail(e.to_string()))
+}
+
+pub(crate) fn lib_dir() -> &'static Dir<'static> {
+    &BUNDLED_PLUGINS
+        .iter()
+        .find(|p| p.name == "lib")
+        .expect("lib plugin bundled")
+        .dir
+}
+
+static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
+    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
+    Vec::leak(dirs)
+});
+
+/// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
+/// order is deterministic across machines.
+///
+/// A repository can commit a symlink, so each entry is resolved and checked to
+/// be inside the package before it is read.
+fn package_entrypoints(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
+    let entrypoint_dir = root.join("plugin");
+    let entries = match fs::read_dir(&entrypoint_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(PluginError::Io {
+                path: entrypoint_dir,
+                source,
+            });
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PluginError::Io {
+            path: entrypoint_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+            continue;
+        }
+        let resolved = path.canonicalize().map_err(|e| PluginError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        if !resolved.starts_with(root) {
+            return Err(PluginError::PackageEscape { path });
+        }
+        if resolved.is_file() {
+            let Some(file_name) = path.file_name().map(std::ffi::OsString::from) else {
+                continue;
+            };
+            files.push((file_name, resolved));
+        }
+    }
+    // By file name, not by the resolved path: a package may symlink an entry
+    // elsewhere inside itself, and load order must still be the order a user
+    // sees in `plugin/`.
+    files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(files.into_iter().map(|(_, path)| path).collect())
+}
+
+pub struct PluginHost {
+    inner: LuaThread,
+    plugin_rules: Arc<PluginRuleStore>,
+    registry: Arc<ToolRegistry>,
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        let Some(handle) = self.inner.join.take() else {
+            return;
+        };
+        // Start the shutdown first, or the join below waits for all
+        // queued bulk work to drain.
+        self.begin_shutdown();
+        let (done_tx, done_rx) = sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(handle.join().is_err());
+        });
+        match done_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(true) => tracing::warn!("lua thread panicked on shutdown"),
+            Err(_) => tracing::warn!("lua thread did not stop within timeout, detaching"),
+            Ok(false) => {}
+        }
+    }
+}
+
+impl PluginHost {
+    /// A TUI host with JIT on, so tests get the whole `maki.ui` surface.
+    pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        Self::start(registry, Interaction::Tty, true)
+    }
+
+    /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
+    /// interpreter with full debug info. Applied at VM creation, so
+    /// every chunk gets it, init.lua files included.
+    ///
+    /// Runs on the current tokio runtime, which `main` enters; a test that
+    /// builds a host without one gets [`HOST_RUNTIME`].
+    pub fn start(
+        registry: Arc<ToolRegistry>,
+        interaction: Interaction,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
+        let _runtime = enter_test_runtime();
+        let plugin_rules = Arc::new(PluginRuleStore::default());
+        let lua = runtime::spawn(
+            Arc::clone(&registry),
+            *BUNDLED_DIRS,
+            interaction,
+            jit,
+            Arc::clone(&plugin_rules),
+        )?;
+        Ok(Self {
+            inner: lua,
+            plugin_rules,
+            registry,
+        })
+    }
+
+    /// One status bar line summing up the wrong key spellings and the keys
+    /// bound in normal mode only found since the last take. Each finding is in
+    /// the log already.
+    pub fn take_key_warning(&self) -> Option<String> {
+        self.inner.key_lint.take_summary()
+    }
+
+    /// The store that `maki.api.register_permission_rule` writes into. Hand
+    /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
+    /// rules apply to all sessions.
+    pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
+        Arc::clone(&self.plugin_rules)
+    }
+
+    /// Stop the Lua thread from taking new work without joining it, so the
+    /// caller can rebuild shared state (like the tool registry) while the
+    /// old VM winds down on its own. The flag makes the watchdog abort
+    /// in-flight callbacks, `Shutdown` on the priority lane skips ahead of
+    /// queued bulk work, and swapping the senders for disconnected ones
+    /// makes every later host call fail right at the send; `&mut self`
+    /// rules out a call racing the swap. `Drop` still joins the thread.
+    pub fn begin_shutdown(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        let _ = self.inner.prio_tx.send(Request::Shutdown);
+        self.inner.tx = unbounded_channel().0;
+        self.inner.prio_tx = unbounded_channel().0;
+    }
+
+    /// Boots the runtime and loads every default bundled plugin into
+    /// `registry`. For callers like tests and docgen that want the full
+    /// builtin set without building a config.
+    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let mut host = Self::new(registry)?;
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
+        Ok(host)
+    }
+
+    /// `warnings` collects non-fatal startup problems (an incompatible
+    /// `plugin.toml` skips that directory's Lua) for the caller to surface.
+    pub fn load_init_files(
+        &self,
+        init_files: InitFiles,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.load_init_files_from_dir(init_files, maki_storage::paths::config_dir().ok(), warnings)
+    }
+
+    fn load_init_files_from_dir(
+        &self,
+        init_files: InitFiles,
+        global_dir: Option<PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if init_files == InitFiles::Disabled {
+            return Ok(None);
+        }
+
+        let mut merged: Option<RawConfig> = None;
+
+        if let Some(global_dir) = global_dir {
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                ConfigScope::Global,
+                &mut merged,
+                warnings,
+            )?;
+        }
+        if let InitFiles::GlobalAndProject(path) = &init_files {
+            self.run_init_file(path, ConfigScope::Project, &mut merged, warnings)?;
+        }
+
+        Ok(merged)
+    }
+
+    fn run_init_file(
+        &self,
+        path: &Path,
+        scope: ConfigScope,
+        merged: &mut Option<RawConfig>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        if let Err(e) = check_plugin_compatibility(scope.label(), plugin_dir.as_deref()) {
+            warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
+            return Ok(());
+        }
+        let owner = scope.label().to_owned();
+        let global = matches!(scope, ConfigScope::Global);
+        if let Some(mut raw) = self.send_config_lua(source, scope, plugin_dir)? {
+            // A folder cannot vouch for itself: ACP resolves many
+            // client-chosen cwds against the config it read once at startup,
+            // so one trusted project's `trust.paths` would reach folders
+            // nobody ever trusted. The same holds for `instructions`, which
+            // picks what a folder's checkout loads into the model. Stripped
+            // rather than rejected, because there is no fallback config at
+            // this point and a hard error would brick the folder the user
+            // just trusted over an ignored setting.
+            if !global {
+                if std::mem::take(&mut raw.trust).is_set() {
+                    warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+                }
+                if std::mem::take(&mut raw.instructions).is_set() {
+                    warnings.push(format!("{INSTRUCTIONS_SCOPE_WARNING} {owner}"));
+                }
+            }
+            match merged {
+                Some(existing) => existing.merge(raw),
+                None => *merged = Some(raw),
+            }
+        }
+        warnings.extend(self.permission_name_warning(&owner));
+        Ok(())
+    }
+
+    pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        let result = self.send_builtin_loads(config);
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
+        for (plugin, opts) in &config.opts {
+            // An enabled package takes its options when the package itself
+            // loads, and an enabled builtin takes them in the loop below.
+            if config.packages.contains(plugin) || config.names.contains(plugin) {
+                continue;
+            }
+            // What is left is a name that exists but is not loading: a builtin
+            // or a package the config disabled, or one discovery refused. It
+            // cannot be a typo, because the config layer validated every
+            // `plugins.<name>` key against the same names before this ran. A
+            // package used to reach this as an error, which stopped maki from
+            // starting over options it was already ignoring.
+            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            tracing::warn!(
+                plugin = plugin.as_str(),
+                keys = keys.join(", "),
+                "nothing named {} is loading; its plugins.{} options are ignored",
+                plugin,
+                plugin
+            );
+        }
+        if let Some(unknown) = config
+            .names
+            .iter()
+            .find(|name| !BUNDLED_PLUGINS.iter().any(|p| p.name == name.as_str()))
+        {
+            return Err(PluginError::UnknownPlugin {
+                plugin: unknown.clone(),
+            });
+        }
+        // `BUNDLED_PLUGINS` order, not `config.names` order, because a rule can
+        // only name a registered tool, so whoever owns a tool loads before
+        // whoever pre-approves it. `DEFAULT_BUILTINS` stays alphabetical for
+        // the config surface.
+        for bundled in BUNDLED_PLUGINS {
+            let Some(builtin) = config.names.iter().find(|n| n.as_str() == bundled.name) else {
+                continue;
+            };
+            let dir = &bundled.dir;
+            let init = dir
+                .get_file("init.lua")
+                .and_then(|f| f.contents_utf8())
+                .ok_or_else(|| PluginError::Lua {
+                    plugin: builtin.clone(),
+                    source: mlua::Error::runtime("bundled plugin missing init.lua"),
+                })?;
+            let permissions = bundled_permissions(bundled)?;
+            let name: Arc<str> = Arc::from(builtin.as_str());
+            let opts = config
+                .opts
+                .get(builtin.as_str())
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            self.send_load(
+                Arc::clone(&name),
+                vec![LoadChunk::bundled(name.as_ref(), init)],
+                LoadContext {
+                    opts,
+                    // The one load that ships inside the binary, and so the
+                    // one that may declare a provider under a built-in slug.
+                    authority: DeclAuthority::Bundled,
+                    ..LoadContext::plain(None, permissions)
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn send_load(
+        &self,
+        name: Arc<str>,
+        chunks: Vec<LoadChunk>,
+        context: LoadContext,
+    ) -> Result<(), PluginError> {
+        self.ask(|reply| Request::LoadSource {
+            name,
+            chunks,
+            context,
+            reply,
+        })?
+    }
+
+    /// Option specs declared by loaded plugins via `maki.api.register_options`,
+    /// keyed by plugin name. Used by docgen.
+    pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
+        self.ask(|reply| Request::CollectPluginOptions { reply })
+    }
+
+    /// Runs a source as the global `init.lua`.
+    ///
+    /// The one scope where `maki.pack.add` may declare packages, so it is its
+    /// own method: deriving the privilege from a source name would let any
+    /// caller reach it by spelling the name the right way.
+    pub fn send_global_init_lua(
+        &self,
+        source: String,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_config_lua(source, ConfigScope::Global, plugin_dir)
+    }
+
+    /// Runs a source as a config chunk named after itself. It gets the
+    /// read-only `maki.pack` table.
+    pub fn send_run_init_lua(
+        &self,
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_config_lua(source, ConfigScope::Named(source_name), plugin_dir)
+    }
+
+    fn send_config_lua(
+        &self,
+        source: String,
+        scope: ConfigScope,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.ask(|reply| Request::RunInitLua {
+            source,
+            scope,
+            plugin_dir,
+            reply,
+        })?
+    }
+
+    pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
+        self.ask(|reply| Request::ClearPlugin {
+            plugin: Arc::from(plugin),
+            reply,
+        })
+    }
+
+    fn ask<T>(&self, request: impl FnOnce(SyncSender<T>) -> Request) -> Result<T, PluginError> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.inner
+            .tx
+            .send(request(reply_tx))
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Runs a source with every permission granted, for tests and embedders.
+    /// Lua arriving from disk must not: it goes through
+    /// [`PluginHost::load_builtins`], [`PluginHost::load_packages`] or the
+    /// `init.lua` path, each of which derives its grant from a manifest.
+    pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
+        self.load_source_with_opts(name, source, serde_json::Map::new())
+    }
+
+    pub fn load_source_with_opts(
+        &self,
+        name: &str,
+        source: &str,
+        opts: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), PluginError> {
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::new(name, source)],
+            LoadContext {
+                opts: Arc::new(opts),
+                ..LoadContext::plain(None, PluginPermissions::trusted())
+            },
+        )
+    }
+
+    pub fn load_source_with_permissions(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+    ) -> Result<(), PluginError> {
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::new(name, source)],
+            LoadContext::plain(None, permissions),
+        )
+    }
+
+    /// Runs a source with a provider grant, for tests and embedders that load
+    /// a plugin registering providers outside the package system.
+    pub fn load_source_with_grant(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+        granted_providers: Vec<String>,
+    ) -> Result<(), PluginError> {
+        let mut context = LoadContext::plain(None, permissions);
+        context.granted_providers = Arc::from(granted_providers);
+        self.send_load(Arc::from(name), vec![LoadChunk::new(name, source)], context)
+    }
+
+    pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        check_plugin_compatibility(USER_PLUGIN, plugin_dir.as_deref())?;
+        let permissions = load_plugin_permissions(plugin_dir.as_deref());
+        let granted_providers = load_plugin_granted_providers(plugin_dir.as_deref());
+        // Test-only path today. Once user plugin dirs exist: derive a real
+        // plugin name, since the hardcoded "user" would collide across files,
+        // pass the `plugins.<name>` opts through, and teach the
+        // unknown-plugin guards about user plugin names.
+        let mut context = LoadContext::plain(plugin_dir, permissions);
+        context.granted_providers = Arc::from(granted_providers);
+        self.send_load(
+            Arc::from(USER_PLUGIN),
+            vec![LoadChunk::new(path.display().to_string(), source)],
+            context,
+        )
+    }
+
+    /// Packages declared by `maki.pack.add` in `init.lua`.
+    ///
+    /// Read after the init files have run, which is when the declared set is
+    /// complete and before anything is installed.
+    pub fn declared_packages(&self) -> Result<Vec<crate::api::pack::Declared>, PluginError> {
+        self.ask(|reply| Request::CollectPackages { reply })
+    }
+
+    fn run_pack_loader(
+        &self,
+        declared: crate::api::pack::Declared,
+        package: &DiscoveredPackage,
+        permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        check_plugin_compatibility(&package.name, Some(&package.dir))?;
+        self.ask(|reply| Request::RunPackLoader {
+            declared,
+            context: LoadContext {
+                plugin_dir: Some(package.dir.clone()),
+                permissions,
+                granted_providers,
+                opts,
+                revision_guard: package.revision_guard.clone(),
+                package: true,
+                authority: DeclAuthority::ThirdParty,
+            },
+            reply,
+        })?
+    }
+
+    /// Loads one external package directory as a single owner.
+    ///
+    /// Every `plugin/*.lua` becomes a chunk, and the chunks share one
+    /// environment, so what one file registers the next can use. The whole set
+    /// commits or none of it does.
+    pub fn load_package(
+        &self,
+        name: &str,
+        dir: &Path,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        self.load_package_with_guard(name, dir, permissions, Arc::from(Vec::new()), opts, None)
+    }
+
+    fn load_package_with_guard(
+        &self,
+        name: &str,
+        dir: &Path,
+        permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
+        opts: PluginOpts,
+        revision_guard: Option<Arc<maki_pack::lock::Lock>>,
+    ) -> Result<(), PluginError> {
+        // Refused here and not only in discovery, because loading an owner
+        // drops that owner's existing registrations first. A package named
+        // after a bundled plugin would unload the builtin before its own
+        // entrypoint ever ran, so every caller has to be gated, not just the
+        // one that walks the site directory.
+        if is_bundled(name) {
+            return Err(PluginError::PackageNameConflict {
+                name: name.to_owned(),
+                path: dir.to_path_buf(),
+            });
+        }
+        // Resolved once here, so the manifest, the entrypoints, and later
+        // `require` calls all agree on one directory even if the path they came
+        // from changes underneath us.
+        let root = dir.canonicalize().map_err(|e| PluginError::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })?;
+        // Gated next to the bundled-name refusal and before any chunk is read,
+        // so a package that outran this Maki registers nothing at all.
+        check_plugin_compatibility(name, Some(&root))?;
+        let files = package_entrypoints(&root)?;
+        if files.is_empty() {
+            return Err(PluginError::PackageEmpty {
+                name: name.to_owned(),
+                path: root,
+            });
+        }
+
+        let mut chunks = Vec::with_capacity(files.len());
+        for path in files {
+            let source = fs::read_to_string(&path).map_err(|e| PluginError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            chunks.push(LoadChunk::new(path.display().to_string(), source));
+        }
+        self.send_load(
+            Arc::from(name),
+            chunks,
+            LoadContext {
+                plugin_dir: Some(root),
+                permissions,
+                granted_providers,
+                opts,
+                revision_guard,
+                package: true,
+                authority: DeclAuthority::ThirdParty,
+            },
+        )
+    }
+
+    /// Refuses further `maki.packadd` calls, and returns anything the queue
+    /// still holds.
+    ///
+    /// One call and not a read followed by a close, because a Lua task can
+    /// record an activation between the two and closing would strand it.
+    pub fn seal_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+        self.ask(|reply| Request::SealPackOps { reply })
+    }
+
+    /// Takes the package operations Lua recorded, leaving the queue empty.
+    ///
+    /// Called by the host after the initiating task has exited, which keeps a
+    /// load off the thread that requested it.
+    fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+        self.ask(|reply| Request::TakePackOps { reply })
+    }
+
+    /// Loads every package that should be loaded now: the `start/` ones, and
+    /// the `opt/` ones that `maki.packadd` named.
+    ///
+    /// Activation names are collected here rather than acted on inside
+    /// `packadd`, because a load waits on a reply from the runtime thread that
+    /// `packadd` is called on. They are collected after each round as well as
+    /// before the first, so a package that activates another one still has it
+    /// loaded in this startup rather than the next.
+    pub fn load_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        self.load_declared_packages(packages, &[], config)
+    }
+
+    /// The names the plugin registered that maki's own permission defaults are
+    /// keyed on. Taking such a name is allowed, and a drop-in replacement may
+    /// want the builtin's rules, but the user has to be told which rules the
+    /// plugin just inherited. One warning lists them all, because the TUI
+    /// flashes a single warning and a per-tool one would drop the rest.
+    fn permission_name_warning(&self, plugin: &str) -> Option<String> {
+        let snapshot = self.registry.iter();
+        let names: Vec<String> = snapshot
+            .iter()
+            .filter(|t| t.source.plugin.as_ref() == plugin)
+            .filter(|t| carries_builtin_defaults(t.name()))
+            .map(|t| format!("`{}`", t.name()))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{plugin}: registered {}, so it {PERMISSION_NAME_WARNING}",
+            names.join(", ")
+        ))
+    }
+
+    /// As `load_packages`, with the declarations that may carry a custom
+    /// loader. A package with no matching declaration loads its `plugin/*.lua`.
+    pub fn load_declared_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        declared: &[crate::api::pack::Declared],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut loaded: Vec<&str> = Vec::new();
+        let mut round: Vec<&DiscoveredPackage> = packages
+            .iter()
+            .filter(|pkg| pkg.eager && config.packages.iter().any(|n| n == &pkg.name))
+            .collect();
+
+        // A `loop` and not `while !round.is_empty()`: with no `start` package
+        // installed the first round is empty, and the names `init.lua` already
+        // recorded still have to be collected.
+        loop {
+            for pkg in round.drain(..) {
+                let opts = config
+                    .opts
+                    .get(&pkg.name)
+                    .cloned()
+                    .map(Arc::new)
+                    .unwrap_or_default();
+                let (permissions, granted_providers) = crate::pack::effective_grant(pkg);
+                let granted_providers = Arc::from(granted_providers);
+                // Keep the granted slugs owned even if the load fails, so the
+                // catalog client cannot take over the slug and receive the
+                // key the user saved for it.
+                keep_granted(&pkg.name, &granted_providers);
+                loaded.push(&pkg.name);
+                let custom = declared
+                    .iter()
+                    .find(|declaration| declaration.spec.name == pkg.name)
+                    .filter(|declaration| {
+                        matches!(declaration.load, crate::api::pack::LoadMode::Custom(_))
+                            && matches!(
+                                &pkg.origin,
+                                crate::pack::Origin::Fetched { src }
+                                    if src == &declaration.spec.src
+                            )
+                    });
+                let result = match custom {
+                    Some(declaration) => self.run_pack_loader(
+                        declaration.clone(),
+                        pkg,
+                        permissions,
+                        granted_providers,
+                        opts,
+                    ),
+                    None => self.load_package_with_guard(
+                        &pkg.name,
+                        &pkg.dir,
+                        permissions,
+                        granted_providers,
+                        opts,
+                        pkg.revision_guard.clone(),
+                    ),
+                };
+                match result {
+                    Ok(()) => warnings.extend(self.permission_name_warning(&pkg.name)),
+                    Err(e) if e.is_version_floor() => {
+                        tracing::warn!(
+                            package = %pkg.name,
+                            path = %pkg.dir.display(),
+                            error = %e,
+                            "{SKIPPED_PLUGIN_WARNING}"
+                        );
+                        warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            package = %pkg.name,
+                            path = %pkg.dir.display(),
+                            error = %e,
+                            "failed to load package"
+                        );
+                        warnings.push(format!("{}: failed to load: {e}", pkg.name));
+                    }
+                }
+            }
+
+            let ops = match self.take_pending_pack_ops() {
+                Ok(ops) => ops,
+                Err(e) => {
+                    warnings.push(format!("could not read package activations: {e}"));
+                    break;
+                }
+            };
+            for op in ops {
+                let crate::api::pack::PackOp::Activate { name } = op;
+                if loaded.contains(&name.as_str()) {
+                    continue;
+                }
+                // Refused rather than loaded when the config disabled it, so
+                // `packadd` cannot be a way around `plugins.<name>.enabled`.
+                let found = packages
+                    .iter()
+                    .find(|pkg| pkg.name == name && config.packages.iter().any(|n| n == &pkg.name));
+                match found {
+                    Some(pkg) => round.push(pkg),
+                    None => warnings.push(format!(
+                        "packadd {name:?}: no package with that name is installed"
+                    )),
+                }
+            }
+            if round.is_empty() {
+                break;
+            }
+        }
+        // Nothing drains the queue after this, so `packadd` is closed rather
+        // than left accepting names no one will read. Closing returns whatever
+        // arrived since the last round, which is reported rather than dropped:
+        // that request was going to be honoured a moment earlier.
+        match self.seal_pack_ops() {
+            Ok(leftover) => {
+                for op in leftover {
+                    let crate::api::pack::PackOp::Activate { name } = op;
+                    warnings.push(format!(
+                        "packadd {name:?}: arrived after the packages had loaded"
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not close the package activation queue");
+            }
+        }
+        warnings
+    }
+
+    pub fn event_handle(&self) -> EventHandle {
+        EventHandle {
+            tx: self.inner.tx.clone(),
+            prio_tx: self.inner.prio_tx.clone(),
+            moves: self.inner.moves.clone(),
+            layered: Arc::clone(&self.inner.layered),
+            background: self.inner.background.clone(),
+        }
+    }
+
+    pub fn command_reader(&self) -> LuaCommandReader {
+        self.inner.command_reader.clone()
+    }
+
+    pub fn keymap_reader(&self) -> KeymapReader {
+        self.inner.keymap_reader.clone()
+    }
+
+    pub fn hint_reader(&self) -> HintReader {
+        self.inner.hint_reader.clone()
+    }
+
+    pub fn input_rules_reader(&self) -> InputRulesReader {
+        self.inner.input_rules_reader.clone()
+    }
+
+    /// The one receiver of what plugins ask of the UI, for the event loop to
+    /// own. `None` once taken. The loop closes it when it stops draining, before
+    /// teardown runs `SessionEnd`, so a handler is turned away at the send
+    /// instead of parking on a reply that never comes.
+    pub fn take_ui_action_rx(&self) -> Option<UnboundedReceiver<UiAction>> {
+        self.inner.ui_action_rx.lock().unwrap().take()
+    }
+
+    /// Rings when a plugin changes a window or what one shows.
+    pub fn ui_waker(&self) -> UiWaker {
+        self.inner.ui_waker.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct EventHandle {
+    pub(crate) tx: UnboundedSender<Request>,
+    /// User-initiated requests bypass queued bulk work (session restores).
+    prio_tx: UnboundedSender<Request>,
+    moves: UnboundedSender<MoveRequest>,
+    /// Published by the Lua thread and read without touching it: whether
+    /// asking a chain can change the answer at all.
+    layered: Arc<LayeredTools>,
+    background: BackgroundTasks,
+}
+
+impl EventHandle {
+    pub(crate) fn from_tx(tx: UnboundedSender<Request>) -> Self {
+        Self {
+            tx,
+            prio_tx: unbounded_channel().0,
+            moves: unbounded_channel().0,
+            layered: Arc::default(),
+            background: BackgroundTasks::default(),
+        }
+    }
+
+    /// Esc in a plugin task's tab. Ends the session as stopped by the user,
+    /// so the plugin's pending `:prompt()` returns "stopped by user".
+    /// Synchronous on purpose: the registry is a mutex the Lua thread shares,
+    /// so a busy Lua thread cannot delay the stop.
+    pub fn cancel_plugin_session(&self, id: &str) {
+        self.background.stop(id, Cutter::User);
+    }
+
+    #[doc(hidden)]
+    pub fn disconnected_for_test() -> Self {
+        Self::from_tx(unbounded_channel().0)
+    }
+
+    /// Whether a plugin is layering either of the plan form slots. False on a
+    /// stock install, where the form opens in the frame the plan lands in: a
+    /// request loop busy with a `/reload` or a long tool call would otherwise
+    /// keep the user waiting for an answer that cannot differ.
+    pub fn plan_form_layered(&self) -> bool {
+        self.layered.layers_surface(PLAN_FORM_SLOT)
+            || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Runs the handler behind a plugin row of {session}'s plan form, named
+    /// by its position in the menu [`Self::open_plan_form`] built and the
+    /// {generation} that menu was published with.
+    ///
+    /// The receiver answers whether the row's built-in action still runs, and
+    /// disconnects when the pick never reached the host, so the caller can
+    /// tell the user instead of going quiet.
+    pub fn run_plan_action(
+        &self,
+        session: String,
+        generation: u64,
+        row: usize,
+        path: String,
+        parallel: bool,
+    ) -> oneshot::Receiver<PlanActionOutcome> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::RunPlanAction {
+            session,
+            generation,
+            row,
+            path,
+            parallel,
+            reply,
+        });
+        rx
+    }
+
+    /// Asks the `ui.plan_form*` chains what to draw for a draft that just
+    /// landed, starting from the {rows} the host proposes. The menu answers
+    /// with {request} as its generation. The receiver answers `None` when a
+    /// layer took the form over, and disconnects when the host is gone, which
+    /// leaves the caller the built-in form.
+    pub fn open_plan_form(
+        &self,
+        path: String,
+        session: String,
+        request: u64,
+        rows: Vec<PlanFormRow>,
+    ) -> oneshot::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::OpenPlanForm {
+            path,
+            session,
+            request,
+            rows,
+            reply,
+        });
+        rx
+    }
+
+    /// True when no runtime is draining requests. Production handles stay
+    /// connected for the host's lifetime; the disconnected-for-test handle
+    /// and a host whose thread has shut down both report true. Callers use
+    /// this to skip async side effects (e.g. a restore-complete flip) that
+    /// no live consumer would ever observe.
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_closed() && self.prio_tx.is_closed()
+    }
+
+    /// Test probe sibling of `from_tx`: collapses both senders onto one
+    /// channel so a `RequestProbe` sees every request, including the
+    /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
+    /// would route to a disconnected channel.
+    pub(crate) fn probed_for_test(shared: UnboundedSender<Request>) -> Self {
+        Self {
+            tx: shared.clone(),
+            prio_tx: shared,
+            moves: unbounded_channel().0,
+            layered: Arc::default(),
+            background: BackgroundTasks::default(),
+        }
+    }
+
+    /// The same handle, reporting {slots} as layered, for a test that drives
+    /// the UI without a host.
+    pub(crate) fn layering(mut self, slots: &[&str]) -> Self {
+        self.layered = Arc::new(LayeredTools::with_surfaces(slots));
+        self
+    }
+
+    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
+        let _ = self.prio_tx.send(Request::RunCommand {
+            plugin,
+            command,
+            args,
+            depth,
+        });
+    }
+
+    pub async fn package_context(&self) -> Result<crate::pack::PackContext, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Request::CollectPackageContext { reply: reply_tx })
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let (declared, active) = reply_rx
+            .await
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let installed = crate::pack::installed_names()
+            .await
+            .ok_or_else(|| "could not read the package lockfile".to_owned())?;
+
+        Ok(crate::pack::PackContext::new(declared, installed, active))
+    }
+
+    /// `session` names the session whose prompt is being built, so content
+    /// callbacks can tell it apart from the focused tab.
+    pub async fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
+        rx.await.unwrap_or_default()
+    }
+
+    pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
+        let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+    }
+
+    /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
+    /// outside it (header line etc.).
+    pub fn request_click(&self, tool_use_id: String, row: usize) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: None,
+        });
+    }
+
+    /// Like [`Self::request_click`], but when the runtime no longer holds
+    /// a live or warm handle for the tool it restores from `item` (whose
+    /// `clicks` must already include `row`) and emits fresh snapshots on
+    /// `event_tx`. Callers need no knowledge of the runtime's warm cache.
+    pub fn request_click_with_fallback(
+        &self,
+        tool_use_id: String,
+        row: usize,
+        item: RestoreItem,
+        event_tx: maki_agent::EventSender,
+    ) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: Some(Box::new(ClickFallback { item, event_tx })),
+        });
+    }
+
+    /// Asks the call to move to the background. The answer arrives once its
+    /// `ctx:on_background` hook ran.
+    pub fn request_background(&self, tool_use_id: String) -> oneshot::Receiver<MoveOutcome> {
+        let (request, rx) = MoveRequest::by_user(tool_use_id);
+        let _ = self.moves.send(request);
+        rx
+    }
+
+    pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
+        let _ = self.tx.send(Request::RestoreComplete { flag });
+    }
+
+    /// Blocks until every restore item queued so far has finished; restores
+    /// run as spawned tasks, and the `RestoreComplete` flag flips only once
+    /// the whole batch has landed, making it the batch barrier.
+    #[doc(hidden)]
+    pub fn wait_restore_complete_for_test(&self) {
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let flag = Arc::new(AtomicBool::new(true));
+        self.send_restore_complete(Arc::clone(&flag));
+        let start = std::time::Instant::now();
+        while flag.load(Ordering::Relaxed) {
+            assert!(start.elapsed() < DEADLINE, "restore batch never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The one way host code fires an event, so every field it sends is one
+    /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
+    /// classifies. {session_id} is the session the event is about.
+    pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
+        let _ = self.tx.send(Request::FireAutocmd {
+            event: event.name().to_owned(),
+            data: event.payload(session_id),
+            message: event.lua_message().cloned(),
+        });
+    }
+
+    /// Headless drivers install their own provider so `maki.session.read` has
+    /// something to answer with instead of "no interactive UI attached". The UI
+    /// leaves the slot empty and answers through its event loop, which owns the
+    /// live session runtimes.
+    pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
+        let _ = self.tx.send(Request::InstallSessionSnapshot { provider });
+    }
+
+    /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
+    /// then return. Call from every session-end path so a Lua monitor can
+    /// stay a plugin. A caller that must not outrun the handlers wants
+    /// [`Self::end_sessions`].
+    ///
+    /// Nothing waits here, so handlers get no deadline and the UI is still
+    /// there to answer them.
+    pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
+        let _ = self.tx.send(Request::EndSession(EndSession {
+            session,
+            reason,
+            wait: None,
+        }));
+    }
+
+    /// [`Self::end_session`] for process exit and an ACP session close: wait
+    /// until the handlers ran and the jobs were reaped, so the `Shutdown`
+    /// that follows on the priority lane cannot skip ahead of them.
+    ///
+    /// Every session is queued first and the deadline is shared, so quitting
+    /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
+    pub async fn end_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = MakiId>,
+        reason: SessionEndReason,
+    ) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let waits: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                Some((session, self.send_end_session(session, reason, deadline)?))
+            })
+            .collect();
+        for (session, reply_rx) in waits {
+            if !matches!(timeout_at(deadline.into(), reply_rx).await, Ok(Ok(()))) {
+                tracing::warn!(
+                    session = %session,
+                    "SessionEnd did not finish within timeout, continuing teardown"
+                );
+            }
+        }
+    }
+
+    fn send_end_session(
+        &self,
+        session: MakiId,
+        reason: SessionEndReason,
+        deadline: Instant,
+    ) -> Option<oneshot::Receiver<()>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Request::EndSession(EndSession {
+                session,
+                reason,
+                wait: Some((deadline, reply_tx)),
+            }))
+            .ok()?;
+        Some(reply_rx)
+    }
+
+    /// Whether the keystroke reached the Lua thread's queue. `false` says the
+    /// host is gone, which the caller answers by running the built-in binding
+    /// for the key in the same keystroke.
+    pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
+        self.prio_tx
+            .send(Request::RunKeybindCallback { ticket })
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::keymap::{
+        CursorShape, CursorStyle, InputMode, InputSnapshot, TAKEN_ERR, UNKNOWN_CURSOR_SHAPE_ERR,
+    };
+    use crate::api::util::command::{
+        BuiltinAction, InputRequest, LuaCommandInfo, LuaCommandWriter, PLUGIN_LOADING_ERR,
+    };
+    use crate::api::util::convert::UNKNOWN_FIELD_ERR;
+    use crate::key::{Key, PASTE};
+    use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
+    use crate::plugin_permissions::{Permission, PluginReach, denied_error};
+    use crate::runtime::{FALLBACK_SPENT_ERR, OUTSIDE_TASK_ERR};
+    use crate::test_support::runtime;
+    use crate::test_support::wait_next;
+    use crossterm::event::KeyCode;
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
+    use maki_agent::tools::ToolRegistry;
+    use test_case::test_case;
+
+    const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
+    const PROJECT_TRUST_PATH: &str = "**";
+
+    /// Closing the queue and reading it are one message. A Lua task can record
+    /// an activation between a separate read and close, and a close that threw
+    /// the queue away would strand exactly the request that was about to be
+    /// honoured.
+    #[test]
+    fn closing_the_activation_queue_hands_back_what_it_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("recorder", r#"maki.packadd("demo")"#)
+            .expect("packadd is available to every plugin");
+
+        let leftover = host.seal_pack_ops().expect("the host is running");
+
+        assert_eq!(
+            leftover,
+            vec![crate::api::pack::PackOp::Activate {
+                name: "demo".to_owned()
+            }],
+            "a recorded activation must come back, not be dropped"
+        );
+    }
+
+    /// jit=true is exercised by the whole integration suite
+    /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
+    /// interpreter path needs its own coverage.
+    #[test]
+    fn jit_off_loads_builtins_and_registers_tools() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+        assert!(reg.has("glob"));
+    }
+
+    /// The second call sends `Shutdown` on a sender that is already
+    /// disconnected; it must swallow that error and keep rejecting work.
+    #[test]
+    fn begin_shutdown_rejects_later_loads_and_is_idempotent() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.begin_shutdown();
+        assert!(host.load_source("late", "return {}").is_err());
+        host.begin_shutdown();
+        assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
+    /// clone keeps queued requests alive after the Lua thread exits, and
+    /// dispatch prefers the priority lane, so a bulk request queued behind
+    /// `Shutdown` is never served. Without the drain its reply sender lives
+    /// forever and `collect_prompt_slots` blocks; with it, the call falls
+    /// back to defaults right away.
+    #[test]
+    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hinted",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+        host.begin_shutdown();
+
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
+        assert!(
+            contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
+            "dead host must yield defaults, not real slots"
+        );
+
+        drop(host);
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    /// Load `src` as one plugin, collect resolved slots.
+    /// Panics on failure; use `load_err` to inspect errors.
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(plugin, src).unwrap();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        (host, slots)
+    }
+
+    fn contents(slots: &ResolvedPrompts, prompt: PromptId, slot: Slot) -> Vec<&str> {
+        slots
+            .get(prompt, slot)
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn command_writer_reader_pair_works() {
+        let (writer, reader) = LuaCommandWriter::new();
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 0);
+
+        writer.publish(vec![LuaCommandInfo {
+            name: Arc::from("/test"),
+            description: Arc::from("desc"),
+            plugin: Arc::from("p"),
+            reach: PluginReach::new(PluginPermissions::trusted()),
+            max_args: 0,
+        }]);
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 1);
+        assert!(snap.generation > 0);
+    }
+
+    #[test]
+    fn memory_builtin_registers_command() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+        let reader = host.command_reader();
+        let snap = reader.load();
+        let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
+        assert!(
+            found,
+            "Expected /memory command, found: {:?}",
+            snap.commands
+                .iter()
+                .map(|c| c.name.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_command_sends_correct_request() {
+        let (prio_tx, mut prio_rx) = unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
+        let handle = EventHandle {
+            tx,
+            prio_tx,
+            moves: unbounded_channel().0,
+            layered: Arc::default(),
+            background: BackgroundTasks::default(),
+        };
+        handle.run_command(
+            Arc::from("myplugin"),
+            Arc::from("/greet"),
+            "world".into(),
+            2,
+        );
+        let req = prio_rx.try_recv().unwrap();
+        match req {
+            Request::RunCommand {
+                plugin,
+                command,
+                args,
+                depth,
+            } => {
+                assert_eq!(plugin.as_ref(), "myplugin");
+                assert_eq!(command.as_ref(), "/greet");
+                assert_eq!(args, "world");
+                assert_eq!(depth, 2);
+            }
+            _ => panic!("expected RunCommand"),
+        }
+    }
+
+    #[test]
+    fn multiple_plugins_register_independent_commands() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "plugin_a",
+            r#"
+            maki.api.register_command({
+                name = "/alpha",
+                description = "from a",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+        host.load_source(
+            "plugin_b",
+            r#"
+            maki.api.register_command({
+                name = "/beta",
+                description = "from b",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 2);
+        let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+        assert!(names.contains(&"/alpha"));
+        assert!(names.contains(&"/beta"));
+    }
+
+    #[test]
+    fn register_command_adds_missing_leading_slash() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "noslash",
+            r#"
+            maki.api.register_command({
+                name = "hello",
+                description = "no slash",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 1);
+        assert_eq!(snap.commands[0].name.as_ref(), "/hello");
+    }
+
+    #[test]
+    fn command_reader_generation_increments_on_publish() {
+        let (writer, reader) = LuaCommandWriter::new();
+        assert_eq!(reader.load().generation, 0);
+        writer.publish(vec![]);
+        assert!(reader.load().generation > 0);
+    }
+
+    const FIRED_COMMAND: &str = "/fired";
+    const KEYBIND_NEVER_RAN: &str = "the keybind callback never ran";
+    const KEYBIND_NEVER_DONE: &str = "the keybind handler never reported done";
+    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Waits for {presses} keybind handlers to report done, then checks that
+    /// one of them registered {FIRED_COMMAND}, which is how a test on this
+    /// side of the channel sees that a handler ran.
+    fn assert_fired_after(host: &PluginHost, presses: usize) {
+        let mut ui = host.take_ui_action_rx().unwrap();
+        for _ in 0..presses {
+            while !matches!(
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
+                UiAction::KeybindDone(_)
+            ) {}
+        }
+        let snapshot = host.command_reader().load();
+        let fired = snapshot
+            .commands
+            .iter()
+            .any(|c| c.name.as_ref() == FIRED_COMMAND);
+        assert!(fired, "{KEYBIND_NEVER_RAN}");
+    }
+
+    /// End-to-end: a plugin registers a keymap override, the override is
+    /// published to the snapshot, `dispatch` hands the binding it matched to
+    /// `run_keybind_callback`, and the runtime calls it with an observable
+    /// side effect. Unit tests only cover the pieces in isolation.
+    #[test]
+    fn keybind_callback_runs_end_to_end() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            &format!(
+                r#"
+            maki.keymap.set("n", "<C-g>", function()
+                maki.api.register_command({{
+                    name = "{FIRED_COMMAND}",
+                    description = "callback ran",
+                    handler = function() end,
+                }})
+            end, {{ desc = "test override" }})
+            "#
+            ),
+        )
+        .unwrap();
+
+        let reader = host.keymap_reader();
+        let key = {
+            let snap = reader.load();
+            assert_eq!(snap.entries.len(), 1, "override published to snapshot");
+            let entry = &snap.entries[0];
+            assert_eq!(entry.desc, "test override");
+            entry.key
+        };
+        assert!(
+            host.command_reader().load().commands.is_empty(),
+            "callback has not fired yet"
+        );
+
+        let handle = host.event_handle();
+        assert!(reader.dispatch(key, InputMode::Normal, None, |ticket| {
+            handle.run_keybind_callback(ticket)
+        }));
+        assert_fired_after(&host, 1);
+    }
+
+    const VIM_PLUGIN: &str = "vim";
+
+    /// A tiny vim plugin: `<Esc>` leaves insert mode and `i` goes back. Each
+    /// handler flashes `maki.fn.mode()` right after it switches, so the test
+    /// waits on that reply instead of polling, and it also proves the switch
+    /// is visible inside the handler that made it.
+    #[test]
+    fn a_vim_style_plugin_switches_modes() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"
+            local function switch(mode)
+                return function()
+                    maki.ui.set_mode(mode)
+                    maki.ui.flash(maki.fn.mode())
+                end
+            end
+            maki.keymap.set("i", "<Esc>", switch("n"))
+            maki.keymap.set("n", "i", switch("i"))
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let mut ui = host.take_ui_action_rx().unwrap();
+        let press = |lhs| {
+            let mode = reader.sync_mode(true);
+            reader.dispatch(Key::parse(lhs).unwrap(), mode, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        let mut flashed_mode = || {
+            let Some(UiAction::Flash(mode)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_RAN}");
+            };
+            let Some(UiAction::KeybindDone(_)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_DONE}");
+            };
+            mode
+        };
+
+        assert!(!press("i"), "typing an i reaches the input");
+        assert!(press("<Esc>"));
+        assert_eq!(flashed_mode(), InputMode::Normal.letter());
+        assert!(!press("<Esc>"), "the insert binding rests in normal mode");
+        assert!(press("i"));
+        assert_eq!(flashed_mode(), InputMode::Insert.letter());
+        assert!(!press("i"), "back in insert mode, an i types again");
+    }
+
+    const ENTER_NORMAL: &str = r#"maki.ui.set_mode("n")"#;
+    const ENTER_NORMAL_THEN_FAIL: &str = r#"maki.ui.set_mode("n") error("broken")"#;
+
+    fn unload_vim(host: &PluginHost) {
+        host.unload(VIM_PLUGIN).unwrap();
+    }
+
+    fn reload_vim(host: &PluginHost) {
+        host.load_source(VIM_PLUGIN, "").unwrap();
+    }
+
+    fn reload_vim_broken(host: &PluginHost) {
+        assert!(
+            host.load_source(VIM_PLUGIN, ENTER_NORMAL_THEN_FAIL)
+                .is_err()
+        );
+    }
+
+    /// Only the plugin that switched to normal mode can switch back, so the
+    /// mode goes with its load. Another plugin going away leaves it alone.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    #[test_case(reload_vim_broken ; "reload_fails")]
+    fn normal_mode_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(VIM_PLUGIN, ENTER_NORMAL).unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+
+        teardown(&host);
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    const BLINKING_BAR: CursorStyle = CursorStyle {
+        shape: CursorShape::Bar,
+        blink: true,
+    };
+
+    /// No shape is sent before a plugin asks, so the terminal keeps the one
+    /// the user configured.
+    #[test_case("", None ; "never_set")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blink = true })"#, Some(BLINKING_BAR) ; "bar_blinking")]
+    #[test_case(r#"maki.ui.set_cursor_shape("block")"#, Some(CursorStyle { shape: CursorShape::Block, blink: false }) ; "block_steady_by_default")]
+    #[test_case(r#"maki.ui.set_cursor_shape("default", { blink = true })"#, Some(CursorStyle::DEFAULT) ; "default_keeps_the_terminal_blink")]
+    fn cursor_shape_is_what_the_plugin_set(source: &str, expected: Option<CursorStyle>) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(VIM_PLUGIN, source).unwrap();
+        assert_eq!(host.keymap_reader().cursor_style(), expected);
+    }
+
+    #[test_case(r#"maki.ui.set_cursor_shape("beam")"#, UNKNOWN_CURSOR_SHAPE_ERR ; "unknown_shape")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blinks = true })"#, UNKNOWN_FIELD_ERR ; "unknown_option")]
+    fn cursor_shape_throws_on_bad_arguments(source: &str, expected: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(VIM_PLUGIN, source)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(host.keymap_reader().cursor_style(), None);
+    }
+
+    /// Like normal mode, a shape goes with the plugin that set it, and the
+    /// terminal gets its own cursor back. Another plugin going away leaves it.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    fn cursor_shape_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"maki.ui.set_cursor_shape("bar", { blink = true })"#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.cursor_style(), Some(BLINKING_BAR));
+
+        teardown(&host);
+        assert_eq!(reader.cursor_style(), Some(CursorStyle::DEFAULT));
+    }
+
+    const PARKED_COMMAND: &str = "/park";
+    const PARKED_DONE: &str = "parked done";
+    const PARKED_NEVER_RAN: &str = "the command never parked on the UI";
+    const PARKED_NEVER_DONE: &str = "the command never finished";
+
+    /// An unload never waits for a command handler, so one parked on the UI
+    /// wakes up with its load gone. A normal mode it switched to then would
+    /// belong to nothing that could ever switch it back, and the chat input
+    /// could not be typed in again.
+    #[test]
+    fn a_mode_switch_from_an_unloaded_plugin_is_dropped() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            &format!(
+                r#"
+            maki.api.register_command({{
+                name = "{PARKED_COMMAND}",
+                description = "parks on the UI",
+                handler = function()
+                    maki.ui.input()
+                    maki.ui.set_mode("n")
+                    maki.ui.flash("{PARKED_DONE}")
+                end,
+            }})
+            "#
+            ),
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let mut ui = host.take_ui_action_rx().unwrap();
+        host.event_handle().run_command(
+            Arc::from(VIM_PLUGIN),
+            Arc::from(PARKED_COMMAND),
+            String::new(),
+            0,
+        );
+        let parked = loop {
+            if let UiAction::Input { reply_tx, .. } =
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
+            {
+                break reply_tx;
+            }
+        };
+
+        host.unload(VIM_PLUGIN).unwrap();
+        parked.send(Ok(serde_json::Value::Null)).unwrap();
+        while !matches!(
+            wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
+            UiAction::Flash(said) if said == PARKED_DONE
+        ) {}
+
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    /// The UI lets the held keys go when the done report arrives. If it came
+    /// before the handler's edit or mode switch, those keys would race them
+    /// all over again.
+    #[test]
+    fn a_keybind_handler_reports_done_after_its_edit_and_mode_switch() {
+        const SESSION: &str = "s1";
+        const VERSION: u64 = 7;
+        const TEXT: &str = "ab";
+        const TAB: &str = "<Tab>";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "accept",
+            r#"
+            maki.keymap.set("i", "<Tab>", function(ev)
+                local st = ev.input
+                maki.ui.input_edit({
+                    start = 0, stop = st.cursor, text = ev.key,
+                    version = st.version, session_id = st.session_id,
+                })
+                maki.ui.set_mode("n")
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let mut ui = host.take_ui_action_rx().unwrap();
+
+        let mut pressed = None;
+        assert!(reader.dispatch(
+            Key::parse(TAB).unwrap(),
+            reader.sync_mode(true),
+            None,
+            |t| {
+                let t = t.with_input(InputSnapshot {
+                    session_id: SESSION.into(),
+                    text: TEXT.into(),
+                    cursor: TEXT.len(),
+                    anchor: None,
+                    version: VERSION,
+                });
+                pressed = Some(t.id());
+                handle.run_keybind_callback(t)
+            }
+        ));
+
+        let Some(UiAction::Input {
+            req: InputRequest::Edit(edit),
+            reply_tx,
+        }) = wait_next(&mut ui, KEYBIND_TIMEOUT)
+        else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(
+            (edit.session_id.as_str(), edit.version, edit.edits[0].stop),
+            (SESSION, VERSION, TEXT.len()),
+            "the edit was planned against `ev.input`"
+        );
+        assert_eq!(edit.edits[0].text, TAB, "`ev.key` names the key");
+        reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
+
+        let Some(UiAction::KeybindDone(done)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
+            panic!("{KEYBIND_NEVER_DONE}");
+        };
+        assert_eq!(Some(done), pressed);
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+    }
+
+    /// The UI runs a fallback only for the key it still holds the later keys
+    /// for, so a second call, or one made after the handler returned, would
+    /// do nothing. The plugin is told so instead of being answered `true`.
+    #[test]
+    fn fallback_asks_once_and_only_while_the_handler_runs() {
+        const PASTED: &str = "pasted";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "fallback",
+            r#"
+            local stashed
+            maki.keymap.set("i", "<Paste>", function(ev)
+                stashed = ev
+                local first = ev.fallback()
+                local _, again = ev.fallback()
+                maki.ui.flash(table.concat({ ev.text, tostring(first), again }, "|"))
+            end)
+            maki.keymap.set("i", "<Tab>", function()
+                local _, late = stashed.fallback()
+                maki.ui.flash(late)
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let mut ui = host.take_ui_action_rx().unwrap();
+        let press = |key: Key| {
+            let mut id = None;
+            assert!(reader.dispatch(key, reader.sync_mode(true), None, |t| {
+                let t = t.with_text(PASTED.into());
+                id = Some(t.id());
+                handle.run_keybind_callback(t)
+            }));
+            id.unwrap()
+        };
+        let mut next = || wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
+
+        let paste = press(PASTE);
+        assert!(matches!(next(), UiAction::KeybindFallback(id) if id == paste));
+        let UiAction::Flash(said) = next() else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(said, format!("{PASTED}|true|{FALLBACK_SPENT_ERR}"));
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == paste));
+
+        let tab = press(Key::parse("<Tab>").unwrap());
+        let UiAction::Flash(said) = next() else {
+            panic!("a late fallback must not reach the UI");
+        };
+        assert_eq!(said, FALLBACK_SPENT_ERR);
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == tab));
+    }
+
+    fn grants(names: &[&str]) -> PluginPermissions {
+        PluginPermissions::from_approved(names.iter().copied())
+    }
+
+    /// A key that types text shows the plugin every key the user types, in
+    /// normal mode too since a plugin may switch to it, so it costs what
+    /// reading the input costs.
+    #[test_case(r#""i", "a""#, &[] => false ; "a_letter_in_insert_mode")]
+    #[test_case(r#""i", "<Space>""#, &[] => false ; "space_in_insert_mode")]
+    #[test_case(r#""i", "<Paste>""#, &[] => false ; "a_paste_in_insert_mode")]
+    #[test_case(r#"{ "n", "i" }, "A""#, &[] => false ; "a_letter_in_both_modes")]
+    #[test_case(r#""i", "a""#, &["session_read"] => true ; "a_letter_with_session_read")]
+    #[test_case(r#""i", "<C-g>""#, &[] => true ; "a_shortcut_in_insert_mode")]
+    #[test_case(r#""n", "a""#, &[] => false ; "a_letter_in_normal_mode")]
+    #[test_case(r#""n", "<C-g>""#, &[] => true ; "a_shortcut_in_normal_mode")]
+    fn binding_a_typing_key_needs_session_read(mode_and_key: &str, granted: &[&str]) -> bool {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = format!("maki.keymap.set({mode_and_key}, function() end)");
+        match host.load_source_with_permissions("typing", &source, grants(granted)) {
+            Ok(()) => !host.keymap_reader().load().entries.is_empty(),
+            Err(err) => {
+                let denied = denied_error(Permission::SessionRead).to_string();
+                assert!(err.to_string().contains(&denied), "got: {err}");
+                false
+            }
+        }
+    }
+
+    /// A buffer binding sees the keys typed into the chat input too, while its
+    /// window sits on screen without the keyboard. So it costs the same.
+    #[test_case(&["session_read"] => "true" ; "with_session_read")]
+    #[test_case(&[] => "false" ; "without_session_read")]
+    fn a_typing_key_on_a_buffer_needs_session_read(granted: &[&str]) -> String {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "popup",
+            r#"
+            maki.keymap.set("n", "<C-t>", function()
+                local buf = maki.ui.buf()
+                local bound = pcall(maki.keymap.set, "i", "a", function() end, { buffer = buf })
+                maki.ui.flash(tostring(bound))
+            end)
+            "#,
+            grants(granted),
+        )
+        .unwrap();
+        let key = Key::parse("<C-t>").unwrap();
+        let handle = host.event_handle();
+        assert!(
+            host.keymap_reader()
+                .dispatch(key, InputMode::Normal, None, |t| {
+                    handle.run_keybind_callback(t)
+                })
+        );
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        said
+    }
+
+    /// `ev.input` and `ev.text` carry the draft, so only a plugin that may
+    /// read the session gets them, even on a key that types nothing.
+    #[test_case(&["session_read"] => "true|pasted" ; "with_session_read")]
+    #[test_case(&[] => "false|nil" ; "without_session_read")]
+    fn a_key_handler_sees_the_draft_only_with_session_read(granted: &[&str]) -> String {
+        const PASTED: &str = "pasted";
+        const SHORTCUT: &str = "<C-g>";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "peek",
+            r#"
+            maki.keymap.set("n", "<C-g>", function(ev)
+                maki.ui.flash(tostring(ev.input ~= nil) .. "|" .. tostring(ev.text))
+            end)
+            "#,
+            grants(granted),
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        assert!(reader.dispatch(
+            Key::parse(SHORTCUT).unwrap(),
+            InputMode::Normal,
+            None,
+            |t| {
+                let t = t
+                    .with_input(InputSnapshot {
+                        session_id: String::new(),
+                        text: PASTED.into(),
+                        cursor: 0,
+                        anchor: None,
+                        version: 0,
+                    })
+                    .with_text(PASTED.into());
+                handle.run_keybind_callback(t)
+            }
+        ));
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        said
+    }
+
+    /// `<C-c>` never reaches a binding, so accepting one publishes a mapping
+    /// with a `desc` in the keymap list that can never fire.
+    #[test]
+    fn binding_a_key_the_host_reserves_is_refused() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(
+                "kb",
+                r#"maki.keymap.set("n", "<C-c>", function() end, { desc = "quit" })"#,
+            )
+            .expect_err("Ctrl+C is the host's");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    /// `unique` is a plugin saying the key is no good to it shared, so the
+    /// call has to fail where the author reads it and name who to go look at.
+    #[test]
+    fn a_unique_bind_fails_on_a_key_another_plugin_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        let err = host
+            .load_source(
+                "second",
+                r#"maki.keymap.set("n", "<C-g>", function() end, { unique = true })"#,
+            )
+            .expect_err("the key is taken");
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!("{TAKEN_ERR} first")),
+            "the error has to name the owner, got: {err}"
+        );
+        assert_eq!(
+            host.keymap_reader().load().entries.len(),
+            1,
+            "the refused bind stored nothing"
+        );
+    }
+
+    #[test]
+    fn del_from_another_plugin_leaves_the_key_alone() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        host.load_source("second", r#"maki.keymap.del("n", "<C-g>")"#)
+            .unwrap();
+
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
+    }
+
+    /// A handler that raises is logged and its key is spent: handing the key
+    /// back seconds later lands it in a UI the user never pressed it against.
+    /// What the host owes is that the raise wedges nothing.
+    #[test]
+    fn a_keybind_that_raises_leaves_the_plugin_dispatching() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            &format!(
+                r#"
+            maki.keymap.set("n", "<C-g>", function() error("boom") end)
+            maki.keymap.set("n", "<C-h>", function()
+              maki.api.register_command({{
+                name = "{FIRED_COMMAND}",
+                description = "the next key still ran",
+                handler = function() end,
+              }})
+            end)
+            "#
+            ),
+        )
+        .unwrap();
+
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let key_of = |code: char| {
+            let snap = reader.load();
+            let entry = snap
+                .entries
+                .iter()
+                .find(|e| e.key.code() == KeyCode::Char(code))
+                .expect("both keys published");
+            entry.key
+        };
+
+        let run = |code| {
+            reader.dispatch(key_of(code), InputMode::Normal, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        assert!(run('g'));
+        assert!(run('h'));
+
+        assert_fired_after(&host, 2);
+    }
+
+    /// Unloading has to take the bindings with it, or a `/reload` leaves keys
+    /// claimed by callbacks that are gone.
+    #[test]
+    fn clearing_a_plugin_takes_its_bindings() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("kb", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
+
+        host.unload("kb").unwrap();
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    #[test]
+    fn init_file_scope_controls_project_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        let mut warnings = Vec::new();
+        for scope in [InitFiles::Disabled, InitFiles::Global] {
+            let skipped = host
+                .load_init_files_from_dir(scope, None, &mut warnings)
+                .expect("scope skips broken project init.lua");
+            assert!(skipped.is_none());
+        }
+
+        let ran = host.load_init_files_from_dir(
+            InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+            None,
+            &mut warnings,
+        );
+        assert!(
+            ran.is_err(),
+            "project-enabled loading must surface the init.lua error"
+        );
+    }
+
+    #[test]
+    fn project_scope_preserves_global_values_and_overrides_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ always_yolo = false, always_fast = true })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ always_yolo = true })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let global_only = global_host
+            .load_init_files_from_dir(InitFiles::Global, Some(global.clone()), &mut warnings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(global_only.always_yolo, Some(false));
+        assert_eq!(global_only.always_fast, Some(true));
+
+        let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = project_host
+            .load_init_files_from_dir(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                Some(global),
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.always_yolo, Some(true));
+        assert_eq!(merged.always_fast, Some(true));
+    }
+
+    #[test]
+    fn project_scope_cannot_set_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            format!(
+                "maki.setup({{ trust = {{ paths = {{ \"{GLOBAL_TRUST_PATH}\" }}, prompt = false }} }})"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            format!("maki.setup({{ trust = {{ paths = {{ \"{PROJECT_TRUST_PATH}\" }} }} }})"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dir(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                Some(global),
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged.trust.paths.expect("the global trust table survives"),
+            [GLOBAL_TRUST_PATH]
+        );
+        assert_eq!(merged.trust.prompt, Some(false));
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.starts_with(TRUST_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())
+            }),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_scope_cannot_set_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ instructions = { files = { \"CLAUDE.md\" }, \
+                 overrides = { { path = \"~/src/me/*\", files = {} } } } })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ instructions = { files = {}, \
+                 overrides = { { remote = \"github.com/*\", files = {} } } } })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dir(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                Some(global),
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .instructions
+                .files
+                .expect("the global instructions table survives"),
+            ["CLAUDE.md"]
+        );
+        assert_eq!(
+            merged.instructions.overrides[0]
+                .path
+                .as_deref()
+                .expect("the global overrides list survives"),
+            "~/src/me/*"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with(INSTRUCTIONS_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn callback_string_lands_in_targeted_prompt_only() {
+        let (_host, slots) = slots_from(
+            "cb",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = function() return "from_cb" end,
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["from_cb"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn callback_returning_nil_contributes_nothing() {
+        let (_host, slots) = slots_from(
+            "nil_cb",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function() return nil end,
+            })
+            "#,
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.
+    #[test]
+    fn static_no_prompt_lands_on_all_prompts_with_slot() {
+        let (_host, slots) = slots_from(
+            "static_hint",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "efficient_tools",
+                content = "index",
+            })
+            "#,
+        );
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
+        }
+    }
+
+    /// `conventions` lives on system and general but not research, so a default
+    /// hint follows the slot and skips research.
+    #[test]
+    fn default_hint_skips_prompts_lacking_the_slot() {
+        let (_host, slots) = slots_from(
+            "conv",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "conventions",
+                content = "follow conventions",
+            })
+            "#,
+        );
+        for pid in [PromptId::System, PromptId::General] {
+            assert_eq!(
+                contents(&slots, pid, Slot::Conventions),
+                ["follow conventions"]
+            );
+        }
+        assert!(contents(&slots, PromptId::Research, Slot::Conventions).is_empty());
+    }
+
+    /// Targeting a prompt that does not have the slot quietly drops the hint.
+    #[test]
+    fn register_prompt_hint_ignores_missing_slot() {
+        let (_host, slots) = slots_from(
+            "drop",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "after_instructions",
+                prompt = "research",
+                content = "never lands",
+            })
+            "#,
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
+        assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
+    }
+
+    /// Content callbacks receive the session whose prompt is built, not the
+    /// focused tab.
+    #[tokio::test]
+    async fn hint_callback_names_the_prompt_session() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "sid",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(ctx)
+                    return ctx and ctx.session_id or "no session"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let named = host
+            .event_handle()
+            .collect_prompt_slots(Some("session-x"))
+            .await;
+        assert_eq!(
+            contents(&named, PromptId::System, Slot::ToolUsage),
+            ["session-x"]
+        );
+        let unnamed = host.event_handle().collect_prompt_slots(None).await;
+        assert_eq!(
+            contents(&unnamed, PromptId::System, Slot::ToolUsage),
+            ["no session"]
+        );
+    }
+
+    #[test]
+    fn prompt_list_targets_each_listed_prompt() {
+        const CONTENT: &str = "shared";
+        let (_host, slots) = slots_from(
+            "list",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = { "system", "research" },
+                content = "shared",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::Research, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert!(contents(&slots, PromptId::General, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn multiple_plugins_sorted_by_plugin_name() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        for plugin in ["zzz", "aaa"] {
+            host.load_source(
+                plugin,
+                r#"
+                maki.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
+                "#
+                .replace("PLUGIN", plugin)
+                .as_str(),
+            )
+            .unwrap();
+        }
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["from_aaa", "from_zzz"],
+            "entries must be ordered by plugin name"
+        );
+    }
+
+    /// One plugin can register several hints; unloading it clears all of them.
+    #[test]
+    fn unload_clears_all_hints_from_plugin() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "multi",
+            r#"
+            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["usage"]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Conventions),
+            ["conv"]
+        );
+
+        host.unload("multi").unwrap();
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
+    }
+
+    #[test_case(r#"{ slot = "nonexistent", content = "x" }"# ; "invalid_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = "nope" }"# ; "invalid_prompt")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = { "system", "bogus" } }"# ; "invalid_prompt_in_list")]
+    #[test_case(r#"{ slot = "tool_usage" }"# ; "missing_content")]
+    #[test_case(r#"{ content = "x" }"# ; "missing_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = 42 }"# ; "content_wrong_type")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = 42 }"# ; "prompt_wrong_type")]
+    fn invalid_hint_spec_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let src = format!("maki.api.register_prompt_hint({spec})");
+        assert!(host.load_source("bad", &src).is_err());
+    }
+
+    #[test_case(Slot::Identity ; "identity")]
+    #[test_case(Slot::Tone ; "tone")]
+    #[test_case(Slot::Conventions ; "static_section")]
+    fn omitted_replacement_targets_only_the_main_prompt(slot: Slot) {
+        const CONTENT: &str = "Custom policy";
+        let (_host, prompts) = slots_from(
+            "persona",
+            &format!("maki.api.set_prompt({{ slot = \"{slot}\", content = {CONTENT:?} }})"),
+        );
+        assert!(assemble(PromptId::System, &prompts, "").contains(CONTENT));
+        for pid in [PromptId::Research, PromptId::General] {
+            assert_eq!(
+                assemble(pid, &prompts, ""),
+                assemble(pid, &ResolvedPrompts::default(), ""),
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_last_wins_across_plugins() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa",
+            r#"maki.api.set_prompt({ slot = "identity", content = "AAA" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "zzz",
+            r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
+        )
+        .unwrap();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        let entries = slots.get(PromptId::System, Slot::Identity);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.last().unwrap().content, "ZZZ");
+    }
+
+    #[test]
+    fn content_required() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source("bad", r#"maki.api.set_prompt({ slot = "identity" })"#);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("'content' is required"));
+    }
+
+    #[test]
+    fn set_prompt_sets_identity() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                content = "New identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["New identity"]
+        );
+    }
+
+    #[test]
+    fn set_prompt_explicit_system_prompt() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                prompt = "system",
+                content = "Explicit identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Explicit identity"]
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
+    }
+
+    #[test]
+    fn prompt_field_targets_specific_prompt() {
+        let (_host, slots) = slots_from(
+            "targeter",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = "General hint",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["General hint"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn set_prompt_invalid_prompt_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "nope", content = "x" })"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_prompt_and_register_prompt_hint_coexist() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hint",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "setter",
+            r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
+        )
+        .unwrap();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["HINT"]
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["SET"]);
+    }
+
+    #[test]
+    fn set_prompt_replaces_aggregate_default_and_preserves_hints() {
+        const REPLACEMENT: &str = "Analyse information without coding guidance.";
+        const HINT: &str = "Use the library catalogue.";
+        let (_host, slots) = slots_from(
+            "sections",
+            r#"
+            maki.api.set_prompt({ slot = "conventions", prompt = "system", content = "Analyse information without coding guidance." })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "Use the library catalogue." })
+            "#,
+        );
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(rendered.contains(&format!("{REPLACEMENT}\n{HINT}")));
+        assert!(!rendered.contains("Never assume a library is available."));
+        assert!(slots.has_replacements());
+        assert!(!slots.policy_key().is_empty());
+    }
+
+    #[test]
+    fn set_prompt_ignores_known_section_missing_from_template() {
+        let (_host, slots) = slots_from(
+            "absent",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "never lands" })"#,
+        );
+        assert!(contents(&slots, PromptId::Plan, Slot::Identity).is_empty());
+        assert!(!assemble(PromptId::Plan, &slots, "").contains("never lands"));
+    }
+
+    #[test]
+    fn empty_prompt_table_is_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = {}, content = "x" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no sequence entries"));
+    }
+
+    #[test]
+    fn content_must_not_be_empty() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn set_prompt_with_callback() {
+        let (_host, slots) = slots_from(
+            "setter_cb",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                content = function() return "Dyn identity" end,
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Dyn identity"]
+        );
+    }
+
+    #[test]
+    fn singleton_callback_is_collected_once_per_snapshot() {
+        let (host, first) = slots_from(
+            "live",
+            r#"
+            local count = 0
+            maki.api.set_prompt({ prompt = {"system", "research", "general"}, slot = "identity", content = function()
+                count += 1
+                return tostring(count)
+            end })
+            "#,
+        );
+        let second = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
+            assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
+        }
+        assert!(!first.has_replacements());
+        assert!(!second.has_replacements());
+    }
+
+    #[test]
+    fn init_lua_replaces_template_and_section() {
+        const TEMPLATE: &str = "Analysis policy.\n{{conventions}}\n{{instructions}}";
+        const SECTION: &str = "Follow primary sources.";
+        const INSTRUCTIONS: &str = "Keep {{identity}} literal.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_global_init_lua(
+            format!(
+                "maki.api.set_prompt({{prompt = \"system\", slot = \"conventions\", content = {SECTION:?}}})\n\
+                 maki.api.set_prompt({{prompt = \"system\", content = {TEMPLATE:?}}})\n\
+                 maki.setup({{}})"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &runtime().block_on(host.event_handle().collect_prompt_slots(None)),
+                INSTRUCTIONS,
+            ),
+            format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
+        );
+    }
+
+    #[test]
+    fn empty_replacements_clear_default_content() {
+        let (_host, slots) = slots_from(
+            "clear",
+            r#"
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = "" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "" })
+            maki.api.set_prompt({ prompt = "plan", content = "" })
+            "#,
+        );
+        const CODING_CONVENTION: &str = "Never assume a library is available.";
+        let defaults = assemble(PromptId::System, &ResolvedPrompts::default(), "");
+        assert!(defaults.contains(CODING_CONVENTION));
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(!rendered.contains("You are Maki"));
+        assert!(!rendered.contains(CODING_CONVENTION));
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), "");
+        assert!(slots.has_template(PromptId::Plan));
+    }
+
+    #[test_case("system", PromptId::System ; "system")]
+    #[test_case("research", PromptId::Research ; "research")]
+    #[test_case("general", PromptId::General ; "general")]
+    #[test_case("plan", PromptId::Plan ; "plan")]
+    fn complete_replacement_has_no_implicit_sections(name: &str, id: PromptId) {
+        const TEMPLATE: &str = "You help analyse information.";
+        let (_host, slots) = slots_from(
+            "author",
+            &format!("maki.api.set_prompt({{ prompt = {name:?}, content = {TEMPLATE:?} }})"),
+        );
+        assert_eq!(assemble(id, &slots, "coding instructions"), TEMPLATE);
+    }
+
+    #[test]
+    fn template_and_section_compose_independent_of_owner_order() {
+        const CONTENT: &str = "Follow the evidence.\nUse the library catalogue.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa_section",
+            r#"
+            maki.api.set_prompt({ prompt = "plan", slot = "conventions", content = "Follow the evidence." })
+            maki.api.register_prompt_hint({ prompt = "plan", slot = "conventions", content = "Use the library catalogue." })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "zzz_template",
+            r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
+        )
+        .unwrap();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
+    }
+
+    #[test]
+    fn replacements_use_alphabetical_owner_and_last_registration() {
+        const CONTENT: &str = "last template: last section";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "zzz",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "old template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "old section" })
+            maki.api.set_prompt({ prompt = "system", content = "last template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "last section" })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "aaa",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "first template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
+            "#,
+        ).unwrap();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
+        assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
+        host.unload("zzz").unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &runtime().block_on(host.event_handle().collect_prompt_slots(None)),
+                ""
+            ),
+            "first template: first section"
+        );
+    }
+
+    #[test]
+    fn repeated_singleton_discards_callback_and_replaces_only_its_targets() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            maki.api.set_prompt({ prompt = { "system", "general" }, slot = "identity", content = function() return "first" end })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "last" end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["last"]);
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Identity),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn replaced_singleton_callback_is_not_invoked() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function() calls += 1; return "old" end })
+            maki.api.set_prompt({ slot = "identity", content = function() return tostring(calls) end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["0"]);
+    }
+
+    #[test]
+    fn unload_reload_and_failed_load_remove_all_replacements() {
+        const TEMPLATE: &str = "replacement: selected";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = r#"
+            maki.api.set_prompt({ prompt = "system", content = "replacement: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "selected" })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "unused identity" end })
+        "#;
+        host.load_source("owned", source).unwrap();
+        let handle = host.event_handle();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &runtime().block_on(handle.collect_prompt_slots(None)),
+                ""
+            ),
+            TEMPLATE
+        );
+        host.unload("owned").unwrap();
+        assert!(
+            !runtime()
+                .block_on(handle.collect_prompt_slots(None))
+                .has_replacements()
+        );
+        host.load_source("owned", source).unwrap();
+        host.load_source(
+            "owned",
+            r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
+        )
+        .unwrap();
+        let reloaded = runtime().block_on(handle.collect_prompt_slots(None));
+        assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
+        assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
+        assert!(
+            host.load_source("owned", &format!("{source}\nerror('failed load')"))
+                .is_err()
+        );
+        let failed = runtime().block_on(handle.collect_prompt_slots(None));
+        assert!(!failed.has_replacements());
+        assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
+        assert_eq!(
+            assemble(PromptId::System, &failed, ""),
+            assemble(PromptId::System, &ResolvedPrompts::default(), "")
+        );
+    }
+
+    #[test_case(r#"{ content = "x" }"# ; "whole_requires_prompt")]
+    #[test_case(r#"{ prompt = { "system", "general" }, content = "x" }"# ; "whole_requires_one_prompt")]
+    #[test_case(r#"{ prompt = "nope", content = "x" }"# ; "unknown_prompt")]
+    #[test_case(r#"{ prompt = "btw_fallback", content = "x" }"# ; "unsupported_btw_fallback")]
+    #[test_case(r#"{ prompt = "continuation", content = "x" }"# ; "unsupported_continuation")]
+    #[test_case(r#"{ prompt = "compaction_user", content = "x" }"# ; "unsupported_compaction_user")]
+    #[test_case(r#"{ prompt = "compaction_system", content = "x" }"# ; "unsupported_compaction_system")]
+    #[test_case(r#"{ prompt = "plan_end", content = "x" }"# ; "unsupported_plan_end")]
+    #[test_case(r#"{ prompt = "system" }"# ; "missing_whole_content")]
+    #[test_case(r#"{ prompt = "system", content = function() return "x" end }"# ; "whole_callback")]
+    #[test_case(r#"{ slot = "conventions", content = function() return "x" end }"# ; "section_callback")]
+    #[test_case(r#"{ slot = "conventions", content = 42 }"# ; "section_wrong_type")]
+    #[test_case(r#"{ slot = "unknown", content = "x" }"# ; "unknown_section")]
+    #[test_case(r#"{ slot = "conventions" }"# ; "missing_section_content")]
+    #[test_case(r#"{ prompt = "system", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_whole")]
+    #[test_case(r#"{ slot = "conventions", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_section")]
+    fn invalid_replacement_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(
+            host.load_source("invalid", &format!("maki.api.set_prompt({spec})"))
+                .is_err()
+        );
+        assert!(
+            !runtime()
+                .block_on(host.event_handle().collect_prompt_slots(None))
+                .has_replacements()
+        );
+    }
+
+    const UI_CALLS_AT_LOAD: &str = r#"
+    local function report(value, err)
+        maki.ui.flash(tostring(value) .. " " .. tostring(err))
+    end
+    report(maki.ui.action("help"))
+    report(maki.fn.winsaveview())
+    maki.defer_fn(function() report(maki.ui.action("help")) end, 0)
+    "#;
+    const HELP_ANSWERED: &str = "true nil";
+    const UI_NEVER_HEARD: &str = "the plugin never reached the UI";
+    const HELP_NEVER_ASKED: &str = "the deferred action never asked the UI";
+
+    /// The UI answers only after every plugin loaded, and startup waits for
+    /// the load, so a round trip from a plugin's top level would hang maki.
+    /// A callback the load scheduled runs later and gets its answer.
+    #[test]
+    fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut ui = host.take_ui_action_rx().unwrap();
+        host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
+        let mut next = || loop {
+            if let action @ (UiAction::Flash(_) | UiAction::Builtin { .. }) =
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
+            {
+                break action;
+            }
+        };
+
+        let refused = format!("nil {PLUGIN_LOADING_ERR}");
+        for _ in 0..2 {
+            assert!(matches!(next(), UiAction::Flash(msg) if msg == refused));
+        }
+        let UiAction::Builtin {
+            action: BuiltinAction::Help,
+            reply_tx,
+            ..
+        } = next()
+        else {
+            panic!("{HELP_NEVER_ASKED}");
+        };
+        reply_tx.send(true).unwrap();
+        assert!(matches!(next(), UiAction::Flash(msg) if msg == HELP_ANSWERED));
+    }
+
+    /// A buffer belongs to a task and the top level runs in none. The load
+    /// fails with a reason instead of taking the host down.
+    #[test_case("maki.ui.buf()" ; "buf")]
+    #[test_case("maki.async.on_cancel(function() end)" ; "on_cancel")]
+    fn a_task_call_at_the_top_level_fails_the_load(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        let err = host.load_source("top_level", source).unwrap_err();
+
+        assert!(err.to_string().contains(OUTSIDE_TASK_ERR), "{err}");
+        host.load_source("after", "return {}").unwrap();
+    }
+
+    const NORMAL_ONLY_PLUGIN: &str = "old_keys";
+    const NORMAL_ONLY_KEY: &str = "<M-n>";
+
+    /// Bindings in `"n"` alone used to fire while typing and no longer do.
+    /// A plugin that binds in `"i"` too, or holds normal mode, manages modes
+    /// on purpose and is left alone.
+    #[test_case(r#"maki.keymap.set("n", "<M-n>", function() end)"#, true ; "normal_only")]
+    #[test_case(r#"maki.keymap.set({ "n", "i" }, "<M-n>", function() end)"#, false ; "both_modes")]
+    #[test_case(
+        r#"maki.keymap.set("i", "<Esc>", function() maki.ui.set_mode("n") end)
+        maki.keymap.set("n", "<M-n>", function() end)"#,
+        false ;
+        "binds_insert_mode_too"
+    )]
+    #[test_case(
+        r#"maki.ui.set_mode("n")
+        maki.keymap.set("n", "<M-n>", function() end)"#,
+        false ;
+        "holds_normal_mode"
+    )]
+    fn a_normal_only_global_key_is_reported_once(source: &str, reported: bool) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(NORMAL_ONLY_PLUGIN, source).unwrap();
+
+        let warning = host.take_key_warning();
+
+        assert_eq!(warning.is_some(), reported, "{warning:?}");
+        if let Some(warning) = warning {
+            let parts = [
+                MODE_WARNING,
+                NORMAL_ONLY_PLUGIN,
+                NORMAL_ONLY_KEY,
+                UPGRADE_DOCS,
+            ];
+            assert!(parts.iter().all(|part| warning.contains(part)), "{warning}");
+        }
+        host.load_source(NORMAL_ONLY_PLUGIN, source).unwrap();
+        assert_eq!(host.take_key_warning(), None, "a reload repeats nothing");
+    }
+}
+
+/// Holds every bundled `plugin.toml` to what its plugin actually does: the
+/// guarded `maki.*` calls in its lua, and the permissions its tools expose to
+/// the model. The guard map is read out of the `lua_fn` attributes the docs
+/// already record, so moving a function under a different guard shows up here
+/// without anyone editing a table.
+#[cfg(test)]
+mod bundled_manifests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use include_dir::{Dir, DirEntry, File};
+    use maki_agent::tools::{ToolReach, ToolRegistry};
+    use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+    use strum::VariantArray;
+    use test_case::test_case;
+
+    use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use crate::agent_autocmd::HostEventKind;
+    use crate::api::util::command::BuiltinAction;
+    use crate::docs::{DocKind, api_docs};
+    use crate::plugin_permissions::{Permission, SENDS_PROMPT};
+
+    const TEST_DIR: &str = "tests";
+    const READS_FILES: Option<ToolReach> = Some(ToolReach::Capability {
+        permission: Permission::FsRead,
+        prompted: false,
+    });
+    const LUA_EXT: &str = "lua";
+    const REQUIRE_CALL: &str = "require(";
+    const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const TOOL_REGISTER: &str = "maki.api.register_tool";
+    const API_KEY_ENV_FIELD: &str = "api_key_env";
+    const AGENT_SESSION: &str = "maki.agent.session";
+    const SESSION_NOTIFY: &str = "maki.session.notify";
+    const WAKE_OPTION: &str = "wake =";
+    const UI_ACTION_CALL: &str = "maki.ui.action(";
+    const INPUT_EDIT_CALL: &str = "maki.ui.input_edit";
+    const DISABLED_WAKE: &str = "false";
+    const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
+    const CTX_BACKGROUND: &str = "ctx:background";
+    const LUA_QUOTES: [char; 2] = ['"', '\''];
+
+    /// Every guarded `maki.*` function under the dotted name lua calls it by.
+    fn guarded_calls() -> Vec<(String, Permission)> {
+        api_docs()
+            .into_iter()
+            .filter(|module| module.kind == DocKind::Table)
+            .flat_map(|module| {
+                module.fns.iter().flat_map(move |func| {
+                    func.guard
+                        .unwrap_or_default()
+                        .iter()
+                        .map(move |&permission| {
+                            (format!("{}.{}", module.name, func.name), permission)
+                        })
+                })
+            })
+            .collect()
+    }
+
+    /// Every bundled tool as `(plugin, tool, reach)`, read off a real load
+    /// rather than off the source text, because `register_tool` refuses a
+    /// permission the plugin lacks, which makes shipping the tool itself a use
+    /// of it.
+    fn bundled_reaches() -> Vec<(String, String, Option<ToolReach>)> {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .expect("every bundled plugin loads");
+        registry
+            .iter()
+            .iter()
+            .map(|tool| {
+                (
+                    tool.source.plugin.to_string(),
+                    tool.name().to_owned(),
+                    tool.tool.reach(),
+                )
+            })
+            .collect()
+    }
+
+    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
+        let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
+        for (plugin, _, reach) in bundled_reaches() {
+            if let Some(permission) = reach.and_then(ToolReach::permission) {
+                out.entry(plugin).or_default().insert(permission);
+            }
+        }
+        out
+    }
+
+    /// A declaration here sets the price of the tool for every hook and
+    /// session at once, so changing one should be a choice, never a slip.
+    #[test_case("todo_write",     Some(ToolReach::Inert) ; "todo_write_reaches_nothing")]
+    #[test_case("question",       Some(ToolReach::Inert) ; "question_reaches_nothing")]
+    #[test_case("view_image",     READS_FILES            ; "view_image_reads_files")]
+    #[test_case("skill",          READS_FILES            ; "skill_reads_files")]
+    #[test_case("batch",          None                   ; "batch_is_undeclared")]
+    #[test_case("code_execution", None                   ; "code_execution_is_undeclared")]
+    #[test_case("memory",         None                   ; "memory_is_undeclared")]
+    #[test_case("task",           None                   ; "task_is_undeclared")]
+    fn bundled_tools_declare_their_reach(tool: &str, expected: Option<ToolReach>) {
+        let (_, _, reach) = bundled_reaches()
+            .into_iter()
+            .find(|(_, name, _)| name == tool)
+            .expect("the bundled tool loads");
+        assert_eq!(reach, expected);
+    }
+
+    /// Specs, not runtime code. What a test calls must not buy the plugin a
+    /// permission its handlers never use.
+    fn runtime_lua(file: &'static File<'static>) -> Option<&'static str> {
+        let path = file.path();
+        if path.extension()? != LUA_EXT || path.components().any(|p| p.as_os_str() == TEST_DIR) {
+            return None;
+        }
+        file.contents_utf8()
+    }
+
+    fn collect_runtime_lua(dir: &'static Dir<'static>, out: &mut Vec<&'static str>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_runtime_lua(sub, out),
+                DirEntry::File(file) => out.extend(runtime_lua(file)),
+            }
+        }
+    }
+
+    fn required_module_names(source: &'static str) -> impl Iterator<Item = &'static str> {
+        source.match_indices(REQUIRE_CALL).filter_map(|(start, _)| {
+            let rest = &source[start + REQUIRE_CALL.len()..];
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let name = &rest[quote.len_utf8()..];
+            name.find(quote).map(|end| &name[..end])
+        })
+    }
+
+    /// A guard resolves against the calling plugin, so a `lib` helper spends
+    /// the caller's permissions and counts as the caller's usage. `lib` is the
+    /// only plugin another one reaches into: anything else a `require` names is
+    /// the plugin's own file, already collected, or a virtual module such as
+    /// `plugin_dev`. A plugin's own directory is taken whole rather than walked
+    /// from its entrypoint, because `index` builds its language module names at
+    /// runtime.
+    fn runtime_sources(dir: &'static Dir<'static>) -> Vec<&'static str> {
+        let mut sources = Vec::new();
+        collect_runtime_lua(dir, &mut sources);
+        let mut seen = BTreeSet::new();
+        let mut next = 0;
+        while let Some(source) = sources.get(next).copied() {
+            next += 1;
+            let reached: Vec<&'static str> = required_module_names(source)
+                .filter(|modname| seen.insert(*modname))
+                .filter_map(|modname| {
+                    lib_dir().get_file(format!("{}.{LUA_EXT}", modname.replace('.', "/")))
+                })
+                .filter_map(runtime_lua)
+                .collect();
+            sources.extend(reached);
+        }
+        sources
+    }
+
+    /// Whole-word only, so `maki.fs.read` is not reported for every
+    /// `maki.fs.read_bytes`.
+    fn calls(source: &str, name: &str) -> bool {
+        source.match_indices(name).any(|(at, _)| {
+            !source[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// A `maki.ui.action` call naming a built-in that changes the input.
+    fn runs_an_input_action(source: &str) -> bool {
+        source.match_indices(UI_ACTION_CALL).any(|(at, _)| {
+            let rest = &source[at + UI_ACTION_CALL.len()..];
+            let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                return false;
+            };
+            let name = &rest[1..];
+            name.find(quote)
+                .and_then(|end| name[..end].parse::<BuiltinAction>().ok())
+                .is_some_and(BuiltinAction::changes_input)
+        })
+    }
+
+    #[test_case(r#"maki.ui.action("undo")"#, true ; "undo")]
+    #[test_case("maki.ui.action('newline')", true ; "newline_in_single_quotes")]
+    #[test_case(r#"maki.ui.action("input_raw")"#, false ; "a_view_toggle")]
+    #[test_case(r#"maki.ui.action("completion.accept")"#, false ; "a_plugin_action")]
+    fn an_input_action_is_spotted(source: &str, spotted: bool) {
+        assert_eq!(runs_an_input_action(source), spotted);
+    }
+
+    fn wakes_session(source: &str) -> bool {
+        calls(source, SESSION_NOTIFY)
+            && source.split(WAKE_OPTION).skip(1).any(|option| {
+                option.split([',', '}']).next().unwrap_or_default().trim() != DISABLED_WAKE
+            })
+    }
+
+    #[test_case("true", true ; "unconditional_wake")]
+    #[test_case("false", false ; "queue_only")]
+    #[test_case("not stopped", true ; "conditional_wake")]
+    #[test_case("false or enabled", true ; "conditional_after_false")]
+    fn notification_wake_usage_requires_the_agent_grant(value: &str, needed: bool) {
+        let source = format!("{SESSION_NOTIFY}('done', {{ session = id, wake = {value} }})");
+        assert_eq!(wakes_session(&source), needed);
+    }
+
+    /// `PROVIDER_BUILTINS` is what keeps a provider plugin's name from reading
+    /// as a tool, so a bundled plugin that starts registering one must join it.
+    #[test]
+    fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
+        let mut registering: Vec<&str> = BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| {
+                runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, PROVIDER_REGISTER))
+            })
+            .map(|p| p.name)
+            .collect();
+        let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
+        registering.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(registering, expected);
+    }
+
+    /// `NON_TOOL_BUILTINS` keeps a UI-only plugin's name from reading as a
+    /// tool, so it must list exactly the defaults that register neither.
+    #[test]
+    fn non_tool_builtins_are_the_defaults_that_register_no_tool_or_provider() {
+        let mut silent: Vec<&str> = BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+            .filter(|p| {
+                !runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, TOOL_REGISTER) || calls(s, PROVIDER_REGISTER))
+            })
+            .map(|p| p.name)
+            .collect();
+        let mut expected = maki_config::NON_TOOL_BUILTINS.to_vec();
+        silent.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(silent, expected);
+    }
+
+    #[test]
+    fn bundled_manifests_match_the_permissions_their_plugin_uses() {
+        let tools = tool_permissions();
+        let guarded = guarded_calls();
+        let mut drift = Vec::new();
+        // `lib` is the one bundled directory that never loads on its own, so it
+        // ships no manifest and its modules answer to whoever requires them.
+        for plugin in BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+        {
+            let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
+            // Each permission paired with the usage demanding it, so a failure
+            // points at something to go look at.
+            let mut needed: BTreeMap<Permission, String> = tools
+                .get(plugin.name)
+                .into_iter()
+                .flatten()
+                .map(|permission| (*permission, format!("a tool exposing '{permission}'")))
+                .collect();
+            for source in runtime_sources(&plugin.dir) {
+                for (name, permission) in &guarded {
+                    if calls(source, name) {
+                        needed.entry(*permission).or_insert_with(|| name.clone());
+                    }
+                }
+                // `api_key_env` is a field, not a call, so the scan above
+                // misses it. Registration still refuses it without `env`.
+                if calls(source, PROVIDER_REGISTER) && calls(source, API_KEY_ENV_FIELD) {
+                    needed
+                        .entry(Permission::Env)
+                        .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                // Waking a chat is guarded only when the option is set, so
+                // it has no unconditional guard in the API metadata.
+                if wakes_session(source) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| format!("{SESSION_NOTIFY} with {WAKE_OPTION}"));
+                }
+                // A ctx method, so the API metadata has no guard for it.
+                if calls(source, CTX_BACKGROUND) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| CTX_BACKGROUND.to_owned());
+                }
+                // Events are never refused, they arrive without their content
+                // fields, so no guard records the need. A bundled plugin
+                // subscribing to an event that has content is reading it.
+                if calls(source, CREATE_AUTOCMD) {
+                    for &kind in HostEventKind::VARIANTS {
+                        let event: &str = kind.into();
+                        if !kind.fields().content.is_empty()
+                            && LUA_QUOTES
+                                .iter()
+                                .any(|q| source.contains(&format!("{q}{event}{q}")))
+                        {
+                            needed
+                                .entry(Permission::SessionRead)
+                                .or_insert_with(|| format!("subscribing to {event}"));
+                        }
+                    }
+                }
+                // A built-in action is guarded by its name, and an edit by
+                // whether it changes the text, which the API metadata cannot
+                // see.
+                let edits_by_action = runs_an_input_action(source);
+                if edits_by_action {
+                    needed
+                        .entry(Permission::Input)
+                        .or_insert_with(|| "a built-in action that edits".to_owned());
+                }
+                if edits_by_action || calls(source, INPUT_EDIT_CALL) {
+                    for &permission in SENDS_PROMPT {
+                        needed
+                            .entry(permission)
+                            .or_insert_with(|| "changing the text of the input".to_owned());
+                    }
+                }
+                // A bundled plugin opening a session hands over whatever the
+                // chat has, and a session pays for everything it hands over.
+                // That leaves out what no tool reaches, as the session's own
+                // check does.
+                if calls(source, AGENT_SESSION) {
+                    for &permission in Permission::ALL {
+                        if !matches!(permission, Permission::Agent | Permission::Input) {
+                            needed
+                                .entry(permission)
+                                .or_insert_with(|| AGENT_SESSION.to_owned());
+                        }
+                    }
+                }
+            }
+
+            let manifest = format!("plugins/{}/plugin.toml", plugin.name);
+            for &permission in Permission::ALL {
+                match (declared.is_allowed(permission), needed.get(&permission)) {
+                    (false, Some(usage)) => drift.push(format!(
+                        "{manifest}: {usage} needs '{permission}', grant it or drop the usage"
+                    )),
+                    (true, None) => drift.push(format!(
+                        "{manifest}: declares '{permission}' but nothing its runtime lua reaches needs it, remove it"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
+    }
+
+    fn collect_lua_files(dir: &'static Dir<'static>, out: &mut Vec<&'static File<'static>>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_lua_files(sub, out),
+                DirEntry::File(file) if file.path().extension() == Some(LUA_EXT.as_ref()) => {
+                    out.push(file);
+                }
+                DirEntry::File(_) => {}
+            }
+        }
+    }
+
+    /// Bundled Lua ships in the binary, so it is linted here instead of at
+    /// every start. Every file counts, specs and modules too, because key
+    /// handling rarely lives in `init.lua`.
+    #[test]
+    fn bundled_lua_has_no_wrong_key_spellings() {
+        let mut linted = 0;
+        let mut findings = Vec::new();
+        for plugin in BUNDLED_PLUGINS {
+            let mut files = Vec::new();
+            collect_lua_files(&plugin.dir, &mut files);
+            for file in files {
+                let Some(source) = file.contents_utf8() else {
+                    continue;
+                };
+                let name = format!("{}/{}", plugin.name, file.path().display());
+                findings.extend(crate::key_lint::lint(&name, source));
+                linted += 1;
+            }
+        }
+
+        assert!(
+            linted > BUNDLED_PLUGINS.len(),
+            "the walk reached past init.lua"
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+}

@@ -1,0 +1,2152 @@
+local truncate = require("maki.truncate")
+local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
+local th = require("maki.test_helpers")
+
+-- Splitting a line is a method, not a key, so the random walk names it apart
+-- from the keys it presses.
+local SPLIT_LINE = "split_line"
+
+local case = th.case
+local eq = th.eq
+
+-- Mock buf that records set_lines calls
+local function mock_buf()
+  local b = { lines = nil, call_count = 0 }
+  function b:set_lines(lines)
+    self.lines = lines
+    self.call_count = self.call_count + 1
+  end
+  function b:on() end
+  return b
+end
+
+case("truncate_within_limits_unchanged", function()
+  eq(truncate("hello", 100, 1000), "hello")
+  eq(truncate("a\nb\nc", 3, 1000), "a\nb\nc")
+  eq(truncate("", 100, 1000), "")
+end)
+
+case("truncate_exceeds_line_limit", function()
+  local result = truncate("aaa\nbbb\nccc\nddd", 2, 1000)
+  assert(result:find("aaa", 1, true), "should keep first line")
+  assert(result:find("bbb", 1, true), "should keep second line")
+  assert(not result:find("ccc", 1, true), "should drop third line")
+  assert(result:find("%[truncated %d+ bytes%]"), "should have truncation marker")
+end)
+
+local function truncated(kept, dropped_bytes)
+  return kept .. "\n\n[truncated " .. dropped_bytes .. " bytes]"
+end
+
+case("truncate_single_oversized_line_keeps_prefix", function()
+  eq(truncate(string.rep("x", 200), 1000, 50), truncated(string.rep("x", 50), 150))
+end)
+
+case("truncate_oversized_line_after_kept_lines_is_dropped", function()
+  local text = "short\n" .. string.rep("x", 100) .. "\nlast"
+  eq(truncate(text, 1000, 20), truncated("short", 106))
+end)
+
+case("truncate_oversized_line_cuts_on_utf8_boundary", function()
+  eq(truncate(string.rep("é", 10), 1000, 5), truncated("éé", 16))
+end)
+
+case("truncate_trailing_newlines_counted", function()
+  local result = truncate("a\n\n\n\n\n", 2, 1000)
+  assert(result:find("%[truncated"), "trailing newlines should count as lines")
+end)
+
+local function cut_middle(head, lines, bytes, tail)
+  return head .. "\n\n[truncated " .. lines .. " lines, " .. bytes .. " bytes]" .. (tail and "\n\n" .. tail or "")
+end
+
+case("cut_middle_within_limits_unchanged", function()
+  eq(output_limits.cut_middle("a\nb\nc", 3, 1000), "a\nb\nc")
+  eq(output_limits.cut_middle("a\nb\nc", nil, nil), "a\nb\nc")
+  eq(output_limits.cut_middle("", 1, 1), "")
+end)
+
+case("cut_middle_keeps_both_ends_on_line_limit", function()
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne\nf", 4, 1000), cut_middle("a\nb", 2, 5, "e\nf"))
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000), cut_middle("a\nb", 2, 5, "e"), "the head gets the odd line")
+end)
+
+case("cut_middle_keeps_both_ends_on_byte_limit", function()
+  local text = "aaaa\nbbbb\ncccc\ndddd\neeee"
+  eq(output_limits.cut_middle(text, 1000, 10), cut_middle("aaaa", 3, 16, "eeee"))
+end)
+
+case("cut_middle_oversized_first_line_keeps_a_utf8_prefix", function()
+  eq(output_limits.cut_middle(string.rep("é", 10), 1000, 6), cut_middle("é", 0, 18))
+  eq(output_limits.cut_middle(string.rep("x", 20) .. "\nok", 1000, 10), cut_middle("xxxxx", 0, 16, "ok"))
+end)
+
+case("cut_middle_unlimited_lines_keeps_tail", function()
+  eq(output_limits.cut_middle("aa\nbb\ncc\ndd\nee", nil, 10), cut_middle("aa", 3, 10, "ee"))
+end)
+
+local function records(n, width)
+  local out = {}
+  for i = 1, n do
+    out[i] = string.rep(string.char(96 + i % 26), (i * 7) % width)
+  end
+  return out
+end
+
+case("cut_middle_drops_lines_over_the_tail_budget", function()
+  local text = "a\n" .. string.rep("x", 50) .. "\nb\n" .. string.rep("y", 50) .. "\nc"
+  eq(output_limits.cut_middle(text, 1000, 20), cut_middle("a", 3, 105, "c"))
+end)
+
+case("collector_result_tracks_the_stream", function()
+  local collector = output_limits.collector(3, 1000)
+  eq(collector:result(), "", "no lines")
+  for _, line in ipairs({ "a", "b", "c", "d", "e" }) do
+    collector:append(line)
+  end
+  eq(collector:result(), output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000))
+  collector:append("f")
+  eq(collector:result(), cut_middle("a\nb", 3, 7, "f"))
+end)
+
+local function retained_bytes(collector)
+  if not collector.head then
+    return #table.concat(collector.lines, "\n")
+  end
+  return #collector.head + collector.tail_used
+end
+
+case("collector_retention_stays_within_limits", function()
+  local max_bytes = 500
+  local collector = output_limits.collector(20, max_bytes)
+  for i, line in ipairs(records(5000, 40)) do
+    collector:append(line)
+    assert(retained_bytes(collector) <= max_bytes, "over the byte budget after line " .. i)
+  end
+end)
+
+case("collector_full_mode_caps_at_ceiling", function()
+  local mib = string.rep("x", 1024 * 1024)
+  local collector = output_limits.collector(nil, nil)
+  local total = output_limits.FULL_OUTPUT_MAX_BYTES // #mib + 1
+  for _ = 1, total do
+    collector:append(mib)
+  end
+  local out = collector:result()
+  assert(#out <= output_limits.FULL_OUTPUT_MAX_BYTES + 100, "full mode kept " .. #out .. " bytes")
+  th.has(out, "[truncated ")
+end)
+
+case("collector_full_mode_caps_lines", function()
+  local collector = output_limits.collector(nil, nil)
+  for _ = 1, output_limits.FULL_OUTPUT_MAX_LINES + 1 do
+    collector:append("")
+  end
+  th.has(collector:result(), "[truncated 1 lines, ")
+end)
+
+case("collector_counts_the_uncut_bytes_of_a_cut_line", function()
+  local collector = output_limits.collector(1000, 4)
+  collector:append("abcd...", 600)
+  eq(collector:result(), cut_middle("ab", 0, 598))
+end)
+
+case("collector_fits_until_it_would_cut_and_newest_has_no_gap", function()
+  local collector = output_limits.collector(4, 1000)
+  for _, line in ipairs({ "a", "b", "c" }) do
+    collector:append(line)
+  end
+  local newest, before = collector:newest()
+  eq(table.concat(newest, ","), "a,b,c")
+  eq(before, 0)
+  assert(collector:fits(1), "a fourth line fits")
+  collector:append("d")
+  assert(not collector:fits(1), "a fifth line would cut")
+  collector:append("e")
+  collector:append("f")
+  newest, before = collector:newest()
+  eq(table.concat(newest, ","), "e,f")
+  eq(before, 4)
+end)
+
+-- ToolView tests
+
+case("tool_view_line_nr_fmt_right_aligns_to_max_width", function()
+  local vectors = {
+    { 0, "1" },
+    { 9, "1" },
+    { 10, " 1" },
+    { 99, " 1" },
+    { 100, "  1" },
+    { 1000, "   1" },
+  }
+  for _, v in ipairs(vectors) do
+    eq(string.format(ToolView.line_nr_fmt(v[1]), 1), v[2], "max_line_nr=" .. v[1])
+  end
+  eq(string.format(ToolView.line_nr_fmt(100), 100), "100")
+end)
+
+case("tool_view_tail_keeps_last_n", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  eq(#buf.lines, 4) -- 3 ring lines + 1 notice
+  eq(buf.lines[1][1][1], "... (2 lines) (click to expand)")
+  eq(buf.lines[2], "line3")
+  eq(buf.lines[3], "line4")
+  eq(buf.lines[4], "line5")
+end)
+
+case("tool_view_head_keeps_first_n", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "head" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:finish()
+  eq(#buf.lines, 4) -- 3 ring lines + 1 notice
+  eq(buf.lines[1], "line1")
+  eq(buf.lines[2], "line2")
+  eq(buf.lines[3], "line3")
+  eq(buf.lines[4][1][1], "... (2 lines) (click to expand)")
+end)
+
+case("tool_view_header_appears_first", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 5 })
+  view:set_header({ "cmd" })
+  view:append("output1")
+  eq(buf.lines[1], "cmd")
+  eq(buf.lines[2][1][1], "──────")
+  eq(buf.lines[3], "output1")
+end)
+
+case("tool_view_ring_wraparound", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  eq(view.skipped, 7)
+  eq(buf.lines[1][1][1], "... (7 lines) (click to expand)")
+  eq(buf.lines[2], "line8")
+  eq(buf.lines[3], "line9")
+  eq(buf.lines[4], "line10")
+end)
+
+case("tool_view_zero_lines_shows_only_header_until_expanded", function()
+  for _, keep in ipairs({ "head", "tail" }) do
+    for _, count in ipairs({ 1, 5 }) do
+      local label = keep .. " count=" .. count
+      local buf = mock_buf()
+      local view = ToolView.new(buf, { max_lines = 0, keep = keep })
+      view:set_header({ "cmd" })
+      for i = 1, count do
+        view:append("line" .. i)
+      end
+      view:finish()
+      eq(#buf.lines, 1, label)
+      eq(buf.lines[1], "cmd", label)
+      eq(view:visible_count(), 0, label)
+      view:toggle()
+      eq(#buf.lines, count + 2, label) -- header + separator
+      eq(buf.lines[3], "line1", label)
+    end
+  end
+end)
+
+case("tool_view_expanded_shows_lines_appended_past_the_cap", function()
+  for _, opts in ipairs({ { max_lines = 0, keep = "tail" }, { max_lines = 1, keep = "head" } }) do
+    local label = opts.keep .. " max=" .. opts.max_lines
+    local buf = mock_buf()
+    local view = ToolView.new(buf, opts)
+    view:append("line1")
+    view:toggle()
+    view:append("line2")
+    eq(#buf.lines, 2, label)
+    eq(buf.lines[2], "line2", label)
+  end
+end)
+
+case("tool_view_finish_flushes_head_skipped", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 2, keep = "head" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  local count_before = buf.call_count
+  view:finish()
+  assert(buf.call_count > count_before, "finish should flush when head has skipped lines")
+  eq(buf.lines[3][1][1], "... (3 lines) (click to expand)")
+end)
+
+case("tool_view_no_truncation_within_limit", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 10, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  eq(#buf.lines, 5)
+  eq(view.skipped, 0)
+end)
+
+case("tool_view_toggle_expands_all_lines", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  eq(#buf.lines, 4) -- 3 visible + hidden notice
+  view:toggle()
+  eq(#buf.lines, 10) -- 10 data lines
+  eq(buf.lines[1], "line1")
+  eq(buf.lines[10], "line10")
+end)
+
+case("tool_view_toggle_twice_collapses_back", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  view:toggle()
+  eq(#buf.lines, 4)
+  eq(buf.lines[1][1][1], "... (7 lines) (click to expand)")
+  eq(buf.lines[2], "line8")
+end)
+
+case("tool_view_toggle_head_mode_expands", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 2, keep = "head" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:finish()
+  eq(buf.lines[3][1][1], "... (3 lines) (click to expand)")
+  view:toggle()
+  eq(buf.lines[1], "line1")
+  eq(buf.lines[5], "line5")
+end)
+
+case("tool_view_expand_cap_overflow_shows_omitted", function()
+  local buf = mock_buf()
+  local cap = 20
+  local view = ToolView.new(buf, { max_lines = 2, keep = "tail", max_expand_lines = cap })
+  for i = 1, cap + 5 do
+    view:append("line" .. i)
+  end
+  eq(view.all_skipped, 5)
+  view:toggle()
+  eq(buf.lines[1], "line1")
+  eq(buf.lines[cap], "line" .. cap)
+  eq(buf.lines[cap + 1][1][1], "5 lines omitted")
+end)
+
+case("tool_view_no_collapse_link_when_within_max", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 10, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  for _, line in ipairs(buf.lines) do
+    if type(line) == "table" and line[1] and line[1][1] == "click to collapse" then
+      error("should not show collapse link when lines <= max")
+    end
+  end
+end)
+
+case("tool_view_clear_resets_data_but_keeps_expanded", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  eq(view.expanded, true)
+  view:clear()
+  eq(#view.all_lines, 0)
+  eq(view.all_skipped, 0)
+  eq(view.ring_count, 0)
+  eq(view.skipped, 0)
+end)
+
+case("tool_view_header_preserved_after_toggle", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  view:set_header({ "$ echo hello" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  eq(buf.lines[1], "$ echo hello")
+  eq(buf.lines[2][1][1], "──────")
+  eq(buf.lines[3], "line1")
+  eq(buf.lines[12], "line10")
+end)
+
+case("tool_view_no_truncate_single_line", function()
+  for _, mode in ipairs({ "tail", "head" }) do
+    local buf = mock_buf()
+    local view = ToolView.new(buf, { max_lines = 3, keep = mode })
+    for i = 1, 4 do
+      view:append("line" .. i)
+    end
+    if mode == "head" then
+      view:finish()
+    end
+    eq(#buf.lines, 4, mode .. ": should inline the single skipped line")
+    eq(buf.lines[1], "line1", mode)
+    eq(buf.lines[4], "line4", mode)
+  end
+end)
+
+case("tool_view_append_after_toggle_still_works", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  view:append("line6")
+  eq(view.all_lines[6], "line6")
+end)
+
+case("tool_view_max_line_bytes_truncates_string_line", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 10 })
+  view:append(string.rep("a", 20))
+  eq(#buf.lines[1], 13)
+  assert(buf.lines[1]:find("…"), "truncated line should end with ellipsis")
+  eq(buf.lines[1]:sub(1, 10), string.rep("a", 10))
+end)
+
+case("tool_view_max_line_bytes_truncates_span_line", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 12 })
+  view:append({ { "hello", "dim" }, " ", { "worldoverflow", "error" } })
+  eq(buf.lines[1][1][1], "hello")
+  eq(buf.lines[1][1][2], "dim")
+  eq(buf.lines[1][3][2], "error")
+  assert(buf.lines[1][3][1]:find("…"), "span should be truncated with ellipsis")
+end)
+
+case("tool_view_max_line_bytes_utf8_safe", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 10 })
+  view:append("éééééééééé")
+  eq(buf.lines[1], string.rep("é", 5) .. "…")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_lines", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append(string.rep("a", 1000))
+  view:append({ { string.rep("b", 1000), "dim" }, "tail" })
+  local cut, span = "aaaaa…", "bbbbb…"
+  eq(view.all_lines[1], cut)
+  eq(#view.all_lines[2], 1, "spans past the cap are not stored")
+  eq(view.all_lines[2][1][1], span)
+  eq(buf.lines[1], cut, "a stored cut line renders unchanged")
+  eq(#buf.lines[2], 1)
+  eq(buf.lines[2][1][1], span)
+  eq(buf.lines[2][1][2], "dim")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_updates", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append("short")
+  view:update_line(1, { { string.rep("c", 1000), "keyword" } })
+  view:flush()
+  eq(view.all_lines[1][1][1], "ccccc…")
+  eq(view.ring[1][1][1], "ccccc…")
+  eq(buf.lines[1][1][1], "ccccc…")
+end)
+
+case("tool_view_max_line_bytes_default_off", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  local long = string.rep("a", 100)
+  view:append(long)
+  eq(buf.lines[1], long)
+end)
+
+local RESTORE_OPTS = { max_lines = 10, keep = "head", width = 80 }
+local RESTORE_OUTPUT = "**bold** line\nsecond line"
+local RENDERED = "rendered by markdown"
+
+local function all_text(lines)
+  local out = {}
+  for _, line in ipairs(lines) do
+    if type(line) == "string" then
+      out[#out + 1] = line
+    else
+      for _, span in ipairs(line) do
+        out[#out + 1] = span[1]
+      end
+    end
+  end
+  return table.concat(out, "\n")
+end
+
+-- Restores {output} with {markdown} standing in for the real renderer; returns
+-- the text that reached the buf and how many times the renderer ran.
+local function restore_markdown(output, is_error, markdown)
+  local buf = mock_buf()
+  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local calls = 0
+  maki.ui.buf = function()
+    return buf
+  end
+  maki.ui.markdown = function(...)
+    calls = calls + 1
+    return markdown(...)
+  end
+  local ok, err = pcall(ToolView.restore_markdown, output, is_error, RESTORE_OPTS)
+  maki.ui.buf, maki.ui.markdown = original.buf, original.markdown
+  assert(ok, tostring(err))
+  return all_text(buf.lines), calls
+end
+
+local function markdown_marker()
+  return { { { RENDERED, "md" } } }
+end
+
+case("tool_view_restore_markdown_renders_markdown", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, false, markdown_marker)
+  eq(calls, 1, "output must go through markdown rendering")
+  eq(text, RENDERED, "the rendered lines are what reaches the buf")
+end)
+
+case("tool_view_restore_markdown_keeps_errors_plain", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, true, markdown_marker)
+  eq(calls, 0, "error output must never reach the markdown renderer")
+  eq(text, RESTORE_OUTPUT, "error output must render verbatim")
+end)
+
+case("tool_view_restore_markdown_falls_back_when_rendering_fails", function()
+  local text = restore_markdown(RESTORE_OUTPUT, false, function()
+    error("renderer blew up")
+  end)
+  eq(text, RESTORE_OUTPUT, "a failing renderer must not swallow the output")
+end)
+
+local TextInput = require("maki.text_input")
+
+case("text_input_insert_and_value", function()
+  local input = TextInput.new()
+  input:handle_key("h")
+  input:handle_key("i")
+  eq(input:value(), "hi")
+  eq(input.col, 2)
+end)
+
+case("text_input_backspace_at_start_noop", function()
+  local input = TextInput.new()
+  input:handle_key("<BS>")
+  eq(input:value(), "")
+  eq(input.col, 0)
+end)
+
+case("text_input_backspace_deletes", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("c")
+  input:handle_key("<BS>")
+  eq(input:value(), "ab")
+  eq(input.col, 2)
+end)
+
+case("text_input_shift_backspace_deletes", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("<S-BS>")
+  eq(input:value(), "a")
+  eq(input.col, 1)
+end)
+
+case("text_input_cursor_movement", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("c")
+  input:handle_key("<Left>")
+  eq(input.col, 2)
+  input:handle_key("<Left>")
+  eq(input.col, 1)
+  input:handle_key("<Left>")
+  eq(input.col, 0)
+  input:handle_key("<Left>")
+  eq(input.col, 0)
+  input:handle_key("<Right>")
+  eq(input.col, 1)
+  input:handle_key("<End>")
+  eq(input.col, 3)
+  input:handle_key("<Home>")
+  eq(input.col, 0)
+end)
+
+case("text_input_delete_word", function()
+  local input = TextInput.new()
+  for c in ("hello world"):gmatch(".") do
+    input:handle_key(c)
+  end
+  eq(input:value(), "hello world")
+  input:handle_key("<C-w>")
+  eq(input:value(), "hello ", "ctrl+w eats the last word in one press")
+  input:handle_key("<C-w>")
+  eq(input:value(), "", "second ctrl+w eats remaining trailing space and word")
+end)
+
+local R = TextInput.Result
+
+case("text_input_unknown_key_returns_ignored", function()
+  local input = TextInput.new()
+  eq(input:handle_key("<C-z>"), R.IGNORED)
+  eq(input:handle_key("<F1>"), R.IGNORED)
+end)
+
+case("text_input_multibyte_key_inserts_single_codepoint", function()
+  local input = TextInput.new()
+  eq(input:handle_key("你"), R.CHANGED, "single CJK codepoint key is inserted, not ignored by byte length")
+  eq(input:value(), "你")
+  input:handle_key("好")
+  eq(input:value(), "你好")
+  input:handle_key("<Left>")
+  eq(input:char_before_cursor(), "你")
+end)
+
+case("text_input_render_format", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("<Left>")
+  local r = input:render("> ")
+  eq(#r.lines, 1)
+  eq(r.cursor_row, 1)
+  local spans = r.lines[1]
+  eq(#spans, 4)
+  eq(spans[1][1], "> ")
+  eq(spans[1][2], "dim")
+  eq(spans[2][1], "a")
+  eq(spans[2][2], "")
+  eq(spans[3][1], "b")
+  eq(spans[3][2], "cursor")
+  eq(spans[4][1], "")
+  eq(spans[4][2], "")
+end)
+
+case("text_input_is_empty", function()
+  local input = TextInput.new()
+  eq(input:is_empty(), true)
+  input:handle_key("x")
+  eq(input:is_empty(), false)
+end)
+
+case("text_input_utf8_insert_navigate_delete_render", function()
+  local input = TextInput.new()
+  input:insert_text("héllo — wörld")
+  eq(input:value(), "héllo — wörld", "paste preserves multibyte text")
+  eq(input:char_before_cursor(), "d", "char_before_cursor over single-byte")
+
+  input = TextInput.new()
+  input:insert_text("aé")
+  eq(input.col, 3, "cursor at end of 'aé' (1 + 2 bytes)")
+  input:handle_key("<Left>")
+  eq(input.col, 1, "left jumps over whole codepoint")
+  eq(input:char_before_cursor(), "a")
+  input:handle_key("<Right>")
+  eq(input.col, 3, "right jumps over whole codepoint")
+  input:handle_key("<BS>")
+  eq(input:value(), "a", "backspace removes whole codepoint")
+
+  input = TextInput.new()
+  input:insert_text("aé")
+  input:handle_key("<Left>")
+  local spans = input:render("> ").lines[1]
+  eq(spans[2][1], "a", "text before cursor")
+  eq(spans[3][1], "é", "cursor span is whole codepoint")
+  eq(spans[3][2], "cursor")
+end)
+
+case("text_input_insert_text_table_driven", function()
+  local cases = {
+    { "foo\nbar\nbaz", 3, "foo\nbar\nbaz", 3, 3 },
+    { "a\n", 2, "a\n", 2, 0 },
+    { "\nx", 2, "\nx", 2, 1 },
+    { "\n\n\n", 4, "\n\n\n", 4, 0 },
+    { "é\nö\n世界", 3, "é\nö\n世界", 3, #"世界" },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text(c[1])
+    eq(input:line_count(), c[2], "case " .. i .. ": line_count")
+    eq(input:value(), c[3], "case " .. i .. ": value")
+    eq(input.line, c[4], "case " .. i .. ": line")
+    eq(input.col, c[5], "case " .. i .. ": col")
+  end
+end)
+
+case("text_input_newline_table_driven", function()
+  local cases = {
+    { { "<Left>", "<Left>" }, "hel\nlo" },
+    { { "<Home>" }, "\nhello" },
+    { { "<End>" }, "hello\n" },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text("hello")
+    for _, k in ipairs(c[1]) do
+      input:handle_key(k)
+    end
+    input:split_line()
+    eq(input:value(), c[2], "case " .. i)
+    eq(input:line_count(), 2, "case " .. i .. ": two lines")
+    eq(input.line, 2, "case " .. i .. ": cursor on new line")
+    eq(input.col, 0, "case " .. i .. ": cursor at col 0")
+  end
+end)
+
+case("text_input_up_down_navigation_clamps_and_no_ops", function()
+  local input = TextInput.new()
+  input:insert_text("abc\nlonger_line")
+  eq(input.line, 2)
+  eq(input.col, 11, "cursor at end of longer line")
+  input:handle_key("<Up>")
+  eq(input.line, 1)
+  eq(input.col, 3, "col clamps to short line length")
+  input:handle_key("<Up>")
+  eq(input.line, 1, "up at line 1 is a no-op")
+  input:handle_key("<Down>")
+  input:handle_key("<Down>")
+  eq(input.line, 2, "down at last line is a no-op")
+end)
+
+case("text_input_cursor_wraps_across_line_boundaries", function()
+  local input = TextInput.new()
+  input:insert_text("abc\nxy")
+  input:handle_key("<Home>")
+  input:handle_key("<Left>")
+  eq(input.line, 1)
+  eq(input.col, 3, "left at col 0 lands at end of previous line")
+  input:handle_key("<Right>")
+  eq(input.line, 2)
+  eq(input.col, 0, "right at end of non-last line goes to start of next")
+end)
+
+case("text_input_backspace_joins_lines_table_driven", function()
+  local cases = {
+    { "foo\nbar", { "<Home>" }, "foobar", 1, 3 },
+    { "\nabc", { "<Home>" }, "abc", 1, 0 },
+    { "a\nb", { "<End>", "<BS>" }, "a", 1, 1 },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text(c[1])
+    for _, k in ipairs(c[2]) do
+      input:handle_key(k)
+    end
+    input:handle_key("<BS>")
+    eq(input:value(), c[3], "case " .. i .. ": value")
+    eq(input.line, c[4], "case " .. i .. ": line")
+    eq(input.col, c[5], "case " .. i .. ": col")
+    eq(input:line_count(), 1, "case " .. i .. ": joined to one line")
+  end
+end)
+
+case("text_input_empty_input_movement_is_noop_and_char_before_cursor_is_nil", function()
+  local input = TextInput.new()
+  for _, k in ipairs({ "<Left>", "<Right>", "<Up>", "<Down>", "<BS>" }) do
+    input:handle_key(k)
+  end
+  eq(input:value(), "")
+  eq(input:line_count(), 1)
+  eq(input.line, 1)
+  eq(input.col, 0)
+  eq(input:char_before_cursor(), nil, "no char before cursor at start of empty input")
+
+  input = TextInput.new()
+  input:insert_text("abc\ndef")
+  input:handle_key("<Home>")
+  eq(input:char_before_cursor(), nil, "no char before cursor at col 0 on non-first line")
+end)
+
+case("text_input_ctrl_w_consumes_trailing_spaces_then_word", function()
+  local input = TextInput.new()
+  input:insert_text("hello world  ")
+  input:handle_key("<C-w>")
+  eq(input:value(), "hello ", "single ctrl+w eats trailing spaces AND the word")
+  input:handle_key("<C-w>")
+  eq(input:value(), "", "second ctrl+w eats what is left")
+end)
+
+case("text_input_render_multiline_padding_and_cursor", function()
+  local input = TextInput.new()
+  input:insert_text("line1\nline2")
+  local prefix = "> "
+  local r = input:render(prefix, #prefix)
+  eq(#r.lines, 2, "one render row per logical line")
+  eq(r.cursor_row, 2, "cursor on second logical line")
+  eq(r.lines[1][1][1], prefix, "first row uses the prefix")
+  eq(r.lines[2][1][1], string.rep(" ", #prefix), "continuation rows use blank padding")
+  eq(r.lines[1][2][1], "line1", "non-cursor row renders text in one span")
+  local saw_cursor
+  for _, span in ipairs(r.lines[2]) do
+    if span[2] == "cursor" then
+      saw_cursor = true
+    end
+  end
+  assert(saw_cursor, "cursor span must appear on the row holding the cursor")
+end)
+
+local function span_text(row)
+  local parts = {}
+  for _, span in ipairs(row) do
+    parts[#parts + 1] = span[1]
+  end
+  return table.concat(parts)
+end
+
+local function find_cursor_char(row)
+  for _, span in ipairs(row) do
+    if span[2] == "cursor" then
+      return span[1]
+    end
+  end
+end
+
+case("text_input_render_wraps_long_line", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij")
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 2, "10 chars at usable=6 produces 2 visual rows")
+  eq(r.cursor_row, 2, "cursor on last visual row")
+  eq(find_cursor_char(r.lines[2]), " ", "cursor at end is a space")
+end)
+
+case("text_input_render_wrap_cursor_mid_line", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij")
+  for _ = 1, 5 do
+    input:handle_key("<Left>")
+  end
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 2, "still 2 visual rows")
+  eq(r.cursor_row, 1, "cursor in first chunk")
+  eq(find_cursor_char(r.lines[1]), "f", "cursor on 'f'")
+end)
+
+case("text_input_render_wrap_multiline", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij\n1234567890")
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 4, "each logical line wraps into 2 visual rows")
+  eq(r.cursor_row, 4, "cursor on last visual row of second logical line")
+end)
+
+case("text_input_render_degenerate_width", function()
+  local input = TextInput.new()
+  input:insert_text("abc")
+  local r = input:render("", 0, 1)
+  eq(#r.lines, 3, "usable=1 means one char per visual row")
+  eq(r.cursor_row, 3, "cursor on last row")
+end)
+
+case("text_input_render_empty_input_with_width", function()
+  local input = TextInput.new()
+  local r = input:render("> ", 2, 10)
+  eq(#r.lines, 1, "empty input still produces one row")
+  eq(r.cursor_row, 1, "cursor on that single row")
+  eq(find_cursor_char(r.lines[1]), " ", "cursor is a space on empty input")
+end)
+
+case("text_input_render_wrap_utf8_multibyte_at_boundary", function()
+  local input = TextInput.new()
+  input:insert_text("aaéé")
+  local r = input:render("", 0, 3)
+  eq(#r.lines, 2, "4 codepoints at usable=3 wraps into 2 rows")
+  eq(span_text(r.lines[1]), "aaé", "first chunk has 3 codepoints")
+  local second = span_text(r.lines[2])
+  assert(second:find("é"), "second chunk contains the remaining é")
+  eq(r.cursor_row, 2, "cursor on second row")
+end)
+
+case("text_input_render_wrap_cursor_at_exact_chunk_boundary", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  for _ = 1, 3 do
+    input:handle_key("<Left>")
+  end
+  local r = input:render("", 0, 3)
+  eq(#r.lines, 2, "6 chars at usable=3 -> 2 rows")
+  eq(r.cursor_row, 2, "cursor col=3 lands in second chunk")
+  eq(find_cursor_char(r.lines[2]), "d", "cursor char is 'd'")
+end)
+
+case("text_input_render_exact_fit_no_extra_row", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  local r = input:render(">>", 2, 8)
+  eq(#r.lines, 1, "6 chars exactly fills usable=6, no extra row")
+  eq(r.cursor_row, 1)
+end)
+
+case("text_input_render_empty_lines_in_multiline_with_width", function()
+  local input = TextInput.new()
+  input:insert_text("ab\n\ncd")
+  local r = input:render("> ", 2, 10)
+  eq(#r.lines, 3, "three logical lines produce three visual rows")
+  eq(r.cursor_row, 3, "cursor on last line")
+end)
+
+case("text_input_render_cursor_at_start_with_wrapping", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  input:handle_key("<Home>")
+  local r = input:render("", 0, 3)
+  eq(r.cursor_row, 1, "cursor at col=0 is in the first chunk")
+  eq(find_cursor_char(r.lines[1]), "a", "cursor on first char 'a'")
+end)
+
+case("text_input_render_prefix_width_override", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefgh")
+  local r = input:render("X", 4, 8)
+  eq(#r.lines, 2, "usable = 8-4 = 4, 8 chars wraps into 2 rows")
+  local first = span_text(r.lines[1])
+  assert(first:sub(1, 1) == "X", "first row starts with actual prefix 'X'")
+  local second = span_text(r.lines[2])
+  assert(second:sub(1, 4) == "    ", "continuation uses prefix_width=4 spaces of padding")
+end)
+
+case("text_input_invariants_hold_under_random_sequence", function()
+  TextInput._debug = true
+  local input = TextInput.new()
+  local keys = {
+    "a",
+    "b",
+    "c",
+    "x",
+    "é",
+    "<Space>",
+    SPLIT_LINE,
+    "<Left>",
+    "<Right>",
+    "<Up>",
+    "<Down>",
+    "<Home>",
+    "<End>",
+    "<BS>",
+    "<Del>",
+    "<C-w>",
+    "<C-Left>",
+    "<C-Right>",
+    "<C-a>",
+    "<C-k>",
+    "<M-d>",
+    "<M-b>",
+    "<M-f>",
+  }
+  math.randomseed(0xC0FFEE)
+  for _ = 1, 2000 do
+    local k = keys[math.random(#keys)]
+    if k == "é" then
+      input:insert_text("é")
+    elseif k == SPLIT_LINE then
+      input:split_line()
+    else
+      input:handle_key(k)
+    end
+  end
+  TextInput._debug = false
+end)
+
+-- Inline parity cases. Each case sets up an initial value/cursor, applies a
+-- sequence of keys, and asserts final value+cursor. Add a case here whenever
+-- you change handle_key semantics. Lives in Lua now that there is no second
+-- implementation to cross-check against; if a Rust TextBuffer comes back,
+-- promote this back to a shared golden file.
+local TRACE_CASES = {
+  {
+    name = "plain_insert",
+    initial = "",
+    cur = { 1, 0 },
+    keys = { "h", "i" },
+    final_value = "hi",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "backspace_deletes_char",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "<BS>" },
+    final_value = "ab",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "delete_at_end_joins_lines",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "<Del>" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "backspace_at_line_start_joins",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "<BS>" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "left_then_right_round_trips",
+    initial = "abc",
+    cur = { 1, 2 },
+    keys = { "<Left>", "<Right>" },
+    final_value = "abc",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "right_wraps_to_next_line",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "<Right>" },
+    final_value = "ab\ncd",
+    final_cur = { 2, 0 },
+  },
+  {
+    name = "left_wraps_to_prev_line",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "<Left>" },
+    final_value = "ab\ncd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "home_jumps_to_col_zero",
+    initial = "hello",
+    cur = { 1, 5 },
+    keys = { "<Home>" },
+    final_value = "hello",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "end_jumps_to_line_length",
+    initial = "hello",
+    cur = { 1, 0 },
+    keys = { "<End>" },
+    final_value = "hello",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "up_clamps_to_short_line",
+    initial = "abc\nlonger_line",
+    cur = { 2, 11 },
+    keys = { "<Up>" },
+    final_value = "abc\nlonger_line",
+    final_cur = { 1, 3 },
+  },
+  {
+    name = "down_moves_to_next_line",
+    initial = "ab\ncd",
+    cur = { 1, 0 },
+    keys = { "<Down>" },
+    final_value = "ab\ncd",
+    final_cur = { 2, 0 },
+  },
+  {
+    name = "ctrl_left_jumps_word",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "<C-Left>" },
+    final_value = "hello world",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_left_twice_lands_at_zero",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "<C-Left>", "<C-Left>" },
+    final_value = "hello world",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "ctrl_right_jumps_word",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "<C-Right>" },
+    final_value = "hello world",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_right_eats_leading_spaces_then_word",
+    initial = "hello  ",
+    cur = { 1, 0 },
+    keys = { "<C-Right>" },
+    final_value = "hello  ",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_left_eats_leading_spaces_then_word",
+    initial = "  hello",
+    cur = { 1, 7 },
+    keys = { "<C-Left>" },
+    final_value = "  hello",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_w_eats_trailing_spaces_and_word",
+    initial = "hello world  ",
+    cur = { 1, 13 },
+    keys = { "<C-w>" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_w_twice_clears_input",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "<C-w>", "<C-w>" },
+    final_value = "",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "ctrl_w_at_line_start_joins",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "<C-w>" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_delete_eats_word_after",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "<C-Del>" },
+    final_value = " world",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "alt_d_eats_word_after_space",
+    initial = "hello world",
+    cur = { 1, 6 },
+    keys = { "<M-d>" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_delete_at_line_end_joins",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "<C-Del>" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_k_truncates_line",
+    initial = "hello world",
+    cur = { 1, 5 },
+    keys = { "<C-k>" },
+    final_value = "hello",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_k_at_line_end_joins",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "<C-k>" },
+    final_value = "ab\ncd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_a_moves_home",
+    initial = "hello",
+    cur = { 1, 5 },
+    keys = { "<C-a>" },
+    final_value = "hello",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "alt_b_aliases_ctrl_left",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "<M-b>" },
+    final_value = "hello world",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "alt_f_aliases_ctrl_right",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "<M-f>" },
+    final_value = "hello world",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "space_inserts_a_space",
+    initial = "abcd",
+    cur = { 1, 2 },
+    keys = { "<Space>" },
+    final_value = "ab cd",
+    final_cur = { 1, 3 },
+  },
+  {
+    name = "utf8_left_over_multibyte",
+    initial = "aé",
+    cur = { 1, 3 },
+    keys = { "<Left>" },
+    final_value = "aé",
+    final_cur = { 1, 1 },
+  },
+  {
+    name = "utf8_backspace_removes_codepoint",
+    initial = "aé",
+    cur = { 1, 3 },
+    keys = { "<BS>" },
+    final_value = "a",
+    final_cur = { 1, 1 },
+  },
+  {
+    name = "utf8_ctrl_w_eats_multibyte_word",
+    initial = "hello wörld",
+    cur = { 1, 12 },
+    keys = { "<C-w>" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "tab_is_whitespace_for_ctrl_w",
+    initial = "hello\tworld",
+    cur = { 1, 11 },
+    keys = { "<C-w>" },
+    final_value = "hello\t",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ignored_backspace_at_buffer_start",
+    initial = "",
+    cur = { 1, 0 },
+    keys = { "<BS>" },
+    final_value = "",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_left_at_buffer_start",
+    initial = "abc",
+    cur = { 1, 0 },
+    keys = { "<Left>" },
+    final_value = "abc",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_right_at_buffer_end",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "<Right>" },
+    final_value = "abc",
+    final_cur = { 1, 3 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_up_on_first_line",
+    initial = "abc",
+    cur = { 1, 1 },
+    keys = { "<Up>" },
+    final_value = "abc",
+    final_cur = { 1, 1 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_down_on_last_line",
+    initial = "abc",
+    cur = { 1, 1 },
+    keys = { "<Down>" },
+    final_value = "abc",
+    final_cur = { 1, 1 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_ctrl_w_at_buffer_start",
+    initial = "abc",
+    cur = { 1, 0 },
+    keys = { "<C-w>" },
+    final_value = "abc",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_delete_at_buffer_end",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "<Del>" },
+    final_value = "abc",
+    final_cur = { 1, 3 },
+    results = { R.IGNORED },
+  },
+}
+
+case("text_input_trace_cases", function()
+  for _, c in ipairs(TRACE_CASES) do
+    local input = TextInput.new()
+    input:insert_text(c.initial)
+    input.line, input.col = c.cur[1], c.cur[2]
+    local got = {}
+    for _, k in ipairs(c.keys) do
+      got[#got + 1] = input:handle_key(k)
+    end
+    eq(input:value(), c.final_value, c.name .. ": value")
+    eq(input.line, c.final_cur[1], c.name .. ": cursor line")
+    eq(input.col, c.final_cur[2], c.name .. ": cursor col")
+    if c.results then
+      for i, want in ipairs(c.results) do
+        eq(got[i], want, c.name .. ": key " .. i .. " result")
+      end
+    end
+  end
+end)
+
+local ListPicker = require("maki.list_picker")
+
+case("set_highlight_number_width_scales", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 200 })
+  local lines = {}
+  for i = 1, 100 do
+    lines[i] = "x"
+  end
+  local content = table.concat(lines, "\n")
+  local ok = view:set_highlight(content, "txt")
+  eq(ok, true)
+  eq(view.ring_count, 100)
+  local first_nr = buf.lines[1][1][1]
+  local last_nr = buf.lines[100][1][1]
+  eq(first_nr, "  1 ", "3-digit width for 100 lines, right-aligned")
+  eq(last_nr, "100 ", "line 100 should fill the width")
+  eq(buf.lines[1][1][2], "line_nr")
+end)
+
+case("set_highlight_empty_content_returns_false", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3 })
+  eq(view:set_highlight("", "txt"), false)
+  eq(view:set_highlight("\n", "txt"), false)
+  eq(buf.lines, nil, "nothing flushed for empty content")
+end)
+
+case("set_highlight_toggle_keeps_lines_and_collapses_back", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "head" })
+  eq(view:set_highlight("a\nb\nc\nd\ne", "txt"), true)
+
+  view:toggle()
+  eq(view.expanded, true)
+  eq(#buf.lines, 5, "expanded renders every line")
+  eq(buf.lines[1][2][1], "a")
+  eq(buf.lines[5][2][1], "e")
+
+  view:toggle()
+  eq(view.expanded, false)
+  eq(buf.lines[3][2][1], "c", "collapsed shows the head window")
+  eq(buf.lines[4][1][1], "... (2 lines) (click to expand)")
+end)
+
+local render_lines = ListPicker._render_lines
+
+case("render_lines_string_items_basic", function()
+  local lines = render_lines({ "alpha", "beta" }, 1, 40)
+  eq(#lines, 2)
+  eq(lines[1][1][1], "  alpha")
+  eq(lines[1][1][2], "selected")
+  eq(lines[2][1][2], "item")
+end)
+
+case("render_lines_table_items_with_detail", function()
+  local items = {
+    { label = "foo", detail = "(3 bytes)" },
+    { label = "bar", detail = "(10 bytes)" },
+  }
+  local lines = render_lines(items, 2, 60)
+  eq(lines[1][1][2], "item", "unselected label style")
+  eq(lines[1][3][2], "dim", "unselected detail style")
+  eq(lines[2][1][2], "selected", "selected label style")
+  eq(lines[2][3][2], "selected", "selected detail uses selected")
+end)
+
+case("render_lines_detail_padding_never_zero", function()
+  local label = string.rep("x", 50)
+  local detail = string.rep("y", 50)
+  local items = { { label = label, detail = detail } }
+  local lines = render_lines(items, 1, 20)
+  local pad_span = lines[1][2][1]
+  assert(#pad_span >= 1, "padding must be at least 1 space even when overflowing")
+end)
+
+case("render_lines_no_detail_fills_trailing", function()
+  local lines = render_lines({ "ab" }, 1, 10)
+  eq(#lines[1], 2, "label + trailing pad")
+  local trail = lines[1][2][1]
+  eq(#trail, 10 - 2 - 2, "trail = width - indent(2) - label_len(2)")
+end)
+
+case("render_lines_selected_index_out_of_range", function()
+  local lines = render_lines({ "a", "b" }, 99, 40)
+  eq(lines[1][1][2], "item")
+  eq(lines[2][1][2], "item")
+end)
+
+case("render_lines_empty_items", function()
+  local lines = render_lines({}, 1, 40)
+  eq(#lines, 0)
+end)
+
+case("render_lines_default_width_used", function()
+  local items = { "test" }
+  local lines_default = render_lines(items, 1)
+  local lines_explicit = render_lines(items, 1, 80)
+  eq(#lines_default[1], #lines_explicit[1], "default width should be 80")
+  eq(lines_default[1][2][1], lines_explicit[1][2][1])
+end)
+
+case("render_lines_mixed_string_and_table", function()
+  local items = { "plain", { label = "rich", detail = "info" } }
+  local lines = render_lines(items, 1, 40)
+  eq(lines[1][1][1], "  plain")
+  eq(#lines[1], 2, "string item: label + trailing")
+  eq(lines[2][1][1], "  rich")
+  eq(#lines[2], 4, "table item with detail: label + pad + detail + right_pad")
+end)
+
+case("render_lines_label_longer_than_width_is_truncated", function()
+  local lines = render_lines({ string.rep("z", 10) }, 1, 12)
+  eq(lines[1][1][1], "  " .. string.rep("z", 7) .. "…", "label gives up cells for the ellipsis")
+  eq(lines[1][2][1], "  ", "the right pad still closes the row")
+end)
+
+case("render_lines_match_highlight_selected", function()
+  local lines = render_lines({ "alpha", "beta" }, 1, 40, "lph")
+  eq(lines[1][1][1], "  a")
+  eq(lines[1][1][2], "selected")
+  eq(lines[1][2][1], "lph")
+  eq(lines[1][2][2], "match_selected")
+  eq(lines[1][3][1], "a")
+  eq(lines[1][3][2], "selected")
+end)
+
+case("render_lines_match_highlight_not_selected", function()
+  local lines = render_lines({ "beta", "alpha" }, 2, 40, "et")
+  eq(lines[1][1][1], "  b")
+  eq(lines[1][1][2], "item")
+  eq(lines[1][2][1], "et")
+  eq(lines[1][2][2], "match")
+  eq(lines[1][3][1], "a")
+  eq(lines[1][3][2], "item")
+end)
+
+local filter_items = ListPicker._filter_items
+
+case("filter_items_empty_query_returns_all", function()
+  local items = { "alpha", "beta", "gamma" }
+  local filtered, indices = filter_items(items, "")
+  eq(#filtered, 3)
+  eq(indices[1], 1)
+  eq(indices[2], 2)
+  eq(indices[3], 3)
+end)
+
+case("filter_items_case_insensitive", function()
+  local items = { "Alpha", "BETA", "gamma" }
+  local filtered, indices = filter_items(items, "al")
+  eq(#filtered, 1)
+  eq(filtered[1], "Alpha")
+  eq(indices[1], 1)
+end)
+
+case("filter_items_no_matches", function()
+  local items = { "apple", "banana" }
+  local filtered, indices = filter_items(items, "xyz")
+  eq(#filtered, 0)
+  eq(#indices, 0)
+end)
+
+case("filter_items_table_items_uses_label", function()
+  local items = {
+    { label = "Foo", detail = "d1" },
+    { label = "Bar", detail = "d2" },
+    { label = "Foobar", detail = "d3" },
+  }
+  local filtered, indices = filter_items(items, "foo")
+  eq(#filtered, 2)
+  eq(filtered[1].label, "Foo")
+  eq(filtered[2].label, "Foobar")
+  eq(indices[1], 1)
+  eq(indices[2], 3)
+end)
+
+case("filter_items_every_word_must_match", function()
+  local items = { "review gh pr 441", "review gh pr 461", "new session" }
+  local filtered = filter_items(items, "441 review")
+  eq(#filtered, 1)
+  eq(filtered[1], "review gh pr 441")
+end)
+
+case("filter_items_matches_section", function()
+  local items = {
+    { label = "a.md", section = "auth (2)" },
+    { label = "b.md", section = "auth (2)" },
+    { label = "c.md", section = "storage (1)" },
+  }
+  local filtered, indices = filter_items(items, "auth")
+  eq(#filtered, 2, "typing a section name keeps its items")
+  eq(filtered[1].label, "a.md")
+  eq(filtered[2].label, "b.md")
+  eq(indices[2], 2)
+end)
+
+case("filter_items_words_split_across_label_and_section", function()
+  local items = {
+    { label = "gotchas.md", section = "auth (2)" },
+    { label = "notes.md", section = "auth (2)" },
+  }
+  local filtered = filter_items(items, "auth gotchas")
+  eq(#filtered, 1)
+  eq(filtered[1].label, "gotchas.md")
+end)
+
+case("highlight_spans_overlapping_words_merge", function()
+  local spans = ListPicker.highlight_spans("alphabet", { "alpha", "phab" }, "item", "match")
+  eq(#spans, 2)
+  eq(spans[1][1], "alphab", "alpha(1-5) + phab(3-6) merge into one span")
+  eq(spans[1][2], "match")
+  eq(spans[2][1], "et")
+  eq(spans[2][2], "item")
+end)
+
+case("highlight_spans_multi_word", function()
+  local spans = ListPicker.highlight_spans("review pr 441", { "pr", "441" }, "item", "match")
+  eq(#spans, 4)
+  eq(spans[1][1], "review ")
+  eq(spans[1][2], "item")
+  eq(spans[2][1], "pr")
+  eq(spans[2][2], "match")
+  eq(spans[3][1], " ")
+  eq(spans[3][2], "item")
+  eq(spans[4][1], "441")
+  eq(spans[4][2], "match")
+end)
+
+case("render_lines_match_at_start_keeps_indent", function()
+  local lines = render_lines({ "alpha" }, 1, 40, "al")
+  eq(lines[1][1][1], "  ")
+  eq(lines[1][1][2], "selected")
+  eq(lines[1][2][1], "al")
+  eq(lines[1][2][2], "match_selected")
+end)
+
+case("render_lines_sections_headers_and_item_lines", function()
+  local items = {
+    { label = "a", section = "auth", section_detail = "(2)" },
+    { label = "b", section = "auth", section_detail = "(2)" },
+    { label = "c", section = "storage" },
+  }
+  local lines, item_lines = render_lines(items, 1, 40)
+  eq(#lines, 6, "two headers + blank gap + three items, header never repeats within a section")
+  eq(lines[1][1][1], "  auth")
+  eq(lines[1][1][2], "keybind_section")
+  eq(lines[1][3][1], "(2)", "section detail right-aligned like an item detail")
+  eq(lines[1][3][2], "dim")
+  eq(lines[2][1][1], "  a")
+  eq(lines[3][1][1], "  b")
+  eq(#lines[4], 0, "blank line between sections")
+  eq(lines[5][1][1], "  storage")
+  eq(#lines[5], 2, "label plus trailing pad without section_detail")
+  eq(lines[6][1][1], "  c")
+  eq(item_lines[1], 2, "cursor mapping skips the header")
+  eq(item_lines[2], 3)
+  eq(item_lines[3], 6)
+end)
+
+case("render_lines_item_lines_identity_without_sections", function()
+  local lines, item_lines = render_lines({ "a", "b", "c" }, 1, 40)
+  eq(#lines, 3)
+  for i = 1, 3 do
+    eq(item_lines[i], i, "plain list maps item " .. i .. " straight to its line")
+  end
+end)
+
+case("section_rows_counts_headers_and_gaps", function()
+  local section_rows = ListPicker._section_rows
+  eq(section_rows({ "a", "b" }), 0)
+  eq(section_rows({ { label = "a", section = "s" }, "b" }), 1, "header on line one needs no gap")
+  eq(section_rows({ "a", { label = "b", section = "s" } }), 2, "gap precedes a header that follows items")
+  eq(section_rows({ { label = "a", section = "s" }, { label = "b", section = "t" } }), 3)
+end)
+
+case("render_lines_nil_sections_mix_with_grouped", function()
+  local lines = render_lines({ "plain", { label = "x", section = "grp" } }, 1, 40)
+  eq(lines[1][1][1], "  plain", "no header for a nil-section first item")
+  eq(#lines[2], 0, "blank line before a header that follows items")
+  eq(lines[3][1][1], "  grp")
+  eq(lines[4][1][1], "  x")
+
+  local _, item_lines = render_lines({ { label = "a", section = "grp" }, "b" }, 1, 40)
+  eq(item_lines[1], 2, "grouped item sits under its header")
+  eq(item_lines[2], 3, "nil-section item follows without a new header")
+end)
+
+local ELLIPSIS = "…"
+local MIN_DETAIL_COLS = 6
+local PEER_STYLE = { fg = "#c0caf5", bg = "#283457" }
+
+local function row_width(spans)
+  local w = 0
+  for _, s in ipairs(spans) do
+    w = w + maki.ui.display_width(s[1])
+  end
+  return w
+end
+
+local function row_text(spans)
+  local parts = {}
+  for i, s in ipairs(spans) do
+    parts[i] = s[1]
+  end
+  return table.concat(parts)
+end
+
+-- A row wider than its window breaks the float's frame, so check every shape a
+-- row can take, wide characters included.
+case("render_lines_row_fills_exactly_the_window_width", function()
+  local labels = {
+    ascii_short = "ab",
+    ascii_long = string.rep("abcdefghij", 4),
+    cjk = string.rep("中文字符", 6),
+    emoji = string.rep("🎉", 12),
+  }
+  local details = { none = nil, short = "1.2K", long = string.rep("tag-name, ", 8) }
+  for _, width in ipairs({ 3, 5, 13, 60 }) do
+    for lname, label in pairs(labels) do
+      for dname, detail in pairs(details) do
+        local lines = render_lines({ { label = label, detail = detail } }, 1, width)
+        eq(row_width(lines[1]), width, lname .. "/" .. dname .. "@" .. width)
+      end
+    end
+  end
+end)
+
+local function one_part(text)
+  return { { text, "dim" } }
+end
+
+case("fit_row_shrinks_the_detail_before_the_label", function()
+  local fit_row = ListPicker._fit_row
+  local label, detail, pad = fit_row("abcdefghij", one_part("0123456789"), 22)
+  eq(label, "abcdefghij", "the label keeps every cell while the detail can still give some up")
+  eq(detail[1][1], "012345" .. ELLIPSIS)
+  eq(pad, 1, "the two sides never touch")
+
+  label, detail = fit_row("abcdefghij", one_part("0123456789"), 18)
+  eq(maki.ui.display_width(detail[1][1]), MIN_DETAIL_COLS, "the detail stops shrinking here")
+  eq(label, "abcdef" .. ELLIPSIS, "only then does the label truncate")
+end)
+
+-- A row ending in a fixed column, a file size say, loses characters from the
+-- text before it and never from the column.
+case("fit_row_shrinks_the_elastic_part_and_keeps_the_rest", function()
+  local fit_row = ListPicker._fit_row
+  local parts = { { "gotchas, architecture", "section", elastic = true }, { " ·  1.2K", "dim" } }
+
+  local label, detail = fit_row("a.md", parts, 30)
+  eq(label, "a.md")
+  eq(detail[1][1], "gotchas, arc" .. ELLIPSIS, "the elastic part gives up the cells")
+  eq(detail[2][1], " ·  1.2K", "the trailing column stays whole")
+
+  local _, wide = fit_row("a.md", parts, 60)
+  eq(wide[1][1], "gotchas, architecture", "nothing is cut when the row is wide enough")
+
+  -- Once even the fixed parts do not fit, the tail goes, since a row wider than
+  -- its window is worse.
+  local _, tiny = fit_row("a.md", parts, 14)
+  eq(#tiny, 1)
+  eq(tiny[1][1], "gotch" .. ELLIPSIS)
+end)
+
+case("render_lines_section_header_is_fitted_like_an_item", function()
+  local items = { { label = "a", section = string.rep("long-tag-", 6), section_detail = "(1)" } }
+  local lines = render_lines(items, 1, 30)
+  eq(row_width(lines[1]), 30, "a long section name is fitted, not overflowed")
+  assert(row_text(lines[1]):find(ELLIPSIS, 1, true), "the section name marks its cut")
+end)
+
+local function peer_stub()
+  return {
+    key = function(item)
+      return item.label
+    end,
+    style = PEER_STYLE,
+    detail_style = function(role)
+      return { fg = role .. "-color", bg = PEER_STYLE.bg }
+    end,
+  }
+end
+
+case("render_lines_tints_the_rows_sharing_the_selected_key", function()
+  local items = {
+    { label = "a.md", detail = { { "1.2K", "dim" } } },
+    { label = "b.md" },
+    { label = "a.md", detail = { { "1.2K", "dim" } } },
+  }
+  local lines = render_lines(items, 1, 40, nil, peer_stub())
+  eq(lines[1][1][2], "selected", "the selected row keeps the selection style")
+  eq(lines[1][3][2], "selected", "and so does its detail")
+  eq(lines[2][1][2], "item", "a different key is an ordinary row")
+  eq(lines[3][1][2], PEER_STYLE, "the same key is tinted")
+  eq(lines[3][3][2].fg, "dim-color", "a tinted detail keeps its own color")
+  eq(lines[3][3][2].bg, PEER_STYLE.bg, "over the same tint, so the row has no hole")
+
+  eq(render_lines(items, 1, 40, nil, nil)[3][1][2], "item", "without a peer nothing is tinted")
+end)
+
+case("render_lines_peer_match_is_the_peer_style_made_bold", function()
+  local lines = render_lines({ { label = "alpha" }, { label = "alpha" } }, 1, 40, "lph", peer_stub())
+  local match = lines[2][2]
+  eq(match[1], "lph")
+  eq(match[2].bold, true, "a match on a tinted row stays visible")
+  eq(match[2].fg, PEER_STYLE.fg)
+  eq(match[2].bg, PEER_STYLE.bg)
+  eq(PEER_STYLE.bold, nil, "the caller's style table is not mutated")
+end)
+
+local function palette(styles)
+  return function(name)
+    return styles[name]
+  end
+end
+
+case("peer_palette_tints_the_row_and_keeps_detail_colors_on_it", function()
+  local background, selection, item, dim = "#000000", "#ffffff", "#c0caf5", "#565f89"
+  local styles = {
+    background = { bg = background },
+    item_selected = { bg = selection },
+    item = { fg = item },
+    dim = { fg = dim },
+  }
+  local peer = ListPicker._peer(nil, palette(styles))
+  local tint = peer.style.bg
+  assert(tint ~= background and tint ~= selection, "the tint is a blend of both")
+  eq(peer.style.fg, item, "the themed item foreground stays on top")
+  eq(peer.detail_style("dim").fg, dim, "a detail keeps its own color")
+  eq(peer.detail_style("dim").bg, tint, "over the tint, so the row has no hole")
+  eq(peer.detail_style("match").fg, nil, "a style with no foreground has no color to mix")
+  eq(peer.detail_style("match").dim, true, "so the terminal dims it over the tint instead")
+
+  local paletted = ListPicker._peer(
+    nil,
+    palette({
+      background = { bg = "4" },
+      item_selected = { bg = "5" },
+    })
+  )
+  eq(paletted.style.fg, "5", "palette colors cannot blend, so selection tints the fg")
+  eq(paletted.detail_style("dim"), "dim", "without a tint the detail keeps the plain style name")
+
+  eq(ListPicker._peer(nil, palette({})).style, nil, "a theme with neither color loses the tint")
+end)
+
+-- Callers align a trailing size by leaning on this: whatever the label
+-- measures, the detail ends against the right pad.
+case("render_lines_details_end_against_the_right_pad", function()
+  local items = {
+    { label = "a.md", detail = "12B" },
+    { label = string.rep("long-name-", 3), detail = "gotchas, auth · 1.2K" },
+  }
+  for i, spans in ipairs(render_lines(items, 1, 44)) do
+    eq(spans[#spans][1], "  ", "row " .. i .. " ends with the right pad and nothing else")
+  end
+end)
+
+case("render_lines_detail_parts_keep_their_own_styles", function()
+  local items = { { label = "a.md", detail = { { "1.2K · ", "dim" }, { "gotchas, auth", "match" } } } }
+  local lines = render_lines(items, 2, 40)
+  eq(lines[1][3][1], "1.2K · ")
+  eq(lines[1][3][2], "dim")
+  eq(lines[1][4][1], "gotchas, auth")
+  eq(lines[1][4][2], "match")
+
+  -- The cut eats the last part first, and the ellipsis stays in it.
+  local narrow = render_lines(items, 2, 22)
+  eq(narrow[1][3][2], "dim")
+  eq(narrow[1][4][1], "gotch" .. ELLIPSIS)
+  eq(narrow[1][4][2], "match")
+end)
+
+case("select_after_swap_follows_the_key_then_clamps", function()
+  local swap = ListPicker._select_after_swap
+  local key = function(item)
+    return item
+  end
+  eq(swap({ "a", "b", "c" }, key, "c", 1), 3, "the cursor follows its row")
+  eq(swap({ "a", "b" }, key, "gone", 5), 2, "a vanished key clamps the previous position")
+  eq(swap({}, key, "a", 3), 1, "an empty list selects nothing")
+  eq(swap({ "a", "b", "a" }, key, "a", 3), 1, "duplicate keys resolve to the first row")
+  eq(swap({ "a", "b" }, nil, nil, 2), 2, "without a key function the position is kept")
+end)
+
+local function mock_win()
+  local w = {}
+  function w:set_config(cfg)
+    self.reserved_top = cfg.reserved_top
+  end
+  return w
+end
+
+-- A query that wraps, or one pasted with a newline, grows the header past the
+-- single line a picker would guess. Whatever it draws is what the window pins,
+-- or the query scrolls out from under itself.
+case("render_header_pins_the_height_it_actually_drew", function()
+  local TextInput = require("maki.text_input")
+  local win = mock_win()
+  local input = TextInput.new()
+  local lines = {}
+
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 2, "empty query is one line plus a spacer")
+  eq(win.reserved_top, 2)
+  eq(#lines, 2)
+
+  input:insert_text(string.rep("x", 60))
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 3, "a wrapped query is two lines plus a spacer")
+  eq(win.reserved_top, 3)
+  eq(#lines, 3)
+
+  input:clear()
+  input:insert_text("a\nb")
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 3, "a pasted newline is two lines plus a spacer")
+  eq(win.reserved_top, 3)
+
+  -- Shrinking back matters too: a header pinned taller than it draws leaves a
+  -- gap and mis-scrolls the list under it.
+  input:clear()
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 2, "clearing the query shrinks the header back")
+  eq(win.reserved_top, 2)
+  eq(#lines, 2)
+end)
+
+-- Picker keys come from a caller the host never parses, so they are
+-- normalized on the way in: a spelling maki accepts is a spelling that
+-- matches.
+case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
+  local set = ListPicker._key_set({ "<Enter>", "R", "<nope>" })
+  eq(set["<CR>"], true, "<Enter> matches a <CR> press")
+  eq(set["R"], true, "a plain char is itself")
+  eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
+end)
+
+local ListNav = require("maki.list_nav")
+
+local UP = "<Up>"
+local DOWN = "<Down>"
+local PAGE_UP = "<PageUp>"
+local PAGE_DOWN = "<PageDown>"
+local CTRL_N = "<C-n>"
+local LETTER = "x"
+local UNKNOWN_ACTION_ERROR = "only up, down, page_up and page_down exist"
+
+local function only(...)
+  local rows = {}
+  for _, i in ipairs({ ... }) do
+    rows[i] = true
+  end
+  return function(i)
+    return rows[i] == true
+  end
+end
+
+-- No {want} means the key is taken but the cursor stays.
+local NAV_CASES = {
+  { name = "down_steps_one_row", key = DOWN, cursor = 2, opts = { count = 5 }, want = 3 },
+  { name = "down_wraps_past_the_last_row", key = DOWN, cursor = 5, opts = { count = 5 }, want = 1 },
+  { name = "up_wraps_past_the_first_row", key = UP, cursor = 1, opts = { count = 5 }, want = 5 },
+  { name = "up_without_wrap_stays_on_the_first_row", key = UP, cursor = 1, opts = { count = 5, wrap = false } },
+  { name = "page_down_moves_a_page", key = PAGE_DOWN, cursor = 1, opts = { count = 9, page = 3 }, want = 4 },
+  { name = "page_up_clamps_to_the_first_row", key = PAGE_UP, cursor = 2, opts = { count = 9, page = 3 }, want = 1 },
+  {
+    name = "page_down_on_the_last_row_does_not_wrap",
+    key = PAGE_DOWN,
+    cursor = 9,
+    opts = { count = 9, page = 3 },
+    want = 9,
+  },
+  { name = "page_down_without_page_jumps_to_the_end", key = PAGE_DOWN, cursor = 2, opts = { count = 9 }, want = 9 },
+  {
+    name = "down_skips_unselectable_rows",
+    key = DOWN,
+    cursor = 2,
+    opts = { count = 5, selectable = only(2, 4) },
+    want = 4,
+  },
+  {
+    name = "up_wraps_over_unselectable_rows",
+    key = UP,
+    cursor = 2,
+    opts = { count = 5, selectable = only(2, 4) },
+    want = 4,
+  },
+  {
+    name = "down_without_wrap_stays_when_only_unselectable_rows_follow",
+    key = DOWN,
+    cursor = 4,
+    opts = { count = 5, wrap = false, selectable = only(2, 4) },
+  },
+  {
+    name = "page_down_settles_further_in_its_direction_first",
+    key = PAGE_DOWN,
+    cursor = 1,
+    opts = { count = 5, page = 2, selectable = only(1, 2, 4) },
+    want = 4,
+  },
+  {
+    name = "page_up_settles_back_when_nothing_further_is_selectable",
+    key = PAGE_UP,
+    cursor = 5,
+    opts = { count = 5, page = 3, selectable = only(4, 5) },
+    want = 4,
+  },
+  { name = "down_on_an_empty_list_selects_nothing", key = DOWN, cursor = 1, opts = { count = 0 } },
+  {
+    name = "down_with_no_selectable_row_selects_nothing",
+    key = DOWN,
+    cursor = 1,
+    opts = { count = 3, selectable = only() },
+  },
+  {
+    name = "page_up_with_no_selectable_row_selects_nothing",
+    key = PAGE_UP,
+    cursor = 3,
+    opts = { count = 3, page = 1, selectable = only() },
+  },
+  {
+    name = "up_from_past_a_shrunk_list_lands_back_on_it",
+    key = UP,
+    cursor = 9,
+    opts = { count = 5, wrap = false },
+    want = 4,
+  },
+  { name = "a_letter_is_passed_on", key = LETTER, cursor = 2, opts = { count = 5 }, passed_on = true },
+  -- An empty filter result must still let the user type, or a typo would lock
+  -- the filter.
+  { name = "a_letter_on_an_empty_list_is_passed_on", key = LETTER, cursor = 1, opts = { count = 0 }, passed_on = true },
+  { name = "j_is_passed_on_by_default", key = "j", cursor = 2, opts = { count = 5 }, passed_on = true },
+  { name = "vim_keys_move_with_j", key = "j", cursor = 2, opts = { count = 5, keys = ListNav.VIM_KEYS }, want = 3 },
+  {
+    name = "own_keys_bind_an_action",
+    key = CTRL_N,
+    cursor = 2,
+    opts = { count = 5, keys = { [CTRL_N] = "down" } },
+    want = 3,
+  },
+}
+
+-- Answers whether ListNav took {key} and every row it moved to.
+local function nav(key, cursor, opts)
+  local moves = {}
+  local taken = ListNav.handle_key(key, cursor, opts, function(i)
+    moves[#moves + 1] = i
+  end)
+  return taken, moves
+end
+
+case("list_nav_moves_the_cursor", function()
+  for _, c in ipairs(NAV_CASES) do
+    local taken, moves = nav(c.key, c.cursor, c.opts)
+    eq(taken, not c.passed_on, c.name .. ": taken")
+    eq(table.concat(moves, ","), c.want and tostring(c.want) or "", c.name .. ": moves")
+  end
+end)
+
+-- A typo in an action name would otherwise pass the key on, and it would
+-- quietly type into the filter.
+case("list_nav_throws_on_an_unknown_action", function()
+  local ok, err = pcall(nav, CTRL_N, 2, { count = 5, keys = { [CTRL_N] = "sideways" } })
+  eq(ok, false)
+  th.has(err, UNKNOWN_ACTION_ERROR)
+end)
+
+local PICK_ITEMS = { "alpha", "beta", "gamma" }
+local ENTER = "<CR>"
+local CTRL_D = "<C-d>"
+local BACKSPACE = "<BS>"
+local NO_MATCH_QUERY = "q"
+local FAKE_WIN_WIDTH = 40
+-- Taller than the list, so a page moves past its end and has to clamp.
+local FAKE_WIN_HEIGHT = 20
+local KEYS_RAN_OUT = "picker asked for a key past the scripted ones"
+local KEYS_LEFT_OVER = "picker returned before the scripted keys ran out"
+
+-- Opens ListPicker over PICK_ITEMS and presses {keys}. Running out of keys is
+-- an error, because a nil event looks like the user closing the picker and
+-- would hide a picker that forgot to return.
+local function drive_picker(keys, opts)
+  local queue = {}
+  for i, key in ipairs(keys) do
+    queue[i] = { type = "key", key = key }
+  end
+  local win = { width = FAKE_WIN_WIDTH, height = FAKE_WIN_HEIGHT }
+  function win:recv()
+    return assert(table.remove(queue, 1), KEYS_RAN_OUT)
+  end
+  function win:set_cursor() end
+  function win:set_config() end
+  function win:close() end
+
+  local original = { buf = maki.ui.buf, open_win = maki.ui.open_win, flash = maki.ui.flash }
+  maki.ui.buf = mock_buf
+  maki.ui.open_win = function()
+    return win
+  end
+  maki.ui.flash = function() end
+  local ok, result = pcall(ListPicker.open, PICK_ITEMS, opts)
+  maki.ui.buf, maki.ui.open_win, maki.ui.flash = original.buf, original.open_win, original.flash
+  if not ok then
+    error(result, 0)
+  end
+  eq(#queue, 0, KEYS_LEFT_OVER)
+  return result
+end
+
+local PICKER_KEY_CASES = {
+  { name = "down_then_enter_picks_the_second_row", keys = { DOWN, ENTER }, want = { type = "choice", item = "beta" } },
+  {
+    name = "up_from_the_first_row_wraps_to_the_last",
+    keys = { UP, ENTER },
+    want = { type = "choice", item = "gamma" },
+  },
+  {
+    name = "page_down_clamps_to_the_last_row",
+    keys = { PAGE_DOWN, ENTER },
+    want = { type = "choice", item = "gamma" },
+  },
+  {
+    name = "action_key_on_a_nav_key_wins_over_movement",
+    keys = { DOWN },
+    opts = { action_keys = { DOWN } },
+    want = { type = "key", key = DOWN, item = "alpha" },
+  },
+  {
+    name = "action_key_on_ctrl_d_wins_over_delete",
+    keys = { CTRL_D },
+    opts = { action_keys = { CTRL_D } },
+    want = { type = "key", key = CTRL_D, item = "alpha" },
+  },
+  {
+    name = "ctrl_d_twice_deletes_the_selected_row",
+    keys = { DOWN, CTRL_D, CTRL_D },
+    want = { type = "delete", item = "beta" },
+  },
+  -- With nothing matching, Down must not type into the query or index an
+  -- empty list. Backspace then brings every row back.
+  {
+    name = "nav_key_on_an_empty_filter_is_consumed",
+    keys = { NO_MATCH_QUERY, DOWN, BACKSPACE, ENTER },
+    want = { type = "choice", item = "alpha" },
+  },
+}
+
+for _, c in ipairs(PICKER_KEY_CASES) do
+  case("list_picker_" .. c.name, function()
+    local result = drive_picker(c.keys, c.opts)
+    eq(result.type, c.want.type, "type")
+    eq(result.item, c.want.item, "item")
+    eq(result.key, c.want.key, "key")
+  end)
+end
+
+local parse = require("maki.provider_parse")
+
+local NULL_AS_NIL = { luanil = { object = true, array = true } }
+
+local NUMBERS_JSON = [[{
+  "int": 8192, "whole_float": 8192.0, "exp": 1e3, "frac": 1.5, "neg": -1,
+  "null": null, "str": "8192", "bool": true,
+  "u32_max": 4294967295, "past_u32": 4294967296, "past_u64": 1e20
+}]]
+
+case("provider_parse_as_u64_takes_whole_non_negative_numbers", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON, NULL_AS_NIL))
+  for key, expected in pairs({
+    int = 8192,
+    whole_float = 8192,
+    exp = 1000,
+    frac = false,
+    neg = false,
+    null = false,
+    str = false,
+    bool = false,
+    missing = false,
+    past_u32 = 4294967296,
+    past_u64 = false,
+  }) do
+    eq(parse.as_u64(doc[key]), expected or nil, key)
+  end
+end)
+
+case("provider_parse_as_u32_rejects_past_u32_max", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON, NULL_AS_NIL))
+  eq(parse.as_u32(doc.u32_max), 4294967295)
+  eq(parse.as_u32(doc.past_u32), nil)
+  eq(parse.as_u32(doc.whole_float), 8192)
+  eq(parse.as_u32(doc.neg), nil)
+end)
+
+case("provider_parse_as_f64_and_as_bool_take_only_their_type", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON, NULL_AS_NIL))
+  eq(parse.as_f64(doc.frac), 1.5)
+  eq(parse.as_f64(doc.neg), -1)
+  eq(parse.as_f64(doc.str), nil)
+  eq(parse.as_bool(doc.bool), true)
+  eq(parse.as_bool(false), false, "false is a boolean, not a missing one")
+  eq(parse.as_bool(doc.str), nil)
+end)
+
+case("provider_parse_pricing_needs_both_sides", function()
+  eq(parse.pricing(1e-6, nil), nil, "no output price")
+  eq(parse.pricing(nil, 2e-6), nil, "no input price")
+  local pricing = assert(parse.pricing(1e-6, 2e-6, nil, 5e-7))
+  eq(pricing.input, 1)
+  eq(pricing.output, 2)
+  eq(pricing.cache_write, 0, "a missing cache price")
+  eq(pricing.cache_read, 0.5)
+end)
+
+case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
+  local body = assert(maki.json.decode(
+    [[{"data": [
+    {"id": "b", "n": 1}, {"id": "a"}, {"id": "b", "n": 2}, {"n": 3}, "stray"
+  ]}]],
+    NULL_AS_NIL
+  ))
+  local rows = parse.models(body, function(raw)
+    if type(raw) == "table" and raw.id then
+      return { id = raw.id, n = raw.n }
+    end
+    return nil
+  end)
+  eq(#rows, 2)
+  eq(rows[1].id, "a")
+  eq(rows[2].id, "b")
+  eq(rows[2].n, 1, "the first b wins")
+  eq(#parse.models({}, function() end), 0, "a body without data")
+end)
+
+th.report()

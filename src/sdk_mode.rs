@@ -1,0 +1,2238 @@
+//! SDK streaming mode: `maki --print --input-format stream-json`.
+//!
+//! Wire protocol matches Claude Code's SDK interface so tools like Conductor, Windsurf, and custom
+//! orchestrators work without adaptation.
+//!
+//! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
+//! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
+//! `MakiId` canonical form.
+
+use std::collections::HashMap;
+use std::mem;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use color_eyre::Result;
+use color_eyre::eyre::{Context, eyre};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
+use maki_agent::mcp;
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
+use maki_agent::prompt::ResolvedPrompts;
+use maki_agent::session::Resumed;
+use maki_agent::tools::QUESTION_TOOL_NAME;
+use maki_agent::{
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    PermissionsConfig, RunTotals, SessionEndReason, SessionEvents, SteerKind,
+};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
+use maki_providers::model::Model;
+use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
+use maki_storage::StateDir;
+use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
+use maki_storage::stdin;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::io::{AsyncWriteExt, stdout};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
+use tracing::warn;
+
+use crate::cli::Cli;
+use crate::interrupt::Interrupt;
+use crate::subagent_tasks::{SubagentTasks, TaskMessage};
+
+/// An accepted observation's line, such as a background result. It goes out
+/// live only, since the SDK has no history replay.
+pub(crate) const NOTICE_SUBTYPE: &str = "notice";
+const BACKGROUND_USAGE_SUBTYPE: &str = "background_usage";
+const TOOL_NAME_MAP: &[(&str, &str)] = &[
+    ("bash", "Bash"),
+    ("read", "Read"),
+    ("edit", "Edit"),
+    ("write", "Write"),
+    ("grep", "Grep"),
+    ("glob", "Glob"),
+    ("todo_write", "TodoWrite"),
+    ("webfetch", "WebFetch"),
+    ("websearch", "WebSearch"),
+    ("task", "Task"),
+    ("multiedit", "MultiEdit"),
+    ("code_execution", "CodeExecution"),
+    ("index", "Index"),
+    ("memory", "Memory"),
+    ("question", "Question"),
+    ("skill", "Skill"),
+];
+
+/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
+/// (message.id, assistant message.id).
+#[allow(clippy::disallowed_methods)]
+fn wire_uuid() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PermissionMode {
+    Default,
+    AcceptEdits,
+    Plan,
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    fn resolve(flag: Option<&str>, yolo: bool) -> Self {
+        match flag {
+            Some(s) => Self::parse(s).unwrap_or_else(|| {
+                eprintln!("warning: unknown permission mode '{s}', using default");
+                Self::Default
+            }),
+            None if yolo => Self::BypassPermissions,
+            None => Self::Default,
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "acceptEdits" => Some(Self::AcceptEdits),
+            "plan" => Some(Self::Plan),
+            "bypassPermissions" => Some(Self::BypassPermissions),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    fn agent_mode(self, cwd: &Path) -> AgentMode {
+        match self {
+            Self::Plan => AgentMode::Plan(cwd.join("plan.md")),
+            _ => AgentMode::Build,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireMessage {
+    #[serde(flatten)]
+    inner: WireInner,
+    session_id: SessionRef,
+    uuid: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireInner {
+    System(SystemPayload),
+    Assistant(AssistantPayload),
+    User(UserPayload),
+    Result(ResultPayload),
+    StreamEvent(StreamEventPayload),
+    ControlResponse(ControlResponsePayload),
+    ControlRequest(ControlRequestPayload),
+}
+
+#[derive(Serialize)]
+struct SystemPayload {
+    subtype: &'static str,
+    #[serde(flatten)]
+    extra: Value,
+}
+
+#[derive(Serialize)]
+struct AssistantPayload {
+    message: AssistantMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AssistantMessage {
+    id: String,
+    model: String,
+    role: &'static str,
+    content: Value,
+    stop_reason: Option<StopReason>,
+    usage: TokenUsage,
+}
+
+#[derive(Serialize)]
+struct UserPayload {
+    message: UserMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UserMessage {
+    role: &'static str,
+    content: Value,
+}
+
+#[derive(Serialize)]
+struct ResultPayload {
+    subtype: &'static str,
+    is_error: bool,
+    duration_ms: u128,
+    duration_api_ms: u128,
+    num_turns: u32,
+    result: String,
+    total_cost_usd: f64,
+    usage: TokenUsage,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    permission_denials: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct StreamEventPayload {
+    event: Value,
+}
+
+#[derive(Serialize)]
+struct ControlResponsePayload {
+    response: ControlResponseInner,
+}
+
+#[derive(Serialize)]
+struct ControlResponseInner {
+    subtype: &'static str,
+    request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ControlRequestPayload {
+    request_id: String,
+    request: ControlRequestInner,
+}
+
+#[derive(Serialize)]
+struct ControlRequestInner {
+    subtype: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_use_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(flatten)]
+    payload: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundUser {
+    message: InboundUserMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundUserMessage {
+    content: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundControlRequest {
+    request_id: String,
+    request: InboundControlRequestInner,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundControlRequestInner {
+    subtype: String,
+    #[serde(flatten)]
+    extra: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundControlResponse {
+    response: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundControlCancelRequest {
+    request_id: String,
+}
+
+// StreamSynth owns all Anthropic stream state. Each method returns every wire
+// event the transition needs (closing the old block, opening a new message, ...)
+// so callers never have to track block lifecycle themselves.
+
+#[derive(Clone, Copy, PartialEq)]
+enum BlockKind {
+    Text,
+    Thinking,
+}
+
+struct StreamSynth {
+    block_index: i32,
+    started: bool,
+    current_block: Option<BlockKind>,
+}
+
+impl StreamSynth {
+    fn new() -> Self {
+        Self {
+            block_index: -1,
+            started: false,
+            current_block: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn text_delta(&mut self, model: &str, text: &str) -> Vec<Value> {
+        let mut events = self.ensure_block(model, BlockKind::Text);
+        events.push(serde_json::json!({
+            "type": "content_block_delta",
+            "index": self.block_index,
+            "delta": {"type": "text_delta", "text": text}
+        }));
+        events
+    }
+
+    fn thinking_delta(&mut self, model: &str, text: &str) -> Vec<Value> {
+        let mut events = self.ensure_block(model, BlockKind::Thinking);
+        events.push(serde_json::json!({
+            "type": "content_block_delta",
+            "index": self.block_index,
+            "delta": {"type": "thinking_delta", "thinking": text}
+        }));
+        events
+    }
+
+    fn tool_use(&mut self, model: &str, id: &str, name: &str, input_json: &str) -> Vec<Value> {
+        let mut events = self.ensure_started(model);
+        events.extend(self.close_block());
+        self.block_index += 1;
+        events.push(serde_json::json!({
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }));
+        events.push(serde_json::json!({
+            "type": "content_block_delta",
+            "index": self.block_index,
+            "delta": {"type": "input_json_delta", "partial_json": input_json}
+        }));
+        events.push(self.block_stop());
+        events
+    }
+
+    fn finish_message(&mut self, usage: &TokenUsage) -> Vec<Value> {
+        if !self.started {
+            return Vec::new();
+        }
+        let mut events: Vec<Value> = self.close_block().into_iter().collect();
+        events.push(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": null},
+            "usage": {"output_tokens": usage.output}
+        }));
+        events.push(serde_json::json!({"type": "message_stop"}));
+        self.reset();
+        events
+    }
+
+    fn ensure_started(&mut self, model: &str) -> Vec<Value> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": wire_uuid(),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        })]
+    }
+
+    fn ensure_block(&mut self, model: &str, kind: BlockKind) -> Vec<Value> {
+        let mut events = self.ensure_started(model);
+        if self.current_block == Some(kind) {
+            return events;
+        }
+        events.extend(self.close_block());
+        self.block_index += 1;
+        self.current_block = Some(kind);
+        let content_block = match kind {
+            BlockKind::Text => serde_json::json!({"type": "text", "text": ""}),
+            BlockKind::Thinking => serde_json::json!({"type": "thinking", "thinking": ""}),
+        };
+        events.push(serde_json::json!({
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": content_block
+        }));
+        events
+    }
+
+    fn close_block(&mut self) -> Option<Value> {
+        self.current_block.take().map(|_| self.block_stop())
+    }
+
+    fn block_stop(&self) -> Value {
+        serde_json::json!({
+            "type": "content_block_stop",
+            "index": self.block_index,
+        })
+    }
+}
+
+fn maki_to_claude_tool_name(name: &str) -> &str {
+    TOOL_NAME_MAP
+        .iter()
+        .find(|(m, _)| *m == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(name)
+}
+
+#[derive(Clone)]
+struct SdkWriter {
+    session_id: SessionRef,
+    out_tx: UnboundedSender<String>,
+}
+
+impl SdkWriter {
+    fn emit(&self, inner: WireInner) -> Result<()> {
+        let msg = WireMessage {
+            inner,
+            session_id: self.session_id.clone(),
+            uuid: wire_uuid(),
+        };
+        self.out_tx
+            .send(serde_json::to_string(&msg)?)
+            .map_err(|_| eyre!("stdout writer closed"))
+    }
+
+    fn emit_system(&self, subtype: &'static str, extra: Value) -> Result<()> {
+        self.emit(WireInner::System(SystemPayload { subtype, extra }))
+    }
+
+    fn emit_control_response(
+        &self,
+        request_id: &str,
+        response: Option<Value>,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.emit(WireInner::ControlResponse(ControlResponsePayload {
+            response: ControlResponseInner {
+                subtype: if error.is_some() { "error" } else { "success" },
+                request_id: request_id.into(),
+                response,
+                error,
+            },
+        }))
+    }
+}
+
+pub struct SdkParams {
+    pub cli: Cli,
+    /// Which session this run continues and writes under, and where. Resolved
+    /// by the caller from the same flags every other entry point reads.
+    pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
+    pub storage: StateDir,
+    pub model: Model,
+    pub config: AgentConfig,
+    pub permissions_config: PermissionsConfig,
+    pub timeouts: Timeouts,
+    pub prompt_slots: ResolvedPrompts,
+    pub defaults: SessionDefaults,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
+    /// Plugins loaded here still want turn events, and this is what fires
+    /// them the way `maki-ui` does.
+    pub lua_handle: maki_lua::EventHandle,
+    pub project_config: ProjectConfig,
+}
+
+/// Routes permission answers between stdin and the agent.
+///
+/// Owning the outstanding ids *and* their answer channels is the point: an
+/// unanswered request parks the agent forever, so a request may only be
+/// recorded while a source that could answer it exists.
+struct Permissions {
+    /// The main agent's channel. A subagent parks on its own, which its ask
+    /// carries instead.
+    answer_tx: UnboundedSender<String>,
+    /// Wire request id to the agent-side ask it stands for and the channel
+    /// parked on it. The agent only accepts an answer naming the ask it is
+    /// parked on, so the id it asked with has to survive the round trip
+    /// through stdin.
+    outstanding: HashMap<String, (String, UnboundedSender<String>)>,
+    answerable: bool,
+}
+
+impl Permissions {
+    fn new(answer_tx: UnboundedSender<String>) -> Self {
+        Self {
+            answer_tx,
+            outstanding: HashMap::new(),
+            answerable: true,
+        }
+    }
+
+    fn answer(answer_tx: &UnboundedSender<String>, ask_id: &str, answer: PermissionAnswer) {
+        let _ = answer_tx.send(TaggedAnswer::new(ask_id, answer).encode());
+    }
+
+    fn deny_unanswerable(answer_tx: &UnboundedSender<String>, request_id: &str, ask_id: &str) {
+        warn!(%request_id, %ask_id, "denying tool permission: stdin closed");
+        Self::answer(answer_tx, ask_id, PermissionAnswer::Deny);
+    }
+
+    /// Records an outstanding request against the ask it answers. `false` means
+    /// nobody is left to answer it, so it was denied here and must not be put
+    /// on the wire.
+    fn ask(
+        &mut self,
+        request_id: String,
+        ask_id: String,
+        answer_tx: UnboundedSender<String>,
+    ) -> bool {
+        if !self.answerable {
+            Self::deny_unanswerable(&answer_tx, &request_id, &ask_id);
+            return false;
+        }
+        self.outstanding.insert(request_id, (ask_id, answer_tx));
+        true
+    }
+
+    fn resolve(&mut self, request_id: &str, answer: PermissionAnswer) {
+        if let Some((ask_id, answer_tx)) = self.outstanding.remove(request_id) {
+            Self::answer(&answer_tx, &ask_id, answer);
+        }
+    }
+
+    /// No further answers can arrive. Idempotent.
+    fn close(&mut self) {
+        self.answerable = false;
+        for (request_id, (ask_id, answer_tx)) in mem::take(&mut self.outstanding) {
+            Self::deny_unanswerable(&answer_tx, &request_id, &ask_id);
+        }
+    }
+}
+
+struct Shared {
+    model: Model,
+    permission_mode: PermissionMode,
+    /// When the turn the next result answers started: the prompt that sent
+    /// it, or the first event of a turn nobody prompted. Taken by the result.
+    turn_start: Option<Instant>,
+    permissions: Permissions,
+}
+
+/// Hands back the interrupt it ran under, for the caller to exit with once
+/// the plugin host is down.
+pub async fn run(params: SdkParams) -> Result<Interrupt> {
+    let SdkParams {
+        cli,
+        resumed,
+        claim,
+        storage,
+        model,
+        config,
+        permissions_config,
+        timeouts,
+        prompt_slots,
+        defaults,
+        model_policy,
+        plugin_rules,
+        lua_handle,
+        project_config,
+    } = params;
+    cli.warn_ignored_flags();
+    let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let interrupt = Interrupt::install();
+    let stop = interrupt.stop();
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let working_dir = cwd.to_string_lossy().into_owned();
+
+    let (mcp_handle, mcp_config_errors) = mcp::start_connected(&cwd, project_config.clone()).await;
+    if !mcp_config_errors.is_empty() {
+        eprintln!("MCP config error: {mcp_config_errors}");
+    }
+
+    let startup_model = model.clone();
+    let (handle, events) = headless::spawn_interactive(InteractiveParams {
+        model,
+        config,
+        permissions_config,
+        timeouts,
+        prompt_slots: Arc::new(prompt_slots),
+        excluded_tools: vec![QUESTION_TOOL_NAME],
+        mcp_handle,
+        initial_wd: cwd.clone(),
+        resumed,
+        claim,
+        storage,
+        yolo: permission_mode == PermissionMode::BypassPermissions,
+        unattended: false,
+        host_prompt: cli.host_prompt(),
+        defaults,
+        model_policy: Arc::clone(&model_policy),
+        plugin_rules,
+        project_config,
+        local_tools: Default::default(),
+        background: BackgroundMode::from_wait(cli.background_wait()),
+        stop: stop.clone(),
+    })
+    .await;
+
+    let (out_tx, mut out_rx) = unbounded_channel::<String>();
+    let writer_task = tokio::spawn(async move {
+        let mut out = stdout();
+        while let Some(mut line) = out_rx.recv().await {
+            line.push('\n');
+            if out.write_all(line.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let writer = SdkWriter {
+        session_id: handle.session_id.clone(),
+        out_tx,
+    };
+    let tools: Vec<&str> = handle
+        .tool_names
+        .iter()
+        .map(|t| maki_to_claude_tool_name(t))
+        .collect();
+    writer.emit_system(
+        "init",
+        serde_json::json!({
+            "cwd": working_dir,
+            "tools": tools,
+            "model": startup_model.id,
+            "permissionMode": permission_mode.as_str(),
+            "apiKeySource": "none",
+            "mcp_servers": [],
+            "slash_commands": [],
+            "output_style": "default",
+        }),
+    )?;
+
+    let shared = Arc::new(Mutex::new(Shared {
+        model: startup_model.clone(),
+        permission_mode,
+        turn_start: None,
+        permissions: Permissions::new(handle.answer_tx.clone()),
+    }));
+
+    let snapshot = HeadlessSnapshot::default();
+    let shared_for_mode = Arc::clone(&shared);
+    snapshot.install(
+        &lua_handle,
+        HeadlessMeta {
+            id: handle.session_id.to_string(),
+            cwd: working_dir.clone(),
+            model: startup_model.spec(),
+        },
+        // `set_permission_mode` can flip this mid-run, so read it per call.
+        move || match shared_for_mode.lock().unwrap().permission_mode {
+            PermissionMode::Plan => MODE_PLAN,
+            _ => MODE_BUILD,
+        },
+    );
+
+    let pump = EventPump {
+        writer: writer.clone(),
+        shared: Arc::clone(&shared),
+        include_partial_messages: cli.include_partial_messages,
+        synth: StreamSynth::new(),
+        tool_inputs: HashMap::new(),
+        tasks: SubagentTasks::new(maki_to_claude_tool_name),
+        result_text: String::new(),
+        reported: RunTotals::default(),
+        run_id: None,
+        request_counter: 0,
+        lua_handle: lua_handle.clone(),
+        session_id: handle.session_id.to_string(),
+        snapshot,
+    }
+    .spawn(events);
+
+    // Read on a blocking thread, so a stop does not wait for the next line.
+    while let Ok(next) = stop.race(stdin::read_line()).await {
+        let Some(line) = next.context("read stdin")? else {
+            break;
+        };
+        if line.is_empty() {
+            continue;
+        }
+
+        let msg: InboundMessage = match serde_json::from_str(&line) {
+            Ok(msg) => msg,
+            Err(e) => {
+                eprintln!("warning: ignoring malformed input line: {e}");
+                continue;
+            }
+        };
+
+        match msg.msg_type.as_str() {
+            "user" => {
+                let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message") else {
+                    continue;
+                };
+                let content = user.message.content;
+                let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
+                let images = content_images(&content);
+                let mode = {
+                    let mut shared = shared.lock().unwrap();
+                    shared.turn_start.get_or_insert_with(Instant::now);
+                    shared.permission_mode
+                };
+                let input = AgentInput::from_defaults(
+                    prompt,
+                    mode.agent_mode(&cwd),
+                    images,
+                    defaults,
+                    InputSource::Headless,
+                );
+                if handle.input_tx.send(input).is_err() {
+                    break;
+                }
+            }
+            "control_request" => {
+                let Some(cr) =
+                    parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
+                else {
+                    continue;
+                };
+                handle_control_request(
+                    &cr,
+                    &writer,
+                    &handle,
+                    &shared,
+                    &startup_model,
+                    &model_policy,
+                    &cwd,
+                )
+                .await?;
+            }
+            "control_response" => {
+                let Some(cr) =
+                    parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
+                else {
+                    continue;
+                };
+                let data = cr.response;
+                if let Some(req_id) = data.get("request_id").and_then(Value::as_str) {
+                    let answer = decode_permission_response(&data);
+                    shared.lock().unwrap().permissions.resolve(req_id, answer);
+                }
+            }
+            "control_cancel_request" => {
+                let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
+                    msg.payload,
+                    "control_cancel_request",
+                ) else {
+                    continue;
+                };
+                shared
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .resolve(&ccr.request_id, PermissionAnswer::Deny);
+            }
+            other => warn!("unknown inbound message type: {other}"),
+        }
+    }
+
+    // stdin was the only source of permission answers, so a run still in
+    // flight has to stop asking now: an unanswerable request parks the agent,
+    // and a parked agent never ends the event stream the pump waits on.
+    shared.lock().unwrap().permissions.close();
+
+    let InteractiveHandle {
+        input_tx,
+        task,
+        session_id,
+        spend,
+        ..
+    } = handle;
+    drop(input_tx);
+    // Unbounded: the pump ends at the stream marker, which the session
+    // emits once it has answered every prompt stdin queued.
+    let reported = pump.await.context("event pump")?;
+    let track = headless::await_shutdown(task).await;
+    // Reaps session-owned plugin jobs before the writer task ends: an
+    // orphan inheriting stdout would keep an orchestrator's read blocked
+    // after maki exits.
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
+    // Background work and plugin jobs are stopped by now, so nothing spends
+    // any more. Dropping the track saves the full bill, also what no result
+    // was left to report.
+    drop(track);
+    if let Err(e) = emit_unreported(&writer, spend.totals().since(&reported)) {
+        warn!(error = %e, "failed to report background usage");
+    }
+    drop(writer);
+    let _ = writer_task.await;
+    Ok(interrupt)
+}
+
+/// What background work spent that no result carried, because it paid after
+/// the last one. Results keep their shape, so it gets a message of its own.
+fn emit_unreported(writer: &SdkWriter, unreported: RunTotals) -> Result<()> {
+    if unreported.usage == TokenUsage::default() {
+        return Ok(());
+    }
+    writer.emit_system(
+        BACKGROUND_USAGE_SUBTYPE,
+        serde_json::json!({
+            "total_cost_usd": unreported.cost.unwrap_or_default(),
+            "usage": unreported.usage,
+        }),
+    )
+}
+
+fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
+    match serde_json::from_value(payload) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("warning: ignoring malformed {what}: {e}");
+            None
+        }
+    }
+}
+
+fn content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| {
+                    (b.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| b.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+// Claude Code stream-json block shape:
+// {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+// `source` deserializes straight into ImageSource; malformed blocks are skipped.
+fn content_images(content: &Value) -> Vec<ImageSource> {
+    let Value::Array(blocks) = content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|b| serde_json::from_value::<ImageSource>(b.get("source")?.clone()).ok())
+        .collect()
+}
+
+async fn handle_control_request(
+    cr: &InboundControlRequest,
+    writer: &SdkWriter,
+    handle: &InteractiveHandle,
+    shared: &Mutex<Shared>,
+    startup_model: &Model,
+    model_policy: &ModelPolicy,
+    cwd: &Path,
+) -> Result<()> {
+    let ok = Some(Value::Object(Default::default()));
+    match cr.request.subtype.as_str() {
+        "initialize" => {
+            if let Some(extra) = cr.request.extra.as_object()
+                && (extra.contains_key("hooks") || extra.contains_key("agents"))
+            {
+                eprintln!("note: hooks/agents payloads are ignored");
+            }
+            writer.emit_control_response(
+                &cr.request_id,
+                Some(serde_json::json!({"commands": []})),
+                None,
+            )
+        }
+        "interrupt" => {
+            let _ = handle.cancel_tx.send(());
+            writer.emit_control_response(&cr.request_id, ok, None)
+        }
+        "set_permission_mode" => {
+            let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
+            match mode_str.and_then(PermissionMode::parse) {
+                Some(mode) => {
+                    shared.lock().unwrap().permission_mode = mode;
+                    handle.switch_mode(mode.agent_mode(cwd));
+                    writer.emit_control_response(&cr.request_id, ok, None)
+                }
+                None => writer.emit_control_response(
+                    &cr.request_id,
+                    None,
+                    Some(format!(
+                        "invalid permission mode: {}",
+                        mode_str.unwrap_or("<missing>")
+                    )),
+                ),
+            }
+        }
+        "set_model" => {
+            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy)
+                .await
+            {
+                Some(model) => {
+                    let _ = handle.model_tx.send(model.clone());
+                    shared.lock().unwrap().model = model;
+                    writer.emit_control_response(&cr.request_id, ok, None)
+                }
+                None => writer.emit_control_response(
+                    &cr.request_id,
+                    None,
+                    Some("invalid or disallowed model".into()),
+                ),
+            }
+        }
+        other => writer.emit_control_response(
+            &cr.request_id,
+            None,
+            Some(format!("unsupported: {other}")),
+        ),
+    }
+}
+
+async fn resolve_set_model(
+    model_val: Option<&Value>,
+    startup_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Option<Model> {
+    match model_val? {
+        Value::Null => Some(startup_model.clone()),
+        Value::String(model_str) => {
+            let spec = resolve_model_spec(model_str);
+            Model::from_spec_with_policy(&spec, model_policy)
+                .await
+                .inspect_err(|e| warn!(model = %spec, error = %e, "ignoring requested model"))
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+fn resolve_model_spec(model_id: &str) -> String {
+    if model_id.contains('/') {
+        return model_id.to_string();
+    }
+    if model_id.starts_with("claude-") {
+        return format!("anthropic/{model_id}");
+    }
+    model_id.to_string()
+}
+
+fn decode_permission_response(data: &Value) -> PermissionAnswer {
+    match data.get("behavior").and_then(Value::as_str) {
+        Some("allow") if data.get("updatedPermissions").is_some() => PermissionAnswer::AllowSession,
+        Some("allow") => PermissionAnswer::AllowOnce,
+        Some("deny") => match data.get("message").and_then(Value::as_str) {
+            Some(msg) if !msg.is_empty() => PermissionAnswer::DenyWithGuidance(msg.to_string()),
+            _ => PermissionAnswer::Deny,
+        },
+        _ => PermissionAnswer::Deny,
+    }
+}
+
+struct EventPump {
+    writer: SdkWriter,
+    shared: Arc<Mutex<Shared>>,
+    include_partial_messages: bool,
+    synth: StreamSynth,
+    tool_inputs: HashMap<String, (String, Value)>,
+    tasks: SubagentTasks,
+    result_text: String,
+    /// What every result so far reported.
+    reported: RunTotals,
+    /// The run the last event belonged to. A new one starts a turn.
+    run_id: Option<u64>,
+    request_counter: u64,
+    lua_handle: maki_lua::EventHandle,
+    session_id: String,
+    snapshot: HeadlessSnapshot,
+}
+
+impl EventPump {
+    /// Ends with what its results reported.
+    fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
+        tokio::spawn(async move {
+            while let Some(envelope) = events.next().await {
+                // Folded in first, so a plugin handling `TurnEnd` finds the
+                // finished totals when it calls `maki.session.read()`.
+                self.snapshot.observe(&envelope);
+                maki_lua::agent_autocmd::dispatch(&self.lua_handle, &self.session_id, &envelope);
+                if let Err(e) = self.handle(envelope) {
+                    warn!(error = %e, "sdk event pump stopped");
+                    break;
+                }
+            }
+            let unended = self.tasks.finish();
+            if let Err(e) = self.emit_tasks(unended) {
+                warn!(error = %e, "sdk event pump could not end its subagent tasks");
+            }
+            self.reported
+        })
+    }
+
+    fn model_id(&self) -> String {
+        self.shared.lock().unwrap().model.id.clone()
+    }
+
+    fn emit_stream(&self, events: Vec<Value>) -> Result<()> {
+        events.into_iter().try_for_each(|event| {
+            self.writer
+                .emit(WireInner::StreamEvent(StreamEventPayload { event }))
+        })
+    }
+
+    fn reset_turn(&mut self) {
+        self.synth.reset();
+        self.tool_inputs.clear();
+        self.result_text.clear();
+    }
+
+    fn emit_turn_result(
+        &mut self,
+        is_error: bool,
+        result: String,
+        num_turns: u32,
+        totals: RunTotals,
+    ) -> Result<()> {
+        let duration_ms = self
+            .shared
+            .lock()
+            .unwrap()
+            .turn_start
+            .take()
+            .map_or(0, |start| start.elapsed().as_millis());
+        self.reported += totals;
+        // Zero on an unpriced model, which is what its turns reported too.
+        let total_cost_usd = totals.cost.unwrap_or_default();
+        self.writer.emit(WireInner::Result(ResultPayload {
+            subtype: if is_error {
+                "error_during_execution"
+            } else {
+                "success"
+            },
+            is_error,
+            duration_ms,
+            duration_api_ms: duration_ms,
+            num_turns,
+            result,
+            total_cost_usd,
+            usage: totals.usage,
+            permission_denials: Vec::new(),
+        }))?;
+        self.reset_turn();
+        Ok(())
+    }
+
+    fn handle(&mut self, envelope: Envelope) -> Result<()> {
+        let task_messages = self.tasks.observe(&envelope);
+        self.emit_tasks(task_messages.before)?;
+        self.handle_event(&envelope)?;
+        self.emit_tasks(task_messages.after)
+    }
+
+    fn emit_tasks(&self, tasks: Vec<TaskMessage>) -> Result<()> {
+        tasks.into_iter().try_for_each(|task| {
+            self.writer
+                .emit_system(task.subtype(), serde_json::to_value(task)?)
+        })
+    }
+
+    fn handle_event(&mut self, envelope: &Envelope) -> Result<()> {
+        // A woken turn has no prompt to time it from.
+        if self.run_id.replace(envelope.run_id) != Some(envelope.run_id) {
+            self.shared
+                .lock()
+                .unwrap()
+                .turn_start
+                .get_or_insert_with(Instant::now);
+        }
+        let parent_tool_use_id = envelope
+            .subagent
+            .as_ref()
+            .map(|s| s.parent_tool_use_id.clone());
+
+        match &envelope.event {
+            AgentEvent::TextDelta { text } => {
+                if self.include_partial_messages {
+                    let model = self.model_id();
+                    let events = self.synth.text_delta(&model, text);
+                    self.emit_stream(events)?;
+                }
+            }
+            AgentEvent::ThinkingDelta { text } => {
+                if self.include_partial_messages {
+                    let model = self.model_id();
+                    let events = self.synth.thinking_delta(&model, text);
+                    self.emit_stream(events)?;
+                }
+            }
+            AgentEvent::ToolStart(ts) => {
+                let name = ts.tool.to_string();
+                let input = ts.raw_input.clone().unwrap_or(Value::Null);
+
+                if self.include_partial_messages {
+                    let model = self.model_id();
+                    let events = self.synth.tool_use(
+                        &model,
+                        &ts.id,
+                        maki_to_claude_tool_name(&name),
+                        &serde_json::to_string(&input)?,
+                    );
+                    self.emit_stream(events)?;
+                }
+                self.tool_inputs.insert(ts.id.clone(), (name, input));
+            }
+            AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolDone(_)
+            | AgentEvent::ToolMovable { .. }
+            | AgentEvent::ToolParts { .. }
+            | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::QueueDrained
+            | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
+            | AgentEvent::CompactionDone { .. }
+            | AgentEvent::AuthRequired
+            | AgentEvent::AllowedByPlugin { .. }
+            | AgentEvent::SubagentHistory { .. }
+            | AgentEvent::ToolSnapshot { .. }
+            | AgentEvent::ToolHeaderSnapshot { .. }
+            | AgentEvent::LiveToolBuf { .. }
+            | AgentEvent::Nudge
+            | AgentEvent::Notice { .. }
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::StreamClosed => {}
+            // A later kept message overwrites this with its own answer, so the
+            // reason is the result only when every message was dropped.
+            AgentEvent::Steered {
+                kind: SteerKind::MessageDropped,
+                text,
+            } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
+            AgentEvent::Steered { .. } => {}
+            AgentEvent::ObservationLine { text, .. } if parent_tool_use_id.is_none() => {
+                self.writer
+                    .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
+            }
+            AgentEvent::ObservationLine { .. } => {}
+            AgentEvent::Retry {
+                attempt,
+                message,
+                delay_ms,
+            } => {
+                self.writer.emit_system(
+                    "api_retry",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "retry_delay_ms": delay_ms,
+                        "error": message,
+                    }),
+                )?;
+            }
+            AgentEvent::TurnComplete(tc) => {
+                if self.include_partial_messages {
+                    let events = self.synth.finish_message(&tc.usage);
+                    self.emit_stream(events)?;
+                }
+
+                let content_value = serde_json::to_value(&tc.message.content)?;
+                if parent_tool_use_id.is_none() {
+                    self.result_text = content_text(&content_value).unwrap_or_default();
+                }
+                self.writer.emit(WireInner::Assistant(AssistantPayload {
+                    message: AssistantMessage {
+                        id: wire_uuid(),
+                        model: tc.model.clone(),
+                        role: "assistant",
+                        content: map_tool_names_in_content(&content_value),
+                        stop_reason: None,
+                        usage: tc.usage,
+                    },
+                    parent_tool_use_id,
+                }))?;
+            }
+            AgentEvent::ToolResultsSubmitted { message } => {
+                self.writer.emit(WireInner::User(UserPayload {
+                    message: UserMessage {
+                        role: "user",
+                        content: serde_json::to_value(&message.content)?,
+                    },
+                    parent_tool_use_id,
+                }))?;
+            }
+            AgentEvent::PermissionRequest { id, tool, .. } => {
+                let answer_tx = {
+                    let shared = self.shared.lock().unwrap();
+                    let answer_tx = match &envelope.subagent {
+                        Some(info) => {
+                            let Some(answer_tx) = info.answer_tx.clone() else {
+                                warn!(
+                                    subagent = info.name,
+                                    parent_tool_use_id = info.parent_tool_use_id,
+                                    tool_use_id = id,
+                                    "dropping subagent permission with no answer channel"
+                                );
+                                return Ok(());
+                            };
+                            answer_tx
+                        }
+                        None => shared.permissions.answer_tx.clone(),
+                    };
+                    if shared.permission_mode == PermissionMode::BypassPermissions {
+                        Permissions::answer(&answer_tx, id, PermissionAnswer::AllowSession);
+                        return Ok(());
+                    }
+                    answer_tx
+                };
+
+                let (tool_name, input) = self
+                    .tool_inputs
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| (tool.to_string(), Value::Null));
+
+                self.request_counter += 1;
+                let req_id = format!("req_{}", self.request_counter);
+                if !self.shared.lock().unwrap().permissions.ask(
+                    req_id.clone(),
+                    id.clone(),
+                    answer_tx,
+                ) {
+                    return Ok(());
+                }
+
+                self.writer
+                    .emit(WireInner::ControlRequest(ControlRequestPayload {
+                        request_id: req_id,
+                        request: ControlRequestInner {
+                            subtype: "can_use_tool",
+                            tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
+                            input: Some(input),
+                            tool_use_id: Some(id.clone()),
+                        },
+                    }))?;
+            }
+            AgentEvent::Done {
+                usage,
+                cost,
+                list_cost,
+                num_turns,
+                reason,
+                ..
+            } => {
+                // An interrupted run leaves a partial answer and a dropped one
+                // never ran, so neither is a success.
+                let is_error = match reason {
+                    DoneReason::Cancelled | DoneReason::Dropped => true,
+                    DoneReason::EndTurn
+                    | DoneReason::MaxTokens
+                    | DoneReason::MaxTurns
+                    | DoneReason::Compact => false,
+                };
+                let result = mem::take(&mut self.result_text);
+                let totals = RunTotals {
+                    usage: *usage,
+                    cost: *cost,
+                    list_cost: *list_cost,
+                };
+                self.emit_turn_result(is_error, result, *num_turns, totals)?;
+            }
+            AgentEvent::Error {
+                message, totals, ..
+            } => {
+                self.emit_turn_result(true, message.clone(), 0, *totals)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn map_tool_names_in_content(content: &Value) -> Value {
+    match content {
+        Value::Array(blocks) => {
+            let mapped: Vec<Value> = blocks
+                .iter()
+                .map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && let Some(name) = block.get("name").and_then(Value::as_str)
+                    {
+                        let mut b = block.clone();
+                        b["name"] = Value::String(maki_to_claude_tool_name(name).to_string());
+                        return b;
+                    }
+                    block.clone()
+                })
+                .collect();
+            Value::Array(mapped)
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::iter;
+    use std::time::Duration;
+
+    use maki_agent::SubagentInfo;
+    use maki_config::ToolKey;
+    use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+    use super::*;
+
+    fn claude_to_maki_tool_name(name: &str) -> &str {
+        TOOL_NAME_MAP
+            .iter()
+            .find(|(_, c)| *c == name)
+            .map(|(m, _)| *m)
+            .unwrap_or(name)
+    }
+
+    #[test_case("bash", "Bash")]
+    #[test_case("read", "Read")]
+    #[test_case("edit", "Edit")]
+    #[test_case("write", "Write")]
+    #[test_case("grep", "Grep")]
+    #[test_case("glob", "Glob")]
+    #[test_case("todo_write", "TodoWrite")]
+    #[test_case("webfetch", "WebFetch")]
+    #[test_case("websearch", "WebSearch")]
+    #[test_case("task", "Task")]
+    #[test_case("multiedit", "MultiEdit")]
+    #[test_case("code_execution", "CodeExecution")]
+    #[test_case("index", "Index")]
+    #[test_case("memory", "Memory")]
+    #[test_case("question", "Question")]
+    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
+        assert_eq!(maki_to_claude_tool_name(maki), claude);
+        assert_eq!(claude_to_maki_tool_name(claude), maki);
+    }
+
+    #[test]
+    fn unknown_tool_name_passthrough() {
+        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
+        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
+    }
+
+    const MODEL: &str = "test-model";
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn text_delta_starts_message_and_subsequent_is_delta_only() {
+        let mut synth = StreamSynth::new();
+        let events = synth.text_delta(MODEL, "hi");
+        assert_eq!(
+            types(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert_eq!(events[0]["message"]["model"], MODEL);
+        assert_eq!(events[1]["index"], 0);
+        assert_eq!(events[1]["content_block"]["type"], "text");
+        assert_eq!(events[2]["delta"]["text"], "hi");
+
+        let more = synth.text_delta(MODEL, "again");
+        assert_eq!(types(&more), ["content_block_delta"]);
+    }
+
+    #[test]
+    fn block_transition_closes_previous_and_increments_index() {
+        let mut synth = StreamSynth::new();
+        synth.text_delta(MODEL, "a");
+        let events = synth.thinking_delta(MODEL, "b");
+        assert_eq!(
+            types(&events),
+            [
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert_eq!(events[0]["index"], 0);
+        assert_eq!(events[1]["index"], 1);
+        assert_eq!(events[1]["content_block"]["type"], "thinking");
+    }
+
+    #[test]
+    fn tool_use_emits_complete_block() {
+        let mut synth = StreamSynth::new();
+        synth.text_delta(MODEL, "a");
+        let events = synth.tool_use(MODEL, "tool_1", "Read", r#"{"path":"t"}"#);
+        assert_eq!(
+            types(&events),
+            [
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop"
+            ]
+        );
+        assert_eq!(events[1]["content_block"]["type"], "tool_use");
+        assert_eq!(events[1]["content_block"]["name"], "Read");
+        assert_eq!(events[2]["delta"]["type"], "input_json_delta");
+    }
+
+    #[test]
+    fn multiple_tool_uses_increment_block_index() {
+        let mut synth = StreamSynth::new();
+        synth.text_delta(MODEL, "x");
+        let t1 = synth.tool_use(MODEL, "t1", "Read", "{}");
+        let t2 = synth.tool_use(MODEL, "t2", "Write", "{}");
+        let idx = |events: &[Value]| {
+            events
+                .iter()
+                .find(|e| e["type"] == "content_block_start")
+                .unwrap()["index"]
+                .as_i64()
+        };
+        assert_eq!(idx(&t1), Some(1));
+        assert_eq!(idx(&t2), Some(2));
+    }
+
+    #[test]
+    fn finish_message_closes_block_and_resets() {
+        let mut synth = StreamSynth::new();
+        synth.text_delta(MODEL, "a");
+        let usage = TokenUsage {
+            output: 5,
+            ..Default::default()
+        };
+        let events = synth.finish_message(&usage);
+        assert_eq!(
+            types(&events),
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(events[1]["usage"]["output_tokens"], 5);
+
+        assert!(synth.finish_message(&usage).is_empty());
+
+        let next = synth.text_delta(MODEL, "new");
+        assert_eq!(next[1]["index"], 0);
+    }
+
+    #[test]
+    fn finish_message_before_start_is_empty() {
+        let mut synth = StreamSynth::new();
+        assert!(synth.finish_message(&TokenUsage::default()).is_empty());
+    }
+
+    #[test]
+    fn tool_use_on_fresh_synth_has_no_spurious_stop() {
+        let mut synth = StreamSynth::new();
+        let events = synth.tool_use(MODEL, "t1", "Read", r#"{"path":"x"}"#);
+        assert_eq!(events[0]["type"], "message_start");
+        let start_pos = events
+            .iter()
+            .position(|e| e["type"] == "content_block_start")
+            .unwrap();
+        let stop_pos = events
+            .iter()
+            .position(|e| e["type"] == "content_block_stop")
+            .unwrap();
+        assert!(stop_pos > start_pos);
+    }
+
+    #[test_case("default", PermissionMode::Default)]
+    #[test_case("acceptEdits", PermissionMode::AcceptEdits)]
+    #[test_case("plan", PermissionMode::Plan)]
+    #[test_case("bypassPermissions", PermissionMode::BypassPermissions)]
+    fn permission_mode_roundtrip(s: &str, mode: PermissionMode) {
+        assert_eq!(PermissionMode::parse(s), Some(mode));
+        assert_eq!(mode.as_str(), s);
+    }
+
+    #[test]
+    fn permission_mode_resolve() {
+        assert_eq!(
+            PermissionMode::resolve(None, false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            PermissionMode::resolve(None, true),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            PermissionMode::resolve(Some("plan"), true),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            PermissionMode::resolve(Some("bogus"), false),
+            PermissionMode::Default
+        );
+    }
+
+    #[test]
+    fn content_text_extracts_from_all_shapes() {
+        assert_eq!(content_text(&serde_json::json!("hi")), Some("hi".into()));
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "image", "source": {}},
+            {"type": "text", "text": "b"},
+        ]);
+        assert_eq!(content_text(&blocks), Some("a\nb".into()));
+        assert_eq!(content_text(&serde_json::json!(42)), None);
+    }
+
+    #[test]
+    fn content_images_extracts_base64_blocks() {
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "look at this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+        ]);
+        let images = content_images(&blocks);
+        assert_eq!(images.len(), 2);
+        assert_eq!(&*images[0].data, "AAAA");
+        assert_eq!(&*images[1].data, "BBBB");
+
+        // Non-array content and malformed image blocks yield no images.
+        assert!(content_images(&serde_json::json!("hi")).is_empty());
+        let bad = serde_json::json!([{"type": "image", "source": {"data": "x"}}]);
+        assert!(content_images(&bad).is_empty());
+    }
+
+    #[test]
+    fn wire_result_serializes_correctly() {
+        let msg = WireMessage {
+            inner: WireInner::Result(ResultPayload {
+                subtype: "success",
+                is_error: false,
+                duration_ms: 1000,
+                duration_api_ms: 1000,
+                num_turns: 1,
+                result: "done".into(),
+                total_cost_usd: 0.01,
+                usage: TokenUsage::default(),
+                permission_denials: Vec::new(),
+            }),
+            session_id: SessionRef::generate(),
+            uuid: "u".into(),
+        };
+        let json: Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "result");
+        assert_eq!(json["subtype"], "success");
+        assert_eq!(json["num_turns"], 1);
+        assert!(json.get("session_id").is_some());
+    }
+
+    #[test]
+    fn wire_init_serializes_correctly() {
+        let msg = WireMessage {
+            inner: WireInner::System(SystemPayload {
+                subtype: "init",
+                extra: serde_json::json!({
+                    "cwd": "/tmp",
+                    "tools": ["Read"],
+                    "model": "test",
+                    "permissionMode": "default",
+                }),
+            }),
+            session_id: SessionRef::generate(),
+            uuid: "u".into(),
+        };
+        let json: Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "system");
+        assert_eq!(json["subtype"], "init");
+        assert_eq!(json["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn wire_control_response_serializes() {
+        let msg = WireMessage {
+            inner: WireInner::ControlResponse(ControlResponsePayload {
+                response: ControlResponseInner {
+                    subtype: "success",
+                    request_id: "req_1".into(),
+                    response: Some(serde_json::json!({"commands": []})),
+                    error: None,
+                },
+            }),
+            session_id: SessionRef::generate(),
+            uuid: "u".into(),
+        };
+        let json: Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "control_response");
+        assert_eq!(json["response"]["request_id"], "req_1");
+    }
+
+    #[test]
+    fn wire_control_request_serializes() {
+        let msg = WireMessage {
+            inner: WireInner::ControlRequest(ControlRequestPayload {
+                request_id: "req_5".into(),
+                request: ControlRequestInner {
+                    subtype: "can_use_tool",
+                    tool_name: Some("Read".into()),
+                    input: Some(serde_json::json!({"path": "/tmp"})),
+                    tool_use_id: Some("tool_123".into()),
+                },
+            }),
+            session_id: SessionRef::generate(),
+            uuid: "u".into(),
+        };
+        let json: Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "control_request");
+        assert_eq!(json["request"]["subtype"], "can_use_tool");
+        assert_eq!(json["request"]["tool_name"], "Read");
+    }
+
+    #[test_case("claude-opus-4-6", "anthropic/claude-opus-4-6"; "claude_prefix")]
+    #[test_case("openai/gpt-4", "openai/gpt-4"; "explicit_provider")]
+    #[test_case("gpt-4o", "gpt-4o"; "unknown_passthrough")]
+    fn resolve_model_spec_cases(input: &str, expected: &str) {
+        assert_eq!(resolve_model_spec(input), expected);
+    }
+
+    #[test]
+    fn decode_permission_response_variants() {
+        assert!(matches!(
+            decode_permission_response(&serde_json::json!({"behavior": "allow"})),
+            PermissionAnswer::AllowOnce
+        ));
+        assert!(matches!(
+            decode_permission_response(
+                &serde_json::json!({"behavior": "allow", "updatedPermissions": []})
+            ),
+            PermissionAnswer::AllowSession
+        ));
+        assert!(matches!(
+            decode_permission_response(&serde_json::json!({})),
+            PermissionAnswer::Deny
+        ));
+        assert!(matches!(
+            decode_permission_response(&serde_json::json!({"behavior": "something_else"})),
+            PermissionAnswer::Deny
+        ));
+        match decode_permission_response(
+            &serde_json::json!({"behavior": "deny", "message": "not now"}),
+        ) {
+            PermissionAnswer::DenyWithGuidance(msg) => assert_eq!(msg, "not now"),
+            other => panic!("expected guidance, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_set_model_null_returns_startup() {
+        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let result = resolve_set_model(
+            Some(&Value::Null),
+            &startup,
+            &maki_config::ModelPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.id, startup.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_set_model_rejects_disallowed_exact_spec() {
+        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+            "provider": {"allowed_models": [startup.spec()]}
+        }))
+        .unwrap();
+        let policy = raw.into_config(&[]).unwrap().provider.model_policy;
+
+        assert!(
+            resolve_set_model(
+                Some(&Value::String("openai/gpt-5".into())),
+                &startup,
+                &policy
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn map_tool_names_in_content_maps_known_and_preserves_rest() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "name": "read", "id": "1", "input": {}},
+            {"type": "tool_use", "name": "unknown_native", "id": "2", "input": {}},
+        ]);
+        let mapped = map_tool_names_in_content(&content);
+        assert_eq!(mapped[0]["type"], "text");
+        assert_eq!(mapped[1]["name"], "Read");
+        assert_eq!(mapped[2]["name"], "unknown_native");
+    }
+
+    const TEST_MODEL_SPEC: &str = "anthropic/claude-test";
+    const PUMP_ERROR: &str = "boom";
+    const PUMP_FORWARDED: &str = "the pump must forward what was queued before the close";
+    const TEST_TOOL: &str = "bash";
+    const TEST_TOOL_WIRE_NAME: &str = "Bash";
+    const TEST_TOOL_USE_ID: &str = "toolu_1";
+    const CONTROL_REQUEST_TYPE: &str = "control_request";
+    const SYSTEM_TYPE: &str = "system";
+    const RESULT_TYPE: &str = "result";
+    const USER_TYPE: &str = "user";
+    const TASK_STARTED: &str = "task_started";
+    const TASK_NOTIFICATION: &str = "task_notification";
+    const TASK_A: &str = "session-a";
+    const TASK_B: &str = "session-b";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const CHILD_NOTICE_LINE: &str = "a child's own notice";
+    const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
+    const NOTICE_CHILD: &str = "child-1";
+    const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
+    const NO_ANSWER: &str = "answer sent with nobody parked on it";
+    const STALE_PROMPT_AGE: Duration = Duration::from_secs(10);
+    const WOKEN_RUN: u64 = 1;
+    const TIMED_FROM_PROMPT: &str = "a prompted turn is timed from its prompt";
+    const TIMED_FROM_WAKE: &str = "a woken turn must not be timed from the last prompt";
+    const ANSWER_OUTLIVES_TURN: &str =
+        "a call moved off its turn can still be parked on its ask after the turn result";
+    const OUTSTANDING_REQ: &str = "req_1";
+    const RESULT_INPUT_TOKENS: u64 = 1_000;
+    const RESULT_COST: f64 = 0.25;
+    const LATE_INPUT_TOKENS: u64 = 300;
+    const LATE_COST: f64 = 0.5;
+    const UNREPORTED_ONLY: &str =
+        "only spend that no result carried may be reported after the last one";
+    const LATE_REQ: &str = "req_2";
+    const RESULT_BILLED: &str = "a result must carry its run's bill, also when the run failed";
+
+    /// Every answer in these tests belongs to the one ask `permission_request`
+    /// makes, and the agent only takes an answer naming it.
+    fn tagged(answer: PermissionAnswer) -> String {
+        TaggedAnswer::new(TEST_TOOL_USE_ID, answer).encode()
+    }
+
+    fn test_pump(
+        permission_mode: PermissionMode,
+        answer_tx: UnboundedSender<String>,
+    ) -> (EventPump, UnboundedReceiver<String>) {
+        let (out_tx, out_rx) = unbounded_channel();
+        let session_id = SessionRef::from(maki_storage::id::MakiId::generate());
+        let pump = EventPump {
+            writer: SdkWriter {
+                session_id: session_id.clone(),
+                out_tx,
+            },
+            shared: Arc::new(Mutex::new(Shared {
+                model: Model::from_spec(TEST_MODEL_SPEC).unwrap(),
+                permission_mode,
+                turn_start: None,
+                permissions: Permissions::new(answer_tx),
+            })),
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            tasks: SubagentTasks::new(maki_to_claude_tool_name),
+            result_text: String::new(),
+            reported: RunTotals::default(),
+            run_id: None,
+            request_counter: 0,
+            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
+            session_id: session_id.to_string(),
+            snapshot: HeadlessSnapshot::default(),
+        };
+        (pump, out_rx)
+    }
+
+    fn permission_request() -> Envelope {
+        Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: TEST_TOOL_USE_ID.to_owned(),
+                tool: ToolKey::parse(TEST_TOOL).unwrap(),
+                scopes: Vec::new(),
+                reason: None,
+            },
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    /// The SDK hang: `retained` is the Lua tool context that keeps a sender
+    /// alive on an idle VM, so the pump has to end on the stream marker and
+    /// still report everything queued ahead of it.
+    #[tokio::test]
+    async fn pump_ends_at_stream_close_with_a_retained_sender() {
+        let (guard, events) = maki_agent::event_stream();
+        let retained = guard.sender(0);
+        let (pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let pump = pump.spawn(events);
+
+        retained
+            .send(AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+                auth: false,
+                totals: RunTotals::default(),
+            })
+            .unwrap();
+        drop(guard);
+        pump.await.unwrap();
+
+        let line = out_rx.try_recv().expect(PUMP_FORWARDED);
+        assert!(line.contains(PUMP_ERROR), "got: {line}");
+    }
+
+    /// Stdin is the only answerer, so once it is gone every request has to be
+    /// denied here. A single unanswered one parks the agent, and a parked
+    /// agent never ends the event stream the exit path waits on.
+    #[test]
+    fn closing_the_answer_source_denies_outstanding_and_later_requests() {
+        let (answer_tx, mut answer_rx) = unbounded_channel();
+        let mut permissions = Permissions::new(answer_tx.clone());
+
+        assert!(permissions.ask(
+            OUTSTANDING_REQ.to_owned(),
+            TEST_TOOL_USE_ID.to_owned(),
+            answer_tx.clone()
+        ));
+        assert!(answer_rx.is_empty());
+
+        permissions.close();
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
+
+        assert!(!permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned(), answer_tx));
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
+
+        permissions.close();
+        assert!(answer_rx.is_empty());
+    }
+
+    /// Every answer has to match an id the agent is actually parked on. A
+    /// spare one would be picked up by the *next* turn's request and
+    /// auto-answer it.
+    #[test]
+    fn only_requests_the_agent_waits_on_get_answered() {
+        let (answer_tx, mut answer_rx) = unbounded_channel();
+        let mut permissions = Permissions::new(answer_tx.clone());
+        assert!(permissions.ask(
+            OUTSTANDING_REQ.to_owned(),
+            TEST_TOOL_USE_ID.to_owned(),
+            answer_tx
+        ));
+
+        permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowOnce))
+        );
+
+        permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+    }
+
+    /// Background work outlives the turn that started it, and so does an ask
+    /// it is parked on. Stale answers are harmless anyway: the agent only
+    /// takes the one naming its ask.
+    #[test]
+    fn a_turn_result_keeps_requests_outstanding() {
+        let (answer_tx, mut answer_rx) = unbounded_channel();
+        let (mut pump, _out_rx) = test_pump(PermissionMode::Default, answer_tx);
+        pump.handle(permission_request()).unwrap();
+
+        pump.emit_turn_result(false, String::new(), 1, RunTotals::default())
+            .unwrap();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowOnce)),
+            "{ANSWER_OUTLIVES_TURN}"
+        );
+    }
+
+    /// Bypass answers on the spot, so recording the id or emitting a control
+    /// request would leave an answer nobody is parked on: stdin's reply (or
+    /// the deny on exit) would land on whatever the agent asks next.
+    #[test]
+    fn bypass_answers_immediately_without_recording_or_emitting() {
+        let (answer_tx, mut answer_rx) = unbounded_channel();
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
+
+        pump.handle(permission_request()).unwrap();
+
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowSession))
+        );
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+        assert!(out_rx.try_recv().is_err(), "{NO_CONTROL_REQUEST}");
+        assert!(
+            pump.shared
+                .lock()
+                .unwrap()
+                .permissions
+                .outstanding
+                .is_empty()
+        );
+    }
+
+    /// The wire and the outstanding set have to move together: an id on the
+    /// wire that was never recorded is unanswerable, and one recorded without
+    /// being asked parks the agent until exit.
+    #[test]
+    fn permission_request_reaches_the_wire_only_while_answerable() {
+        let (answer_tx, mut answer_rx) = unbounded_channel();
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, answer_tx);
+
+        pump.handle(permission_request()).unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["type"], CONTROL_REQUEST_TYPE);
+        assert_eq!(wire["request"]["tool_name"], TEST_TOOL_WIRE_NAME);
+        assert_eq!(wire["request"]["tool_use_id"], TEST_TOOL_USE_ID);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        let request_id = wire["request_id"].as_str().unwrap().to_owned();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(&request_id, PermissionAnswer::AllowOnce);
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(tagged(PermissionAnswer::AllowOnce))
+        );
+
+        pump.shared.lock().unwrap().permissions.close();
+        pump.handle(permission_request()).unwrap();
+
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
+        assert!(out_rx.try_recv().is_err(), "{NO_CONTROL_REQUEST}");
+    }
+
+    fn top_level(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    fn from_subagent(id: &str, event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: id.into(),
+                name: id.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                control: Arc::default(),
+                parent_call: None,
+            }),
+            run_id: 0,
+        }
+    }
+
+    /// A subagent parks on its own channel, so an answer sent on the main
+    /// one never wakes it and the main agent drops it as a stray.
+    #[test_case(PermissionMode::BypassPermissions, PermissionAnswer::AllowSession ; "bypass")]
+    #[test_case(PermissionMode::Default, PermissionAnswer::AllowOnce ; "client_answer")]
+    fn subagent_permission_is_answered_on_its_own_channel(
+        permission_mode: PermissionMode,
+        answer: PermissionAnswer,
+    ) {
+        let (main_tx, main_rx) = unbounded_channel();
+        let (child_tx, mut child_rx) = unbounded_channel();
+        let (mut pump, _out_rx) = test_pump(permission_mode, main_tx);
+        let mut request = from_subagent(TASK_A, permission_request().event);
+        request.subagent.as_mut().unwrap().answer_tx = Some(child_tx);
+
+        pump.handle(request).unwrap();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(OUTSTANDING_REQ, answer.clone());
+
+        assert_eq!(child_rx.try_recv(), Ok(tagged(answer)));
+        assert!(main_rx.is_empty(), "{NO_ANSWER}");
+    }
+
+    /// Nothing reached the model, so a client reading `is_error` must not take
+    /// the empty turn for an answer.
+    #[test]
+    fn a_dropped_prompt_is_an_error_with_its_reason() {
+        const DROP_REASON: &str = "blocked by a plugin";
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+
+        pump.handle(top_level(AgentEvent::Steered {
+            kind: SteerKind::MessageDropped,
+            text: DROP_REASON.into(),
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 0,
+            reason: DoneReason::Dropped,
+        }))
+        .unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["is_error"], true);
+        assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    /// The SDK has no history replay, so the line goes out live as a system
+    /// message. A host notice and a child's line stay out.
+    #[test]
+    fn an_accepted_notice_is_a_live_system_message() {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+
+        pump.handle(top_level(AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+            detail: None,
+            markdown: false,
+            end: None,
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Notice {
+            text: HOST_NOTICE.into(),
+        }))
+        .unwrap();
+        pump.handle(from_subagent(
+            NOTICE_CHILD,
+            AgentEvent::ObservationLine {
+                text: CHILD_NOTICE_LINE.into(),
+                detail: None,
+                markdown: false,
+                end: None,
+            },
+        ))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }))
+        .unwrap();
+
+        let wire: Vec<Value> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|message| message["subtype"] != TASK_STARTED)
+            .collect();
+        assert_eq!(wire.len(), 2, "{wire:?}");
+        assert_eq!(wire[0]["type"], SYSTEM_TYPE);
+        assert_eq!(wire[0]["subtype"], NOTICE_SUBTYPE);
+        assert_eq!(wire[0]["text"], NOTICE_LINE);
+        assert_eq!(
+            wire[0]["session_id"],
+            pump.writer.session_id.to_string().as_str()
+        );
+        assert_eq!(wire[1]["type"], RESULT_TYPE);
+    }
+
+    /// Each wire line reads as (type or task subtype, the subagent it names).
+    #[test]
+    fn task_messages_frame_each_subagents_own_messages() {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let results = || AgentEvent::ToolResultsSubmitted {
+            message: Box::default(),
+        };
+
+        pump.handle(top_level(results())).unwrap();
+        for id in [TASK_A, TASK_B, TASK_A] {
+            pump.handle(from_subagent(id, results())).unwrap();
+        }
+        pump.handle(top_level(AgentEvent::SubagentHistory {
+            tool_use_id: TASK_A.into(),
+            messages: Vec::new(),
+        }))
+        .unwrap();
+
+        let wire: Vec<(String, String)> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                let label = message.get("subtype").unwrap_or(&message["type"]);
+                let task = message
+                    .get("task_id")
+                    .unwrap_or(&message["parent_tool_use_id"]);
+                (
+                    label.as_str().unwrap().to_owned(),
+                    task.as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let expected = [
+            (USER_TYPE, ""),
+            (TASK_STARTED, TASK_A),
+            (USER_TYPE, TASK_A),
+            (TASK_STARTED, TASK_B),
+            (USER_TYPE, TASK_B),
+            (USER_TYPE, TASK_A),
+            (TASK_NOTIFICATION, TASK_A),
+        ]
+        .map(|(label, task)| (label.to_owned(), task.to_owned()));
+        assert_eq!(wire, expected);
+    }
+
+    fn run_done(totals: RunTotals) -> AgentEvent {
+        AgentEvent::Done {
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    /// A turn woken once stdin closed has no prompt, so it is timed from its
+    /// own first event.
+    #[test]
+    fn a_woken_turn_is_timed_from_its_own_start() {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        pump.shared.lock().unwrap().turn_start = Instant::now().checked_sub(STALE_PROMPT_AGE);
+
+        pump.handle(top_level(run_done(RunTotals::default())))
+            .unwrap();
+        pump.handle(Envelope {
+            event: run_done(RunTotals::default()),
+            subagent: None,
+            run_id: WOKEN_RUN,
+        })
+        .unwrap();
+
+        let durations: Vec<u128> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| {
+                let result: Value = serde_json::from_str(&line).unwrap();
+                u128::from(result["duration_ms"].as_u64().unwrap())
+            })
+            .collect();
+        assert!(
+            durations[0] >= STALE_PROMPT_AGE.as_millis(),
+            "{TIMED_FROM_PROMPT}"
+        );
+        assert!(
+            durations[1] < STALE_PROMPT_AGE.as_millis(),
+            "{TIMED_FROM_WAKE}"
+        );
+    }
+
+    /// Background work can pay after the last result, when no turn is left
+    /// to carry it. That spend gets a message of its own, and only that spend.
+    /// A failed run bills its result just like a finished one.
+    #[test_case(0, 0.0, false ; "nothing_after_the_last_result")]
+    #[test_case(LATE_INPUT_TOKENS, LATE_COST, false ; "spend_after_the_last_result")]
+    #[test_case(LATE_INPUT_TOKENS, LATE_COST, true ; "spend_after_a_failed_run")]
+    fn only_spend_no_result_carried_is_reported_at_the_end(
+        late_input: u64,
+        late_cost: f64,
+        failed: bool,
+    ) {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        let tokens = |input| TokenUsage {
+            input,
+            ..Default::default()
+        };
+        let run = RunTotals {
+            usage: tokens(RESULT_INPUT_TOKENS),
+            cost: Some(RESULT_COST),
+            list_cost: None,
+        };
+        let ending = if failed {
+            AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+                auth: false,
+                totals: run,
+            }
+        } else {
+            run_done(run)
+        };
+        pump.handle(top_level(ending)).unwrap();
+        let spent = RunTotals {
+            usage: tokens(RESULT_INPUT_TOKENS + late_input),
+            cost: Some(RESULT_COST + late_cost),
+            list_cost: None,
+        };
+
+        emit_unreported(&pump.writer, spent.since(&pump.reported)).unwrap();
+
+        let result: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(result["type"], RESULT_TYPE);
+        assert_eq!(result["is_error"], failed);
+        assert_eq!(
+            result["usage"]["input_tokens"].as_u64(),
+            Some(RESULT_INPUT_TOKENS),
+            "{RESULT_BILLED}"
+        );
+        assert_eq!(
+            result["total_cost_usd"].as_f64(),
+            Some(RESULT_COST),
+            "{RESULT_BILLED}"
+        );
+
+        let unreported: Vec<(u64, f64)> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|message| {
+                message["type"] == SYSTEM_TYPE && message["subtype"] == BACKGROUND_USAGE_SUBTYPE
+            })
+            .map(|message| {
+                (
+                    message["usage"]["input_tokens"].as_u64().unwrap(),
+                    message["total_cost_usd"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        let expected = Vec::from_iter((late_input > 0).then_some((late_input, late_cost)));
+        assert_eq!(unreported, expected, "{UNREPORTED_ONLY}");
+    }
+}

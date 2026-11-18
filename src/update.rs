@@ -1,0 +1,322 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use maki_storage::paths::canonicalize_clean;
+use maki_storage::stdin;
+use maki_storage::version::{self, VersionError};
+use maki_storage::{StateDir, StorageError};
+
+#[cfg(not(windows))]
+const INSTALLER: Installer = Installer {
+    url: "https://maki.sh/install.sh",
+    lang: "bash",
+    suffix: ".sh",
+    program: "sh",
+    args: &[],
+};
+#[cfg(windows)]
+const INSTALLER: Installer = Installer {
+    url: "https://maki.sh/install.ps1",
+    lang: "powershell",
+    // PowerShell's -File refuses scripts that don't end in .ps1.
+    suffix: ".ps1",
+    program: "powershell",
+    args: &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+};
+
+const BACKUP_FILENAME: &str = "maki_backup";
+const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
+
+struct Installer {
+    url: &'static str,
+    lang: &'static str,
+    suffix: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    #[error("failed to fetch {url}: {source}")]
+    Fetch {
+        url: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("failed to determine current binary path: {0}")]
+    CurrentExe(std::io::Error),
+
+    #[error("failed to backup binary to {path}: {source}")]
+    Backup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to write install script: {0}")]
+    WriteScript(std::io::Error),
+
+    #[error("failed to execute install script: {0}")]
+    ExecScript(std::io::Error),
+
+    #[error("install script failed with exit code {0:?}")]
+    InstallFailed(Option<i32>),
+
+    #[error("no backup found at {0}")]
+    NoBackup(PathBuf),
+
+    #[error("failed to restore backup from {path}: {source}")]
+    Restore {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("cannot access data directory: {0}")]
+    Storage(#[from] StorageError),
+
+    #[error("failed to check latest version: {0}")]
+    VersionCheck(#[from] VersionError),
+}
+
+async fn fetch_script() -> Result<String, UpdateError> {
+    let fetch = |source| UpdateError::Fetch {
+        url: INSTALLER.url,
+        source,
+    };
+    let response = version::client()
+        .build()
+        .map_err(fetch)?
+        .get(INSTALLER.url)
+        .send()
+        .await
+        .map_err(fetch)?;
+    response.text().await.map_err(fetch)
+}
+
+/// Where `maki update` keeps the binary it replaced, for `maki rollback`.
+pub fn backup_path() -> Result<PathBuf, StorageError> {
+    Ok(StateDir::resolve()?.path().join(BACKUP_FILENAME))
+}
+
+fn backup_binary(exe_path: &Path, backup_path: &Path) -> Result<(), UpdateError> {
+    std::fs::copy(exe_path, backup_path).map_err(|e| UpdateError::Backup {
+        path: backup_path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
+    let mut tmp = tempfile::Builder::new()
+        .suffix(INSTALLER.suffix)
+        .tempfile()
+        .map_err(UpdateError::WriteScript)?;
+    tmp.write_all(script.as_bytes())
+        .map_err(UpdateError::WriteScript)?;
+    tmp.flush().map_err(UpdateError::WriteScript)?;
+
+    // Close our handle before spawning: on Windows, powershell -File refuses to
+    // open the script while we still hold it open for write ("The process
+    // cannot access the file ... it is being used by another process"), so
+    // every `maki update` on Windows fails. TempPath still deletes the file
+    // when dropped.
+    let tmp_path = tmp.into_temp_path();
+
+    let status = std::process::Command::new(INSTALLER.program)
+        .args(INSTALLER.args)
+        .arg(tmp_path.as_os_str())
+        .env(INSTALL_DIR_ENV, install_dir)
+        .status()
+        .map_err(UpdateError::ExecScript)?;
+
+    if !status.success() {
+        return Err(UpdateError::InstallFailed(status.code()));
+    }
+    Ok(())
+}
+
+fn current_exe_resolved() -> Result<PathBuf, UpdateError> {
+    // canonicalize_clean drops the `\\?\` prefix Windows adds. Otherwise it leaks
+    // into MAKI_INSTALL_DIR and install.ps1 adds a second, duplicate PATH entry.
+    std::env::current_exe()
+        .map(|p| canonicalize_clean(&p))
+        .map_err(UpdateError::CurrentExe)
+}
+
+#[cfg(unix)]
+fn needs_sudo(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_err()
+}
+
+#[cfg(not(unix))]
+fn needs_sudo(_path: &Path) -> bool {
+    false
+}
+
+/// Windows won't overwrite a running exe, but it will rename one. So rollback
+/// parks the live maki.exe as maki.exe.old, the same trick install.ps1 uses.
+#[cfg(windows)]
+fn move_exe_aside(exe_path: &Path) -> Option<PathBuf> {
+    let old = exe_path.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(exe_path, &old).ok().map(|()| old)
+}
+
+#[cfg(not(windows))]
+fn move_exe_aside(_exe_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError> {
+    let err = |e| UpdateError::Restore {
+        path: backup_path.to_path_buf(),
+        source: e,
+    };
+
+    let tmp = exe_path.with_extension("maki_tmp");
+    if needs_sudo(exe_path) {
+        println!("Restoring to {} (requires sudo)...", exe_path.display());
+        let status = std::process::Command::new("sudo")
+            .args([
+                "sh",
+                "-c",
+                r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
+                "maki-restore",
+            ])
+            .arg(backup_path)
+            .arg(&tmp)
+            .arg(exe_path)
+            .status()
+            .map_err(err)?;
+        if !status.success() {
+            return Err(err(std::io::Error::other("sudo restore failed")));
+        }
+    } else {
+        std::fs::copy(backup_path, &tmp).map_err(err)?;
+        let moved_aside = move_exe_aside(exe_path);
+        if let Err(e) = std::fs::rename(&tmp, exe_path) {
+            if let Some(old) = moved_aside {
+                let _ = std::fs::rename(old, exe_path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
+    }
+    Ok(())
+}
+
+async fn prompt_yes(install_dir: &Path) -> bool {
+    eprint!(
+        "Install to {} and run this script? [y/N] ",
+        install_dir.display()
+    );
+    let _ = std::io::stderr().flush();
+    matches!(stdin::read_line().await, Ok(Some(answer)) if answer.trim().eq_ignore_ascii_case("y"))
+}
+
+pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
+    let latest = version::fetch_latest().await?;
+    if !version::is_newer(&latest, version::CURRENT) {
+        println!("Already up to date (v{})", version::CURRENT);
+        return Ok(());
+    }
+
+    println!("Current version: v{}", version::CURRENT);
+    println!("Latest version:  v{latest}");
+    println!();
+
+    let exe_path = current_exe_resolved()?;
+    let install_dir = match std::env::var_os(INSTALL_DIR_ENV).filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => exe_path
+            .parent()
+            .ok_or_else(|| {
+                UpdateError::CurrentExe(std::io::Error::other(
+                    "binary path has no parent directory",
+                ))
+            })?
+            .to_path_buf(),
+    };
+    let backup_path = backup_path()?;
+
+    let script = fetch_script().await?;
+
+    if no_color {
+        println!("{script}");
+    } else {
+        println!("{}", maki_ui::highlight_ansi(INSTALLER.lang, &script));
+    }
+
+    if !skip_confirm && !prompt_yes(&install_dir).await {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    backup_binary(&exe_path, &backup_path)?;
+
+    execute_script(&script, &install_dir)?;
+
+    println!();
+    println!("Updated successfully.");
+    println!("Previous version saved to: {}", backup_path.display());
+    println!("To restore: maki rollback");
+
+    Ok(())
+}
+
+pub fn rollback() -> Result<(), UpdateError> {
+    let exe_path = current_exe_resolved()?;
+    let backup_path = backup_path()?;
+
+    if !backup_path.exists() {
+        return Err(UpdateError::NoBackup(backup_path));
+    }
+
+    restore_backup(&backup_path, &exe_path)?;
+
+    println!("Restored previous version.");
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const CURRENT_EXE_CONTENT: &str = "current_version";
+    const BACKUP_EXE_CONTENT: &str = "backup_version";
+    const STALE_OLD_CONTENT: &str = "stale_old_version";
+
+    #[test_case(false; "clean")]
+    #[test_case(true; "with_stale_old_file")]
+    fn restore_backup_replaces_exe(has_stale_old: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("maki.exe");
+        let backup_path = dir.path().join("maki_backup");
+        let old_path = exe_path.with_extension("exe.old");
+
+        std::fs::write(&exe_path, CURRENT_EXE_CONTENT).unwrap();
+        std::fs::write(&backup_path, BACKUP_EXE_CONTENT).unwrap();
+        if has_stale_old {
+            std::fs::write(&old_path, STALE_OLD_CONTENT).unwrap();
+        }
+
+        restore_backup(&backup_path, &exe_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&exe_path).unwrap(),
+            BACKUP_EXE_CONTENT
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            CURRENT_EXE_CONTENT
+        );
+    }
+}

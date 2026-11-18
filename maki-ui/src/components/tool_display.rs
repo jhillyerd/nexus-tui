@@ -1,0 +1,2325 @@
+use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
+
+use super::code_view;
+use crate::animation::spinner_str;
+use crate::theme;
+use code_view::RenderLimits;
+use code_view::SectionFlags;
+use maki_config::{ClockFormat, ToolOutputLines};
+
+use std::borrow::Cow;
+use std::fmt::Write;
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Instant;
+
+use unicode_width::UnicodeWidthStr;
+
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+
+use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
+use maki_agent::tools::is_timeout_annotation;
+use maki_agent::{
+    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
+};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::render_worker::RenderWorker;
+
+pub struct RenderCtx<'a> {
+    pub started_at: Instant,
+    pub width: u16,
+    pub tool_output_lines: &'a ToolOutputLines,
+}
+
+pub const TOOL_INDICATOR: &str = "● ";
+pub const BACKGROUND_INDICATOR: &str = "↗ ";
+pub const MOVABLE_HINT: &str = "ctrl+b background";
+const BACKGROUND_LABEL: &str = "background";
+const BACKGROUND_CLICK_HINT: &str = "click to open";
+const BACKGROUND_DONE_LABEL: &str = "done";
+const BACKGROUND_FAILED_LABEL: &str = "failed";
+const BACKGROUND_CANCELLED_LABEL: &str = "cancelled";
+const BACKGROUND_LOST_LABEL: &str = "lost";
+const SECS_PER_MINUTE: u64 = 60;
+const SECS_PER_HOUR: u64 = 3600;
+const RIGHT_INFO_GAP: &str = "  ";
+const ASSISTANT_MARKER: &str = TOOL_INDICATOR;
+const USER_MARKER: &str = "❯ ";
+const BLANK_MARKER: &str = "  ";
+const THINKING_LABEL: &str = "thinking> ";
+pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
+pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
+
+const CODE_OUTPUT_DIVIDER: &str = "────────────";
+const ANNOTATION_SEP: &str = " · ";
+/// Instruction blocks have no tool of their own, so they render under this name.
+const INSTRUCTIONS_TOOL: &str = "load";
+/// Stands in for a tool message whose role carries no name.
+const UNNAMED_TOOL: &str = "?";
+
+pub struct RoleStyle {
+    pub marker: &'static str,
+    pub marker_style: Style,
+    pub label: &'static str,
+    pub text_style: Style,
+    pub use_markdown: bool,
+    pub max_line_bytes: Option<usize>,
+}
+
+impl RoleStyle {
+    pub fn label_style(&self) -> Style {
+        self.marker_style.add_modifier(Modifier::BOLD)
+    }
+
+    pub fn gutter(&self) -> Span<'static> {
+        Span::styled(self.marker, self.label_style())
+    }
+}
+
+pub fn assistant_style() -> RoleStyle {
+    RoleStyle {
+        marker: ASSISTANT_MARKER,
+        marker_style: theme::current().assistant_prefix,
+        label: "",
+        text_style: theme::current().assistant,
+        use_markdown: true,
+        max_line_bytes: None,
+    }
+}
+
+pub fn user_style() -> RoleStyle {
+    RoleStyle {
+        marker: USER_MARKER,
+        marker_style: theme::current().user,
+        label: "",
+        text_style: theme::current().user_text,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn thinking_style() -> RoleStyle {
+    RoleStyle {
+        marker: ASSISTANT_MARKER,
+        marker_style: theme::current().thinking,
+        label: THINKING_LABEL,
+        text_style: theme::current().thinking,
+        use_markdown: true,
+        max_line_bytes: None,
+    }
+}
+
+pub fn error_style() -> RoleStyle {
+    RoleStyle {
+        marker: BLANK_MARKER,
+        marker_style: theme::current().tool_error,
+        label: "",
+        text_style: theme::current().error,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn notice_style() -> RoleStyle {
+    RoleStyle {
+        marker: BLANK_MARKER,
+        marker_style: theme::current().tool_dim,
+        label: "",
+        text_style: theme::current().tool_dim,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn done_style() -> RoleStyle {
+    RoleStyle {
+        marker: BLANK_MARKER,
+        marker_style: theme::current().tool_success,
+        label: "",
+        text_style: theme::current().tool_success.add_modifier(Modifier::BOLD),
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub struct ToolLines {
+    pub lines: Vec<Line<'static>>,
+    pub highlight: Option<HighlightRequest>,
+    pub spinner_lines: Vec<(usize, usize)>,
+    pub gutter: Span<'static>,
+    pub gutter_spins: bool,
+    /// Index of the first live-buffer snapshot line, recorded in the same
+    /// pass that lays out `lines`, so click rows can never drift from them.
+    pub snapshot_base: Option<usize>,
+    pub truncation: SectionFlags,
+    pub elapsed: Option<ElapsedSpan>,
+}
+
+/// The header span that shows how long a moved call has been running.
+pub struct ElapsedSpan {
+    pub span: usize,
+    pub since: Instant,
+    pub shown_secs: u64,
+    pub width: u16,
+}
+
+impl ElapsedSpan {
+    pub fn text(secs: u64) -> String {
+        background_annotation(None, Some(secs))
+    }
+
+    /// Shows `secs` on the header. The text can grow, so the right info that
+    /// follows it is re-fitted instead of being left to overflow and wrap.
+    pub fn refit(&self, header: &mut Line<'static>, secs: u64) {
+        let Some(span) = header.spans.get_mut(self.span) else {
+            return;
+        };
+        span.content = Self::text(secs).into();
+        refit_right_info(header, self.span + 1, self.width);
+    }
+}
+
+pub struct HighlightRequest {
+    pub range: (usize, usize),
+    pub input: Option<Arc<ToolInput>>,
+    pub output: Option<Arc<ToolOutput>>,
+    pub limits: RenderLimits,
+}
+
+impl HighlightRequest {
+    fn new(
+        range: (usize, usize),
+        input: Option<Arc<ToolInput>>,
+        output: Option<Arc<ToolOutput>>,
+        limits: RenderLimits,
+    ) -> Option<Self> {
+        if range.0 == range.1 {
+            return None;
+        }
+        let output = output.and_then(|o| match *o {
+            ToolOutput::ReadCode { .. }
+            | ToolOutput::WriteCode { .. }
+            | ToolOutput::Diff { .. }
+            | ToolOutput::GrepResult { .. }
+            | ToolOutput::Instructions { .. } => Some(o),
+            ToolOutput::Plain(_)
+            | ToolOutput::Markdown(_)
+            | ToolOutput::ReadDir(_)
+            | ToolOutput::TodoList(_)
+            | ToolOutput::Batch { .. }
+            | ToolOutput::Image { .. } => None,
+        });
+        if input.is_none() && output.is_none() {
+            return None;
+        }
+        Some(Self {
+            range,
+            input,
+            output,
+            limits,
+        })
+    }
+}
+
+impl ToolLines {
+    pub fn send_highlight(&self, worker: &RenderWorker) -> Option<u64> {
+        let hl = self.highlight.as_ref()?;
+        Some(worker.send(hl.input.clone(), hl.output.clone(), hl.limits))
+    }
+}
+
+pub fn format_timestamp_now(format: ClockFormat) -> String {
+    let zoned = Timestamp::now().to_zoned(TimeZone::system());
+    zoned.strftime(crate::clock::hms(format)).to_string()
+}
+
+type RightPart<'a> = Option<(&'a str, Style)>;
+
+fn right_parts_len(parts: &[RightPart]) -> Option<usize> {
+    let (count, width) = parts
+        .iter()
+        .flatten()
+        .fold((0, 0), |(count, width), (text, _)| {
+            (count + 1, width + UnicodeWidthStr::width(*text))
+        });
+    (count > 0).then(|| width + RIGHT_INFO_GAP.len() * (count - 1) + 1)
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Right-aligns the hint, usage and timestamp on the header line. Whole
+/// pieces are dropped from the left (hint, then usage) when there is no room
+/// for all of them, so the header text never moves and nothing wraps.
+pub fn append_right_info(
+    line: &mut Line<'static>,
+    hint: Option<&str>,
+    usage: Option<&str>,
+    timestamp: Option<&str>,
+    width: u16,
+) {
+    let palette = theme::current();
+    let parts: [RightPart; 3] = [
+        hint.map(|h| (h, palette.tool_dim)),
+        usage.map(|u| (u, palette.tool_dim)),
+        timestamp.map(|t| (t, palette.timestamp)),
+    ];
+    let header_width = spans_width(&line.spans);
+    let w = width as usize;
+    let Some((parts, suffix_len)) = (0..parts.len()).find_map(|dropped| {
+        let kept = &parts[dropped..];
+        let len = right_parts_len(kept)?;
+        (header_width + 1 + len <= w).then_some((kept, len))
+    }) else {
+        return;
+    };
+    line.spans
+        .push(Span::raw(" ".repeat(w - header_width - suffix_len)));
+    for (i, (text, style)) in parts.iter().flatten().enumerate() {
+        if i > 0 {
+            line.spans.push(Span::raw(RIGHT_INFO_GAP));
+        }
+        line.spans.push(Span::styled((*text).to_owned(), *style));
+    }
+}
+
+/// Re-fits the right info laid out by `append_right_info` after the header
+/// grew: `pad_idx` is its padding span. Re-pads when it still fits, otherwise
+/// drops whole pieces from the left, and everything when none fit.
+fn refit_right_info(line: &mut Line<'static>, pad_idx: usize, width: u16) {
+    if pad_idx >= line.spans.len() {
+        return;
+    }
+    let header_width = spans_width(&line.spans[..pad_idx]);
+    let mut right_width = spans_width(&line.spans[pad_idx + 1..]) + 1;
+    let w = width as usize;
+    while header_width + 1 + right_width > w {
+        let first = pad_idx + 1;
+        if line.spans.len() <= first + 1 {
+            line.spans.truncate(pad_idx);
+            return;
+        }
+        right_width -= spans_width(&line.spans[first..first + 2]);
+        line.spans.drain(first..first + 2);
+    }
+    line.spans[pad_idx].content = " ".repeat(w - header_width - right_width).into();
+}
+
+/// Columns the movable hint covers on a header line, if it was drawn.
+pub fn hint_columns(header: &Line<'_>) -> Option<Range<u16>> {
+    let mut col = 0usize;
+    for span in &header.spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if span.content == MOVABLE_HINT {
+            return Some(col as u16..(col + width) as u16);
+        }
+        col += width;
+    }
+    None
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < SECS_PER_MINUTE {
+        format!("{secs}s")
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m{:02}s", secs / SECS_PER_MINUTE, secs % SECS_PER_MINUTE)
+    } else {
+        format!(
+            "{}h{:02}m",
+            secs / SECS_PER_HOUR,
+            secs % SECS_PER_HOUR / SECS_PER_MINUTE
+        )
+    }
+}
+
+/// A running task says how long it has run and where to watch it. An ended
+/// one says how it ended in words, since two endings share a color.
+fn background_annotation(outcome: Option<BackgroundOutcome>, elapsed_secs: Option<u64>) -> String {
+    let mut text = format!(" ({BACKGROUND_LABEL}");
+    match outcome {
+        None => {
+            if let Some(secs) = elapsed_secs {
+                text.push_str(ANNOTATION_SEP);
+                text.push_str(&format_elapsed(secs));
+            }
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(BACKGROUND_CLICK_HINT);
+        }
+        Some(outcome) => {
+            text.push_str(ANNOTATION_SEP);
+            text.push_str(outcome_label(outcome));
+        }
+    }
+    text.push(')');
+    text
+}
+
+fn outcome_label(outcome: BackgroundOutcome) -> &'static str {
+    match outcome {
+        BackgroundOutcome::Done => BACKGROUND_DONE_LABEL,
+        BackgroundOutcome::Error => BACKGROUND_FAILED_LABEL,
+        BackgroundOutcome::Cancelled => BACKGROUND_CANCELLED_LABEL,
+        BackgroundOutcome::Lost => BACKGROUND_LOST_LABEL,
+    }
+}
+
+/// The dot a background task's result notice opens with, colored the way
+/// the moved row's own dot ends.
+pub fn outcome_glyph(outcome: BackgroundOutcome) -> Span<'static> {
+    let indicator = Indicator::from(Some(outcome));
+    Span::styled(finished_glyph(indicator), finished_style(indicator))
+}
+
+#[derive(Clone, Copy)]
+enum Indicator {
+    InProgress,
+    Success,
+    Error,
+    Cancelled,
+    Moved,
+}
+
+impl From<ToolStatus> for Indicator {
+    fn from(s: ToolStatus) -> Self {
+        match s {
+            ToolStatus::InProgress => Self::InProgress,
+            ToolStatus::Success => Self::Success,
+            ToolStatus::Error => Self::Error,
+        }
+    }
+}
+
+impl From<Option<BackgroundOutcome>> for Indicator {
+    fn from(outcome: Option<BackgroundOutcome>) -> Self {
+        match outcome {
+            None => Self::Moved,
+            Some(BackgroundOutcome::Done) => Self::Success,
+            Some(BackgroundOutcome::Error) => Self::Error,
+            Some(BackgroundOutcome::Cancelled | BackgroundOutcome::Lost) => Self::Cancelled,
+        }
+    }
+}
+
+struct ResolvedOutput<'a> {
+    text: Option<Cow<'a, str>>,
+    skipped: usize,
+}
+
+fn resolve_output<'a>(
+    output: Option<&'a ToolOutput>,
+    body: Option<&'a str>,
+    live_output: Option<&'a str>,
+    pre_truncated: usize,
+    limits: RenderLimits,
+) -> ResolvedOutput<'a> {
+    let full_text: Option<Cow<'a, str>> = output.and_then(plain_output_text).map(Cow::Borrowed);
+
+    let expanded = limits.is_output_expanded();
+    let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if expanded {
+        match &full_text {
+            Some(t) => (Some(t.clone()), 0),
+            None if output.is_some() => {
+                return ResolvedOutput {
+                    text: None,
+                    skipped: 0,
+                };
+            }
+            None => match live_output {
+                Some(live) => (Some(Cow::Borrowed(live)), 0),
+                None => match body {
+                    Some(b) => (Some(Cow::Borrowed(b)), pre_truncated),
+                    None => (None, 0),
+                },
+            },
+        }
+    } else {
+        match (body, &full_text) {
+            (Some(b), _) => (Some(Cow::Borrowed(b)), pre_truncated),
+            (None, Some(t)) => (Some(t.clone()), 0),
+            (None, None) if output.is_some() => {
+                return ResolvedOutput {
+                    text: None,
+                    skipped: 0,
+                };
+            }
+            (None, None) => (None, 0),
+        }
+    };
+
+    let (text, skipped) = match raw_text {
+        Some(t) if !t.is_empty() => {
+            let tr = truncate_output(&t, limits.output);
+            let s = if tr.skipped > 0 {
+                tr.skipped
+            } else {
+                already_truncated
+            };
+            (Some(Cow::Owned(tr.kept.into_owned())), s)
+        }
+        _ => (None, already_truncated),
+    };
+
+    ResolvedOutput { text, skipped }
+}
+
+struct ToolLineBuilder {
+    lines: Vec<Line<'static>>,
+    spinner_lines: Vec<(usize, usize)>,
+    snapshot_base: Option<usize>,
+    content_range: (usize, usize),
+    width: u16,
+    truncation: SectionFlags,
+    limits: RenderLimits,
+    markdown: bool,
+    indicator: Indicator,
+    elapsed: Option<ElapsedSpan>,
+}
+
+impl ToolLineBuilder {
+    fn new(
+        width: u16,
+        expanded: SectionFlags,
+        max_output_lines: usize,
+        indicator: Indicator,
+    ) -> Self {
+        let limits = RenderLimits::new(expanded, max_output_lines);
+        Self {
+            lines: Vec::new(),
+            spinner_lines: Vec::new(),
+            snapshot_base: None,
+            content_range: (0, 0),
+            width,
+            truncation: SectionFlags::default(),
+            limits,
+            markdown: false,
+            indicator,
+            elapsed: None,
+        }
+    }
+
+    fn apply_output_format(&mut self, output: Option<&ToolOutput>) {
+        if output.is_some_and(ToolOutput::is_markdown) {
+            self.markdown = true;
+        }
+    }
+
+    fn push_header(
+        &mut self,
+        tool_name: &str,
+        header: &str,
+        annotation: Option<&str>,
+        render_header: Option<&BufferSnapshot>,
+    ) {
+        let mut spans = vec![Span::styled(
+            header_prefix(tool_name, header),
+            theme::current().tool_prefix,
+        )];
+        if let Some(snapshot) = render_header {
+            if let Some(first_line) = snapshot.lines.first() {
+                let line_idx = self.lines.len();
+                let spinners = &mut self.spinner_lines;
+                bake_spans(
+                    &first_line.spans,
+                    &mut spans,
+                    spinner_str(0),
+                    self.indicator,
+                    |span_idx| {
+                        spinners.push((line_idx, span_idx));
+                    },
+                );
+            }
+        } else {
+            spans.push(Span::styled(header.to_owned(), theme::current().tool));
+        }
+        if let Some(ann) = annotation {
+            spans.push(Span::styled(
+                format!(" ({ann})"),
+                theme::current().tool_annotation,
+            ));
+        }
+        self.lines.push(Line::from(spans));
+    }
+
+    fn push_background_annotation(&mut self, badge: &BackgroundBadge) {
+        let Some(header) = self.lines.first_mut() else {
+            return;
+        };
+        let ticking = badge
+            .started_at
+            .filter(|_| badge.outcome.is_none())
+            .map(|since| (since, since.elapsed().as_secs()));
+        self.elapsed = ticking.map(|(since, shown_secs)| ElapsedSpan {
+            span: header.spans.len(),
+            since,
+            shown_secs,
+            width: self.width,
+        });
+        header.spans.push(Span::styled(
+            background_annotation(badge.outcome, ticking.map(|(_, secs)| secs)),
+            theme::current().tool_dim,
+        ));
+    }
+
+    fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
+        let content = code_view::render_tool_content(input, output, false, self.limits);
+        self.truncation.script |= content.truncation.script;
+        self.truncation.output |= content.truncation.output;
+        let start = self.lines.len();
+        self.lines.extend(content.lines);
+        self.content_range = (start, self.lines.len());
+    }
+
+    fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
+        if resolved.text.is_none() {
+            return;
+        }
+
+        if self.content_range.1 > self.content_range.0 {
+            self.lines.push(Line::from(Span::styled(
+                CODE_OUTPUT_DIVIDER,
+                theme::current().tool_dim,
+            )));
+        }
+
+        if let Some(text) = &resolved.text {
+            if self.markdown {
+                self.push_markdown_body(text);
+            } else {
+                push_text_lines(&mut self.lines, text);
+            }
+            self.push_truncation_count(resolved.skipped);
+        }
+    }
+
+    fn push_markdown_body(&mut self, text: &str) {
+        let style = theme::current().assistant;
+        let md_lines = text_to_lines(
+            text,
+            "",
+            style,
+            style,
+            self.width,
+            Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        );
+        self.lines.extend(md_lines);
+    }
+
+    fn push_truncation_count(&mut self, skipped: usize) {
+        if should_truncate(skipped) {
+            self.truncation.output = true;
+            let text = truncation_notice(skipped);
+            self.lines
+                .push(Line::from(Span::styled(text, theme::current().tool_dim)));
+        }
+    }
+
+    fn push_snapshot(&mut self, snapshot: &BufferSnapshot, started_at: Instant) {
+        let base = self.lines.len();
+        self.snapshot_base = Some(base);
+        let total = snapshot.lines.len();
+        let frame = spinner_str(started_at.elapsed().as_millis());
+        let (lines, spinners) = snapshot_to_lines_range(snapshot, 0..total, frame, self.indicator);
+        self.lines.extend(lines);
+        self.spinner_lines
+            .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
+    }
+
+    fn finish(
+        self,
+        started_at: Instant,
+        input: Option<Arc<ToolInput>>,
+        output: Option<Arc<ToolOutput>>,
+    ) -> ToolLines {
+        let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
+        let gutter = match self.indicator {
+            Indicator::InProgress => Span::styled(
+                spinner_str(started_at.elapsed().as_millis()),
+                theme::current().spinner,
+            ),
+            finished => Span::styled(finished_glyph(finished), finished_style(finished)),
+        };
+        ToolLines {
+            lines: self.lines,
+            highlight,
+            spinner_lines: self.spinner_lines,
+            gutter,
+            gutter_spins: matches!(self.indicator, Indicator::InProgress),
+            snapshot_base: self.snapshot_base,
+            truncation: self.truncation,
+            elapsed: self.elapsed,
+        }
+    }
+}
+
+fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str) {
+    let style = theme::current().tool;
+    lines.extend(
+        text.lines()
+            .map(|line| Line::from(Span::styled(line.to_owned(), style))),
+    );
+}
+
+/// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
+/// current frame while a tool is in progress, and `on_spinner` gets their
+/// span index in the same pass, so animation offsets can never drift from
+/// the baked spans. Finished tools bake a static dot instead and record no
+/// spinner position, so a stale `"spinner"` span can never keep animating.
+fn bake_spans(
+    src: &[SnapshotSpan],
+    out: &mut Vec<Span<'static>>,
+    spinner_frame: &'static str,
+    indicator: Indicator,
+    mut on_spinner: impl FnMut(usize),
+) {
+    for span in src {
+        if matches!(&span.style, SpanStyle::Named(n) if n == SPINNER_STYLE_NAME) {
+            match indicator {
+                Indicator::InProgress => {
+                    on_spinner(out.len());
+                    out.push(Span::styled(spinner_frame, theme::current().spinner));
+                }
+                finished => out.push(Span::styled(
+                    finished_glyph(finished),
+                    finished_style(finished),
+                )),
+            }
+        } else {
+            out.push(Span::styled(
+                span.text.clone(),
+                resolve_span_style(&span.style),
+            ));
+        }
+    }
+}
+
+fn finished_glyph(indicator: Indicator) -> &'static str {
+    if matches!(indicator, Indicator::Moved) {
+        BACKGROUND_INDICATOR
+    } else {
+        TOOL_INDICATOR
+    }
+}
+
+fn finished_style(indicator: Indicator) -> Style {
+    match indicator {
+        Indicator::Error => theme::current().tool_error,
+        // The color of a cancelled todo, without its strike, which would run
+        // through the space after the dot as a stray line.
+        Indicator::Cancelled => theme::current()
+            .todo_cancelled
+            .remove_modifier(Modifier::CROSSED_OUT),
+        Indicator::Moved => theme::current().tool_dim,
+        Indicator::InProgress | Indicator::Success => theme::current().tool_success,
+    }
+}
+
+fn snapshot_to_lines_range(
+    snapshot: &BufferSnapshot,
+    range: std::ops::Range<usize>,
+    spinner_frame: &'static str,
+    indicator: Indicator,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let mut spinners = Vec::new();
+    let lines = snapshot.lines[range]
+        .iter()
+        .enumerate()
+        .map(|(i, sline)| {
+            let mut spans = Vec::new();
+            bake_spans(
+                &sline.spans,
+                &mut spans,
+                spinner_frame,
+                indicator,
+                |span_idx| {
+                    spinners.push((i, span_idx));
+                },
+            );
+            Line::from(spans)
+        })
+        .collect();
+    (lines, spinners)
+}
+
+fn span_color(c: SpanColor) -> Option<Color> {
+    theme::segment_slot(theme::segment_color_from_span(c))
+}
+
+pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
+    match style {
+        SpanStyle::Default => theme::current().tool,
+        SpanStyle::Named(name) => theme::style_by_name(name),
+        SpanStyle::Inline(inline) => {
+            let mut s = Style::default();
+            if let Some(fg) = inline.fg.and_then(span_color) {
+                s = s.fg(fg);
+            }
+            if let Some(bg) = inline.bg.and_then(span_color) {
+                s = s.bg(bg);
+            }
+            if inline.bold {
+                s = s.bold();
+            }
+            if inline.italic {
+                s = s.italic();
+            }
+            if inline.underline {
+                s = s.underlined();
+            }
+            if inline.dim {
+                s = s.dim();
+            }
+            if inline.strikethrough {
+                s = s.crossed_out();
+            }
+            if inline.reversed {
+                s = s.reversed();
+            }
+            s
+        }
+    }
+}
+
+pub fn build_tool_lines(
+    msg: &DisplayMessage,
+    status: ToolStatus,
+    rctx: &RenderCtx,
+    expanded: SectionFlags,
+) -> ToolLines {
+    let tool_name = msg.role.tool_name().unwrap_or(UNNAMED_TOOL);
+    let (header, body) = match msg.text.split_once('\n') {
+        Some((h, b)) => (h, Some(b)),
+        None => (msg.text.as_str(), None),
+    };
+
+    let mut b = ToolLineBuilder::new(
+        rctx.width,
+        expanded,
+        rctx.tool_output_lines.get(tool_name),
+        msg.background
+            .as_ref()
+            .map_or_else(|| status.into(), |badge| badge.outcome.into()),
+    );
+    // A moved row only points at its task. The output streams in the task's
+    // tab and the result comes back as a notice. The row keeps the head, like
+    // a bash command, so you can still tell what runs. The rest of its text is
+    // the receipt, which is meant for the model, not for you.
+    if let Some(badge) = &msg.background {
+        b.push_header(tool_name, header, None, msg.render_header.as_ref());
+        b.push_background_annotation(badge);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            b.push_snapshot(&head, rctx.started_at);
+        }
+        return b.finish(rctx.started_at, None, None);
+    }
+    b.apply_output_format(msg.tool_output.as_deref());
+    b.push_header(
+        tool_name,
+        header,
+        msg.annotation.as_deref(),
+        msg.render_header.as_ref(),
+    );
+    let has_snapshot = msg.render_snapshot.is_some();
+    b.push_code_content(
+        msg.tool_input.as_deref(),
+        if has_snapshot {
+            None
+        } else {
+            msg.tool_output.as_deref()
+        },
+    );
+    let show_output = if let Some(ref snapshot) = msg.render_snapshot {
+        b.push_snapshot(snapshot, rctx.started_at);
+        // A denial can land while the snapshot still shows only the
+        // pre-permission script preview, so the error goes below it.
+        // But a collapsed snapshot keeps just a window of the output,
+        // so checking the full text would duplicate long outputs. The
+        // last line is a reliable probe: a tail-keep view always shows
+        // it, a bare script preview never does.
+        matches!(status, ToolStatus::Error) && {
+            let err_text = msg.tool_output.as_deref().map(|o| o.as_text());
+            let tail = err_text
+                .as_deref()
+                .or(body)
+                .map_or("", str::trim)
+                .lines()
+                .next_back()
+                .map_or("", str::trim);
+            !tail.is_empty() && !snapshot.text().contains(tail)
+        }
+    } else {
+        true
+    };
+    if show_output {
+        let resolved = resolve_output(
+            msg.tool_output.as_deref(),
+            body,
+            msg.live_output.as_deref(),
+            msg.truncated_lines,
+            b.limits,
+        );
+        b.push_resolved_output(&resolved);
+    }
+    b.finish(
+        rctx.started_at,
+        msg.tool_input.clone(),
+        msg.tool_output.clone(),
+    )
+}
+
+/// What `/` searches for one tool message, built on demand instead of kept
+/// beside every rendered segment. It follows the same order
+/// [`build_tool_lines`] draws in, except the output is never truncated: a
+/// collapsed tool would otherwise hide its own body from search, and a tool
+/// still running is searched through its live buffer.
+pub fn search_text_for(msg: &DisplayMessage) -> String {
+    let (header, body) = match msg.text.split_once('\n') {
+        Some((h, b)) => (h, Some(b)),
+        None => (msg.text.as_str(), None),
+    };
+    let tool_name = msg.role.tool_name().unwrap_or(UNNAMED_TOOL);
+    if msg.background.is_some() {
+        let mut out = header_search_text(tool_name, header, None);
+        if let Some(head) = msg
+            .render_snapshot
+            .as_ref()
+            .and_then(BufferSnapshot::head_only)
+        {
+            push_section(&mut out, &head.text());
+        }
+        return out;
+    }
+    let mut out = header_search_text(tool_name, header, msg.annotation.as_deref());
+
+    let output = msg.tool_output.as_deref();
+    if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
+        msg.tool_input.as_deref()
+    {
+        push_section(&mut out, code.trim_end());
+    }
+    if let Some(text) = output.and_then(ToolOutput::structured_display_text) {
+        push_section(&mut out, &text);
+    }
+    if let Some(snapshot) = &msg.render_snapshot {
+        push_section(&mut out, &snapshot.text());
+    }
+    if let Some(text) = output
+        .and_then(plain_output_text)
+        .or(body)
+        .or(msg.live_output.as_deref())
+    {
+        push_section(&mut out, text);
+    }
+    out
+}
+
+/// An instruction segment sits beside its tool but draws its own blocks, so it
+/// searches on its own text.
+pub fn instructions_search_text(blocks: &[InstructionBlock]) -> String {
+    let (header, annotation) = instructions_header(blocks);
+    let mut out = header_search_text(INSTRUCTIONS_TOOL, header, annotation.as_deref());
+    for block in blocks {
+        push_section(&mut out, &block.content);
+    }
+    out
+}
+
+/// A bash call without a description has an empty title, and a trailing
+/// space here would sit next to the one the annotation starts with.
+fn header_prefix(tool: &str, header: &str) -> String {
+    if header.is_empty() {
+        format!("{tool}>")
+    } else {
+        format!("{tool}> ")
+    }
+}
+
+fn header_search_text(tool: &str, header: &str, annotation: Option<&str>) -> String {
+    let prefix = header_prefix(tool, header);
+    match annotation {
+        Some(ann) => format!("{prefix}{header} ({ann})"),
+        None => format!("{prefix}{header}"),
+    }
+}
+
+fn push_section(out: &mut String, text: &str) {
+    out.push('\n');
+    out.push_str(text);
+}
+
+/// The untruncated output text, for the variants that carry one.
+fn plain_output_text(output: &ToolOutput) -> Option<&str> {
+    match output {
+        ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
+            Some(t.text.as_str())
+        }
+        ToolOutput::Batch { text } => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+pub fn truncate_to_header(text: &mut String) {
+    text.truncate(header_end(text));
+}
+
+/// A restored row with no body view holds its only copy of the output below
+/// the header.
+pub fn replace_header(text: &mut String, header: &str) {
+    text.replace_range(..header_end(text), header);
+}
+
+fn header_end(text: &str) -> usize {
+    text.find('\n').unwrap_or(text.len())
+}
+
+/// A moved call has no deadline left, so its timeout note would mislead.
+pub(crate) fn without_timeout(annotation: &str) -> Option<String> {
+    let kept: Vec<&str> = annotation
+        .split(ANNOTATION_SEP)
+        .filter(|note| !is_timeout_annotation(note))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(ANNOTATION_SEP))
+}
+
+/// Skips a note the row already shows. A `code_execution` run sends the same
+/// "allowed by" mark for every call a plugin let through.
+pub(crate) fn append_annotation(ann: &mut Option<String>, note: &str) {
+    match ann {
+        Some(a) if a.split(ANNOTATION_SEP).any(|shown| shown == note) => {}
+        Some(a) => write!(a, "{ANNOTATION_SEP}{note}").unwrap(),
+        None => *ann = Some(note.to_owned()),
+    }
+}
+
+fn instructions_header(blocks: &[InstructionBlock]) -> (&str, Option<String>) {
+    let path = blocks.first().map_or("", |b| b.path.as_str());
+    let extra = (blocks.len() > 1).then(|| format!("+{}", blocks.len() - 1));
+    (path, extra)
+}
+
+pub fn build_instructions_lines(
+    blocks: &[InstructionBlock],
+    width: u16,
+    expanded: bool,
+) -> ToolLines {
+    let (header, annotation) = instructions_header(blocks);
+    let exp = SectionFlags {
+        script: false,
+        output: expanded,
+    };
+    let mut b = ToolLineBuilder::new(
+        width,
+        exp,
+        code_view::instruction_limit(expanded),
+        Indicator::Success,
+    );
+    b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None);
+
+    let start = b.lines.len();
+    let has_truncation =
+        code_view::render_instructions(blocks, &mut b.lines, b.limits.output, false);
+    b.truncation.output |= has_truncation;
+    b.content_range = (start, b.lines.len());
+
+    let output = Arc::new(ToolOutput::Instructions {
+        blocks: blocks.to_vec(),
+    });
+    b.finish(Instant::now(), None, Some(output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
+    use crate::components::{DisplayRole, ToolRole};
+    use crate::markdown::TRUNCATION_PREFIX;
+    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use maki_agent::types::{DefaultColor, InlineStyle};
+    use maki_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
+    use test_case::test_case;
+
+    fn test_rctx(width: u16) -> RenderCtx<'static> {
+        RenderCtx {
+            started_at: Instant::now(),
+            width,
+            tool_output_lines: &TOL,
+        }
+    }
+
+    fn exp(both: bool) -> SectionFlags {
+        SectionFlags {
+            script: both,
+            output: both,
+        }
+    }
+
+    fn code_input() -> Option<ToolInput> {
+        Some(ToolInput::Code {
+            language: "sh".into(),
+            code: "echo hi\n".into(),
+        })
+    }
+
+    fn code_output() -> Option<ToolOutput> {
+        Some(ToolOutput::ReadCode {
+            path: "test.rs".into(),
+            start_line: 1,
+            lines: vec!["fn main() {}".into()],
+            total_lines: 1,
+            instructions: None,
+        })
+    }
+
+    fn plain_output() -> Option<ToolOutput> {
+        Some(ToolOutput::Plain("ok".into()))
+    }
+
+    fn bash_msg(
+        text: &str,
+        status: ToolStatus,
+        input: Option<ToolInput>,
+        output: Option<ToolOutput>,
+    ) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status,
+                name: BASH_TOOL_NAME.into(),
+            })),
+            text: text.into(),
+            tool_input: input.map(Arc::new),
+            tool_raw_input: None,
+            tool_output: output.map(Arc::new),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            truncated_lines: 0,
+            timestamp: None,
+            turn_usage: None,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    #[test_case(code_input(),  code_output(),   true,  true  ; "code_input_keeps_code_output")]
+    #[test_case(None,          code_output(),   true,  true  ; "code_output_only")]
+    #[test_case(None,          plain_output(),  false, false ; "no_content_no_highlight")]
+    fn highlight_request(
+        input: Option<ToolInput>,
+        output: Option<ToolOutput>,
+        expect_highlight: bool,
+        expect_output: bool,
+    ) {
+        let msg = bash_msg("header\nbody", ToolStatus::Success, input, output);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.highlight.is_some(), expect_highlight);
+        if let Some(hl) = &tl.highlight {
+            assert_eq!(hl.output.is_some(), expect_output);
+        }
+    }
+
+    fn has_styled_span(spans: &[Span<'_>], text: &str, style: Style) -> bool {
+        spans
+            .iter()
+            .any(|s| s.content.contains(text) && s.style == style)
+    }
+
+    fn lines_text(tl: &ToolLines) -> String {
+        tl.lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test_case(ToolStatus::InProgress, None           ; "live_streaming_shows_body")]
+    #[test_case(ToolStatus::Success,    plain_output() ; "done_with_plain_output_shows_body")]
+    fn bash_body_visible(status: ToolStatus, output: Option<ToolOutput>) {
+        let msg = bash_msg("echo hi\nline1\nline2", status, code_input(), output);
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), SectionFlags::default());
+        let text = lines_text(&tl);
+        assert!(text.contains("line1"));
+        assert!(text.contains("line2"));
+    }
+
+    fn line_has_styled(tl: &ToolLines, text: &str, style: Style) -> bool {
+        tl.lines
+            .iter()
+            .any(|l| has_styled_span(&l.spans, text, style))
+    }
+
+    #[test_case("header\nbody\nmore", "header" ; "multiline")]
+    #[test_case("header",            "header" ; "single_line")]
+    fn truncate_to_header_cases(input: &str, expected: &str) {
+        let mut text = input.to_string();
+        truncate_to_header(&mut text);
+        assert_eq!(text, expected);
+    }
+
+    fn tool_msg() -> DisplayMessage {
+        bash_msg("cmd", ToolStatus::Success, None, None)
+    }
+
+    #[test_case(80, true  ; "shown_when_width_sufficient")]
+    #[test_case(10, false ; "hidden_when_too_narrow")]
+    fn append_right_info_timestamp_visibility(width: u16, expect_timestamp: bool) {
+        let msg = tool_msg();
+        let mut tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let span_count_before = tl.lines[0].spans.len();
+        append_right_info(&mut tl.lines[0], None, None, Some("12:34:56"), width);
+        if expect_timestamp {
+            let last = tl.lines[0].spans.last().unwrap();
+            assert_eq!(last.style, theme::current().timestamp);
+            assert!(tl.lines[0].spans.len() > span_count_before);
+        } else {
+            assert_eq!(tl.lines[0].spans.len(), span_count_before);
+        }
+    }
+
+    #[test]
+    fn annotation_rendered_on_header() {
+        let mut msg = tool_msg();
+        msg.annotation = Some("2m timeout".into());
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("(2m timeout)"));
+    }
+
+    #[test_case("",          "bash> (3 lines)"          ; "untitled")]
+    #[test_case("run tests", "bash> run tests (3 lines)" ; "titled")]
+    fn header_has_one_space_before_the_annotation(header: &str, expected: &str) {
+        let mut msg = bash_msg(header, ToolStatus::Success, None, None);
+        msg.annotation = Some("3 lines".into());
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+
+        assert!(lines_text(&tl).contains(expected), "{}", lines_text(&tl));
+        assert!(search_text_for(&msg).starts_with(expected));
+    }
+    const MOVED_HEADER: &str = "Run the tests";
+    const RECEIPT_ANNOTATION: &str = "3 lines";
+    const RECEIPT_BODY: &str = "Running in the background. Last 2 lines:";
+
+    const MOVED_COMMAND: &str = "cargo test";
+    const MOVED_OUTPUT: &str = "running 3 tests";
+
+    #[test_case(None, 0                          ; "running")]
+    #[test_case(Some(BackgroundOutcome::Done), 0 ; "ended")]
+    #[test_case(None, 1                          ; "with_a_head")]
+    fn a_moved_row_keeps_only_its_header_and_head(outcome: Option<BackgroundOutcome>, head: usize) {
+        let mut msg = bash_msg(
+            &format!("{MOVED_HEADER}\n{RECEIPT_BODY}"),
+            ToolStatus::Success,
+            None,
+            Some(ToolOutput::Plain(RECEIPT_BODY.into())),
+        );
+        msg.annotation = Some(RECEIPT_ANNOTATION.into());
+        msg.background = Some(BackgroundBadge {
+            id: "t1".into(),
+            started_at: None,
+            outcome,
+        });
+        msg.render_snapshot = Some(BufferSnapshot {
+            lines: Arc::new(vec![
+                SnapshotLine::plain(MOVED_COMMAND.into()),
+                SnapshotLine::plain(MOVED_OUTPUT.into()),
+            ]),
+            head,
+        });
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+
+        let text = lines_text(&tl);
+        assert_eq!(tl.lines.len(), 1 + head, "{text}");
+        assert!(text.contains(MOVED_HEADER), "{text}");
+        assert_eq!(text.contains(MOVED_COMMAND), head > 0, "{text}");
+        assert!(!text.contains(MOVED_OUTPUT), "{text}");
+        assert!(
+            text.contains(&background_annotation(outcome, None)),
+            "{text}"
+        );
+        assert!(!text.contains(RECEIPT_ANNOTATION), "{text}");
+
+        let searched = search_text_for(&msg);
+        assert_eq!(searched.contains(MOVED_COMMAND), head > 0, "{searched}");
+        assert!(!searched.contains(MOVED_OUTPUT), "{searched}");
+        assert!(!searched.contains(RECEIPT_BODY), "{searched}");
+    }
+
+    #[test]
+    fn task_output_body_visible() {
+        let msg = task_msg("**bold** and `code`".into());
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("bold"));
+        assert!(text.contains("code"));
+    }
+
+    fn task_msg(output: String) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: TASK_TOOL_NAME.into(),
+            })),
+            text: "Find auth".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    fn n_lines(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_truncation_styled(tl: &ToolLines) {
+        let last = tl.lines.last().unwrap();
+        let span = last
+            .spans
+            .iter()
+            .find(|s| s.content.contains(TRUNCATION_PREFIX));
+        assert!(span.is_some(), "expected truncation prefix");
+        assert_eq!(span.unwrap().style, theme::current().tool_dim);
+    }
+
+    fn task_truncation_tl(output: String) -> ToolLines {
+        let msg = task_msg(output);
+        build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        )
+    }
+
+    #[test]
+    fn task_output_truncated_and_styled() {
+        let task_max = TOL.task;
+        let tl = task_truncation_tl(n_lines(200));
+        let body_lines = tl.lines.len() - 1;
+        assert!(
+            body_lines <= task_max + 1,
+            "expected at most {} body lines, got {body_lines}",
+            task_max + 1,
+        );
+        assert_truncation_styled(&tl);
+    }
+
+    fn assert_hr_fits(tl: &ToolLines, width: u16) {
+        let hr_line = tl
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains('─')));
+        assert!(hr_line.is_some());
+        let total_width: usize = hr_line
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert!(
+            total_width <= width as usize,
+            "HR ({total_width} chars) should fit in {width} cols"
+        );
+    }
+
+    #[test]
+    fn task_hr_fits_within_indented_width() {
+        let width: u16 = 60;
+        let msg = task_msg("before\n\n---\n\nafter".into());
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(width),
+            SectionFlags::default(),
+        );
+        assert_hr_fits(&tl, width);
+    }
+
+    fn index_msg(body: &str) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: "index".into(),
+            })),
+            text: format!("src/lib.rs\n{body}"),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    #[test]
+    fn index_output_truncated_at_max_lines() {
+        let body: String = (0..150).map(|i| format!("  line_{i}\n")).collect();
+        let msg = index_msg(&body);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("line_0"));
+        assert!(!text.contains("line_149"));
+        assert!(text.contains(TRUNCATION_PREFIX));
+    }
+
+    fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: "index".into(),
+            })),
+            text: "src/lib.rs\nplain fallback".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    fn make_snapshot(lines: Vec<Vec<SnapshotSpan>>) -> BufferSnapshot {
+        BufferSnapshot::from_arc(Arc::new(
+            lines
+                .into_iter()
+                .map(|spans| SnapshotLine { spans })
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn snapshot_search_text_derives_from_rendered_lines() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "import asyncio".into(),
+            style: SpanStyle::Named("keyword".into()),
+        }]]);
+        let text = search_text_for(&snapshot_msg(snapshot));
+        assert!(
+            text.contains("import asyncio"),
+            "search must index the rendered snapshot body, got: {text}"
+        );
+    }
+
+    #[test]
+    fn snapshot_base_recorded_where_snapshot_lines_start() {
+        let snapshot = make_snapshot(vec![
+            vec![SnapshotSpan {
+                text: "child one".into(),
+                style: SpanStyle::Default,
+            }],
+            vec![SnapshotSpan {
+                text: "child two".into(),
+                style: SpanStyle::Default,
+            }],
+        ]);
+        let tl = build_tool_lines(
+            &snapshot_msg(snapshot),
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let base = tl.snapshot_base.expect("snapshot must record its base");
+        let line_text = |i: usize| {
+            tl.lines[i]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(line_text(base).contains("child one"));
+        assert!(line_text(base + 1).contains("child two"));
+    }
+
+    #[test]
+    fn snapshot_base_absent_without_snapshot() {
+        let msg = DisplayMessage {
+            render_snapshot: None,
+            ..snapshot_msg(make_snapshot(vec![]))
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.snapshot_base, None);
+    }
+
+    #[test]
+    fn header_spinner_span_bakes_and_shifts_with_indicator() {
+        let header = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "3 tools ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let msg = DisplayMessage {
+            render_header: Some(header),
+            render_snapshot: None,
+            ..snapshot_msg(make_snapshot(vec![]))
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        // `tool> ` prefix + "3 tools " sit before the header spinner.
+        assert_eq!(tl.spinner_lines, vec![(0, 2)]);
+        assert!(tl.gutter_spins);
+    }
+
+    #[test_case(ToolStatus::Success, theme::current().tool_success ; "success")]
+    #[test_case(ToolStatus::Error, theme::current().tool_error ; "error")]
+    fn finished_tool_puts_styled_dot_in_gutter(status: ToolStatus, style: Style) {
+        let tl = build_tool_lines(&tool_msg(), status, &test_rctx(80), SectionFlags::default());
+        assert_eq!(tl.gutter, Span::styled(TOOL_INDICATOR, style));
+        assert!(!tl.gutter_spins);
+        assert!(
+            tl.lines[0]
+                .spans
+                .iter()
+                .all(|s| s.content.as_ref() != TOOL_INDICATOR),
+            "header line must not carry the indicator"
+        );
+    }
+
+    const DENIAL_MSG: &str = "Permission denied: user rejected";
+
+    fn error_snapshot_msg(snapshot_lines: &[&str], output: &str) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Error,
+                name: "code_execution".into(),
+            })),
+            text: "2 lines".into(),
+            tool_output: Some(Arc::new(ToolOutput::Plain(output.into()))),
+            ..snapshot_msg(make_snapshot(
+                snapshot_lines
+                    .iter()
+                    .map(|t| {
+                        vec![SnapshotSpan {
+                            text: (*t).into(),
+                            style: SpanStyle::Default,
+                        }]
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    #[test_case(
+        &["1 print('hi')"], DENIAL_MSG,
+        Some("1 print('hi')"), None
+        ; "denial_shown_below_script_preview")]
+    #[test_case(
+        &[DENIAL_MSG], DENIAL_MSG,
+        None, None
+        ; "denial_in_snapshot_not_duplicated")]
+    #[test_case(
+        &["... (15 lines) (click to expand)", "tail line", "Exit code: 2"],
+        "head line\ntail line\nExit code: 2",
+        None, Some("head line")
+        ; "collapsed_tail_view_not_duplicated")]
+    fn error_snapshot_output_renders_once(
+        snapshot: &[&str],
+        output: &str,
+        shown: Option<&str>,
+        hidden: Option<&str>,
+    ) {
+        let msg = error_snapshot_msg(snapshot, output);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Error,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        let tail = output.lines().next_back().unwrap();
+        assert_eq!(
+            text.matches(tail).count(),
+            1,
+            "output tail must render exactly once: {text}"
+        );
+        if let Some(shown) = shown {
+            assert!(text.contains(shown), "snapshot content must stay: {text}");
+        }
+        if let Some(hidden) = hidden {
+            assert!(
+                !text.contains(hidden),
+                "hidden lines must stay hidden: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_renders_styled_spans() {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "pub".into(),
+                style: SpanStyle::Named("keyword".into()),
+            },
+            SnapshotSpan {
+                text: " fn main()".into(),
+                style: SpanStyle::Named("tool".into()),
+            },
+        ]]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let t = theme::current();
+        assert!(line_has_styled(&tl, "pub", t.index_keyword));
+        assert!(line_has_styled(&tl, " fn main()", t.tool));
+    }
+
+    #[test]
+    fn snapshot_overrides_text_output() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "from_snapshot".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("from_snapshot"));
+        assert!(!text.contains("plain fallback"));
+        assert!(
+            search_text_for(&msg).contains("plain fallback"),
+            "search must reach the tool output the snapshot hides"
+        );
+    }
+
+    #[test_case(None,       None,    "bash",  false ; "none_output_none_body")]
+    #[test_case(None,       Some("hello"), "bash", true ; "none_output_with_body")]
+    #[test_case(
+        Some(ToolOutput::Plain("world".into())), None, "bash", true
+        ; "plain_no_body_uses_plain"
+    )]
+    #[test_case(
+        Some(ToolOutput::Plain("world".into())), Some("override"), "bash", true
+        ; "body_takes_priority_over_plain"
+    )]
+    #[test_case(
+        Some(ToolOutput::Plain(String::new().into())), None, "bash", false
+        ; "empty_plain_resolves_to_none"
+    )]
+    #[test_case(
+        Some(ToolOutput::Batch { text: "legacy batch text".into() }),
+        None, "batch", true
+        ; "legacy_batch_falls_back_to_text"
+    )]
+    #[test_case(
+        Some(ToolOutput::ReadDir(TextOutput::from("dir listing"))),
+        None, "read", true
+        ; "readdir_uses_text_field"
+    )]
+    #[test_case(
+        Some(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }),
+        None, "read", false
+        ; "structured_output_resolves_to_none"
+    )]
+    fn resolve_output_text_presence(
+        output: Option<ToolOutput>,
+        body: Option<&str>,
+        tool: &str,
+        expect_text: bool,
+    ) {
+        let limits = RenderLimits::new(SectionFlags::default(), TOL.get(tool));
+        let resolved = resolve_output(output.as_ref(), body, None, 0, limits);
+        assert_eq!(resolved.text.is_some(), expect_text);
+    }
+
+    #[test]
+    fn resolve_output_pre_truncated_forwarded() {
+        let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
+        let resolved = resolve_output(None, Some("short"), None, 42, limits);
+        assert_eq!(resolved.skipped, 42);
+    }
+
+    #[test]
+    fn resolve_output_truncation_overrides_pre_truncated() {
+        let long = n_lines(200);
+        let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
+        let resolved = resolve_output(None, Some(&long), None, 5, limits);
+        assert!(resolved.skipped > 5);
+    }
+
+    fn bash_output_msg(line_count: usize, live: bool) -> DisplayMessage {
+        let full_body = n_lines(line_count);
+        let tr = truncate_output(&full_body, TOL.get("bash"));
+        let text = if tr.kept.is_empty() {
+            "header".into()
+        } else {
+            format!("header\n{}", tr.kept)
+        };
+        let truncated_lines = tr.skipped;
+        let (status, tool_output, live_output) = if live {
+            (ToolStatus::InProgress, None, Some(full_body))
+        } else {
+            (
+                ToolStatus::Success,
+                Some(Arc::new(ToolOutput::Plain(full_body.into()))),
+                None,
+            )
+        };
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status,
+                name: BASH_TOOL_NAME.into(),
+            })),
+            text,
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output,
+            live_output,
+            annotation: None,
+            plan_path: None,
+            truncated_lines,
+            timestamp: None,
+            turn_usage: None,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    #[test]
+    fn bash_expanded_live_output() {
+        let msg = bash_output_msg(200, true);
+        let collapsed = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), exp(false));
+        let expanded = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), exp(true));
+        let collapsed_text = lines_text(&collapsed);
+        let expanded_text = lines_text(&expanded);
+        assert!(collapsed.truncation.any());
+        assert!(!expanded.truncation.any());
+        assert!(expanded_text.contains("line 0"));
+        assert!(expanded_text.contains("line 199"));
+        assert!(collapsed_text.contains("line 0"));
+        assert!(!collapsed_text.contains("line 199"));
+    }
+
+    #[test_case(200, true,  false, false ; "expanded_shows_all")]
+    #[test_case(200, false, true,  true  ; "collapsed_truncates")]
+    #[test_case(3,   false, false, false ; "short_no_truncation")]
+    fn bash_output_truncation(
+        line_count: usize,
+        expanded: bool,
+        expect_truncation: bool,
+        expect_expand_notice: bool,
+    ) {
+        let msg = bash_output_msg(line_count, false);
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), exp(expanded));
+        let text = lines_text(&tl);
+        assert_eq!(tl.truncation.any(), expect_truncation);
+        assert_eq!(text.contains("click to expand"), expect_expand_notice);
+    }
+
+    fn read_output_msg(line_count: usize) -> DisplayMessage {
+        read_output_msg_with(line_count, "line", None)
+    }
+
+    #[test_case(20, false, true,  true  ; "read_collapsed_truncates")]
+    #[test_case(20, true,  false, false ; "read_expanded_shows_all")]
+    #[test_case(TOL.read, false, false, false ; "read_short_no_truncation")]
+    fn read_output_truncation(
+        line_count: usize,
+        expanded: bool,
+        expect_truncation: bool,
+        expect_expand_notice: bool,
+    ) {
+        let msg = read_output_msg(line_count);
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), exp(expanded));
+        assert_eq!(tl.truncation.any(), expect_truncation);
+        let text = lines_text(&tl);
+        assert_eq!(text.contains("click to expand"), expect_expand_notice);
+    }
+
+    fn read_msg_with_instructions(code_lines: usize, instruction_lines: usize) -> DisplayMessage {
+        let inst_content: String = (0..instruction_lines)
+            .map(|i| format!("inst {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        read_output_msg_with(
+            code_lines,
+            "code",
+            Some(vec![InstructionBlock {
+                path: "AGENTS.md".into(),
+                content: inst_content,
+            }]),
+        )
+    }
+
+    fn read_output_msg_with(
+        line_count: usize,
+        prefix: &str,
+        instructions: Option<Vec<InstructionBlock>>,
+    ) -> DisplayMessage {
+        let lines: Vec<String> = (0..line_count).map(|i| format!("{prefix} {i}")).collect();
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: READ_TOOL_NAME.into(),
+            })),
+            text: "read /src/main.rs".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: Some(Arc::new(ToolOutput::ReadCode {
+                path: "main.rs".into(),
+                start_line: 1,
+                lines,
+                total_lines: line_count,
+                instructions,
+            })),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            truncated_lines: 0,
+            timestamp: None,
+            turn_usage: None,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        }
+    }
+
+    #[test_case(false, true,  false ; "collapsed_truncates_instructions")]
+    #[test_case(true,  false, true  ; "expanded_shows_all_instructions")]
+    fn instructions_segment(expanded: bool, expect_truncation: bool, expect_all_visible: bool) {
+        let msg = read_msg_with_instructions(3, 30);
+        let output = msg.tool_output.as_deref().unwrap();
+        let blocks = output.instructions().unwrap();
+        let tl = build_instructions_lines(blocks, 80, expanded);
+        assert_eq!(tl.truncation.any(), expect_truncation);
+        let text = lines_text(&tl);
+        assert_eq!(text.contains("inst 29"), expect_all_visible);
+    }
+
+    #[test]
+    fn read_code_tool_lines_exclude_instructions() {
+        let msg = read_msg_with_instructions(3, 30);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(
+            !text.contains("inst 0"),
+            "instruction content should not appear in read tool lines"
+        );
+    }
+
+    #[test]
+    fn instructions_has_highlight_request() {
+        let blocks = vec![InstructionBlock {
+            path: "agents.md".into(),
+            content: "follow style guide".into(),
+        }];
+        let tl = build_instructions_lines(&blocks, 80, false);
+        assert!(tl.highlight.is_some());
+        let text = lines_text(&tl);
+        assert!(text.contains("follow style guide"));
+    }
+
+    #[test]
+    fn snapshot_empty_has_no_content_lines() {
+        let snapshot = make_snapshot(vec![]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert!(
+            !lines_text(&tl).contains("plain fallback"),
+            "snapshot present means text path should not be used"
+        );
+        assert_eq!(tl.lines.len(), 1, "only the header line");
+    }
+
+    #[test]
+    fn snapshot_within_limit_no_truncation() {
+        let lines: Vec<Vec<SnapshotSpan>> = (0..3)
+            .map(|i| {
+                vec![SnapshotSpan {
+                    text: format!("row_{i}"),
+                    style: SpanStyle::Default,
+                }]
+            })
+            .collect();
+        let snapshot = make_snapshot(lines);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("row_0"));
+        assert!(text.contains("row_2"));
+        assert!(!text.contains(TRUNCATION_PREFIX));
+    }
+
+    #[test]
+    fn snapshot_search_text_uses_tool_output_not_body() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "visible".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: "index".into(),
+            })),
+            text: "src/lib.rs\nbody_text_here".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        };
+        assert!(
+            search_text_for(&msg).contains("llm_output_here"),
+            "search text should come from ToolOutput::Plain, not body text"
+        );
+    }
+
+    #[test]
+    fn snapshot_search_text_falls_back_to_body_when_no_plain_output() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "visible".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: "index".into(),
+            })),
+            text: "header\nbody_fallback".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: None,
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        };
+        assert!(
+            search_text_for(&msg).contains("body_fallback"),
+            "search text should fall back to msg body when no plain output"
+        );
+    }
+
+    #[test]
+    fn search_text_reaches_the_live_buffer_of_a_running_tool() {
+        const LIVE_TEXT: &str = "streaming_line";
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::InProgress,
+                name: "bash".into(),
+            })),
+            text: "cargo build".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: None,
+            live_output: Some(LIVE_TEXT.into()),
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_expanded: false,
+            images: Vec::new(),
+            movable: false,
+            background: None,
+            detail: None,
+            detail_expanded: false,
+            task_end: None,
+        };
+        assert!(
+            search_text_for(&msg).contains(LIVE_TEXT),
+            "a tool still running is only searchable through its live buffer"
+        );
+    }
+
+    #[test]
+    fn resolve_span_style_inline_all_modifiers() {
+        let style = SpanStyle::Inline(InlineStyle {
+            fg: Some(SpanColor::Rgb((10, 20, 30))),
+            bg: Some(SpanColor::Rgb((40, 50, 60))),
+            bold: true,
+            italic: true,
+            underline: true,
+            dim: true,
+            strikethrough: true,
+            reversed: true,
+        });
+        let resolved = resolve_span_style(&style);
+        assert_eq!(resolved.fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(resolved.bg, Some(Color::Rgb(40, 50, 60)));
+        use ratatui::style::Modifier;
+        assert!(resolved.add_modifier.contains(Modifier::BOLD));
+        assert!(resolved.add_modifier.contains(Modifier::ITALIC));
+        assert!(resolved.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(resolved.add_modifier.contains(Modifier::DIM));
+        assert!(resolved.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(resolved.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    /// A span asking for the terminal default has to leave the slot empty.
+    /// Setting `Color::Reset` would win over the line style underneath it, and
+    /// the selected row of a plugin float would lose its highlight.
+    #[test_case(SpanColor::Ansi(4), Some(Color::Blue) ; "palette index")]
+    #[test_case(SpanColor::Default(DefaultColor::Default), None ; "terminal default")]
+    fn resolve_span_style_inline_colors(color: SpanColor, expected: Option<Color>) {
+        let style = SpanStyle::Inline(InlineStyle {
+            fg: Some(color),
+            bg: Some(color),
+            ..InlineStyle::default()
+        });
+        let resolved = resolve_span_style(&style);
+        assert_eq!((resolved.fg, resolved.bg), (expected, expected));
+    }
+
+    #[test]
+    fn default_span_resolves_to_theme_tool() {
+        theme::set(theme::load_by_name("dracula").expect("dracula theme"));
+        assert_eq!(
+            resolve_span_style(&SpanStyle::Default),
+            theme::current().tool
+        );
+    }
+
+    #[test]
+    fn snapshot_multi_span_line_preserves_order() {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "aaa".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "bbb".into(),
+                style: SpanStyle::Named("dim".into()),
+            },
+            SnapshotSpan {
+                text: "ccc".into(),
+                style: SpanStyle::Default,
+            },
+        ]]);
+        let (lines, _) = snapshot_to_lines_range(&snapshot, 0..1, "⠋ ", Indicator::InProgress);
+        let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["aaa", "bbb", "ccc"]);
+    }
+
+    #[test]
+    fn spinner_spans_bake_to_frame_and_record_positions() {
+        let snapshot = make_snapshot(vec![
+            vec![SnapshotSpan {
+                text: "plain".into(),
+                style: SpanStyle::Default,
+            }],
+            vec![
+                SnapshotSpan {
+                    text: "before ".into(),
+                    style: SpanStyle::Default,
+                },
+                SnapshotSpan {
+                    text: "· ".into(),
+                    style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+                },
+            ],
+        ]);
+        let (lines, spinners) =
+            snapshot_to_lines_range(&snapshot, 0..2, "⠹ ", Indicator::InProgress);
+        assert_eq!(spinners, vec![(1, 1)]);
+        assert_eq!(lines[1].spans[1].content.as_ref(), "⠹ ");
+    }
+
+    #[test_case(ToolStatus::Success ; "success_bakes_dot")]
+    #[test_case(ToolStatus::Error ; "error_bakes_dot")]
+    fn done_snapshot_with_spinner_span_bakes_dot_and_records_no_spinner(status: ToolStatus) {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "child ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let tl = build_tool_lines(
+            &snapshot_msg(snapshot),
+            status,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let body = tl.lines.get(1).expect("snapshot body line");
+        let dot = body.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    #[test]
+    fn done_header_with_spinner_span_bakes_dot_and_records_no_spinner() {
+        let header = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "3 tools ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let msg = DisplayMessage {
+            render_header: Some(header),
+            render_snapshot: None,
+            ..snapshot_msg(make_snapshot(vec![]))
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let header_line = tl.lines.first().expect("header line");
+        let dot = header_line.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    const HEADER_TEXT: &str = "head";
+    const TIMESTAMP: &str = "12:34:56";
+
+    fn right_info_text(width: u16) -> (String, Option<Range<u16>>) {
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, Some(MOVABLE_HINT), None, Some(TIMESTAMP), width);
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        (text, hint_columns(&line))
+    }
+
+    #[test_case(33, true,  true  ; "room_for_both")]
+    #[test_case(20, false, true  ; "hint_dropped_first")]
+    #[test_case(10, false, false ; "room_for_neither")]
+    fn right_info_drops_the_hint_before_the_timestamp(
+        width: u16,
+        expect_hint: bool,
+        expect_timestamp: bool,
+    ) {
+        let (text, hint) = right_info_text(width);
+        assert!(text.starts_with(HEADER_TEXT));
+        assert_eq!(text.contains(MOVABLE_HINT), expect_hint);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert_eq!(hint.is_some(), expect_hint);
+        if expect_timestamp {
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), width as usize - 1);
+        }
+    }
+
+    #[test_case(30, true,  true  ; "room_for_usage_and_timestamp")]
+    #[test_case(20, false, true  ; "usage_dropped_before_timestamp")]
+    fn right_info_drops_whole_pieces_and_never_exceeds_width(
+        width: u16,
+        expect_usage: bool,
+        expect_timestamp: bool,
+    ) {
+        const USAGE: &str = "148↓ $0.009";
+        let mut line = Line::from(HEADER_TEXT);
+        append_right_info(&mut line, None, Some(USAGE), Some(TIMESTAMP), width);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.contains(USAGE), expect_usage);
+        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
+        assert!(UnicodeWidthStr::width(text.as_str()) < width as usize);
+    }
+
+    #[test_case(5,    "5s"     ; "seconds")]
+    #[test_case(72,   "1m12s"  ; "minutes")]
+    #[test_case(3725, "1h02m"  ; "hours")]
+    fn format_elapsed_cases(secs: u64, expected: &str) {
+        assert_eq!(format_elapsed(secs), expected);
+    }
+
+    #[test_case(None, Some(72),                               " (background · 1m12s · click to open)" ; "running")]
+    #[test_case(None, None,                                   " (background · click to open)"         ; "restored")]
+    #[test_case(Some(BackgroundOutcome::Done), None,          " (background · done)"                  ; "done")]
+    #[test_case(Some(BackgroundOutcome::Error), None,         " (background · failed)"                ; "failed")]
+    #[test_case(Some(BackgroundOutcome::Cancelled), None,     " (background · cancelled)"             ; "cancelled")]
+    #[test_case(Some(BackgroundOutcome::Lost), Some(72),      " (background · lost)"                  ; "lost")]
+    fn background_annotation_cases(
+        outcome: Option<BackgroundOutcome>,
+        secs: Option<u64>,
+        expected: &str,
+    ) {
+        assert_eq!(background_annotation(outcome, secs), expected);
+    }
+}

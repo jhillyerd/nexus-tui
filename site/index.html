@@ -1,0 +1,1856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- minimum-scale pins the page to the layout width: pinching out below it exposes the canvas
+       around the page, and no single canvas colour matches a page that runs sky, paper, sky.
+       zooming in is untouched -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+  <title>maki</title>
+  <meta name="description" content="An efficient AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox interpreter. Anthropic, OpenAI, Google, Z.AI, OpenRouter, any OpenAI / Anthropic compatible API, or a provider you write in Lua.">
+  <meta name="theme-color" content="#dbe6ff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1d2040" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://maki.sh/">
+  <meta property="og:title" content="maki - the efficient coder">
+  <meta property="og:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
+  <meta property="og:image" content="https://maki.sh/android-chrome-512x512.png">
+  <meta property="og:site_name" content="maki">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="maki - the efficient coder">
+  <meta name="twitter:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
+  <meta name="twitter:image" content="https://maki.sh/android-chrome-512x512.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <script>
+    (function() {
+      var root = document.documentElement;
+      // a stored choice wins, otherwise follow the system; runs before first paint so nothing flips
+      var theme = localStorage.getItem('theme');
+      root.setAttribute('data-theme', theme === 'light' || theme === 'dark' ? theme
+        : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+
+      // the install line is picked here too, so Windows visitors never see the curl command first
+      var os = localStorage.getItem('os');
+      root.setAttribute('data-os', os === 'win' || os === 'unix' ? os
+        : /Windows/i.test(navigator.userAgent) ? 'win' : 'unix');
+
+      // the recording is the slowest thing the hero needs: start it before the body is even
+      // parsed, and hold on to the text so switching speed later never refetches it
+      window.castText = fetch('demo.cast').then(function(r) { return r.text(); });
+    })();
+  </script>
+  <link rel="dns-prefetch" href="https://api.github.com">
+  <link rel="preload" href="/docs/fonts/nunito-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/docs/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="asciinema-player.min.js" as="script">
+  <!-- the player measures a character cell against these rules on create, so they must be applied
+       before it mounts; 6 KB over the wire is cheaper than a mis-sized terminal -->
+  <link rel="stylesheet" href="asciinema-player.css">
+  <noscript>
+    <style>.reveal, .hero-intro, .hero-preview { opacity: 1; transform: none; animation: none; }</style>
+  </noscript>
+  <style>
+    @font-face {
+      font-family: 'Nunito';
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url('/docs/fonts/nunito-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+    @font-face {
+      font-family: 'JetBrains Mono';
+      font-style: normal;
+      font-weight: 100 800;
+      font-display: swap;
+      src: url('/docs/fonts/jetbrains-mono-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+
+    *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+    button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+    /* dark is the default so a JS-less or pre-script paint is never light */
+    :root {
+      color-scheme: dark;
+      --font-body: 'Nunito', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+
+      --paper: oklch(19.5% 0.028 295);
+      --hover: oklch(25.5% 0.035 295);
+      --soft: oklch(100% 0 0 / 0.06);
+      --soft-hover: oklch(100% 0 0 / 0.13);
+      --ink: oklch(89% 0.02 80);
+      --ink-2: oklch(74% 0.025 75);
+      --ink-3: oklch(60% 0.03 70);
+      --rule: oklch(30% 0.03 295);
+      --accent: oklch(75% 0.12 45);
+      --accent-hover: oklch(82% 0.12 50);
+      --link-underline: oklch(75% 0.12 45 / 0.35);
+      --chip-bg: oklch(27% 0.035 295);
+      --chip-fg: oklch(86% 0.025 80);
+      --chip-border: oklch(35% 0.035 295);
+      --nav-bg: oklch(19.5% 0.028 295 / 0.96);
+      --nav-sep: oklch(42% 0.03 295);
+      --scroll-thumb: oklch(89% 0.02 80 / 0.2);
+      --scroll-thumb-hover: oklch(89% 0.02 80 / 0.34);
+
+      --sky-1: oklch(26% 0.06 277);
+      --sky-2: oklch(23% 0.055 312);
+      --sky-3: oklch(21% 0.045 340);
+      --cloud: var(--paper);
+      --cloud-deep: oklch(24.5% 0.045 310);
+      --moon-face: oklch(94% 0.06 88);
+      --moon-glow: oklch(85% 0.09 85 / 0.4);
+      --star: oklch(96% 0.035 92);
+      --star-op: 1;
+
+      --pane-bg: #1E1E2E;
+      --pane-head: #191B28;
+      --pane-line: #2C2F42;
+      --pane-label: #878DA9;
+      --t-ink: #DDE0EA;
+      --t-com: #878DA9;
+      --t-kw: #A2B5FA;
+      --t-fn: #F7A87D;
+      --t-ty: #A9D5E3;
+      --t-str: #ABD695;
+      --t-con: #EDA8C2;
+
+      --term-bg: #282A36;
+      --term-line: #3A3D4D;
+      --ctl-bg: #16171F;
+      --ctl-hover: #22242F;
+      --ctl-fg: #B6BCCD;
+      --ctl-track: #33364A;
+      --demo-shadow: 0 14px 34px -14px oklch(0% 0 0 / 0.55);
+
+      --nav-h: 44px;
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    [data-theme="light"] {
+      color-scheme: light;
+      --paper: oklch(96.5% 0.022 88);
+      --hover: oklch(93% 0.032 80);
+      --soft: oklch(100% 0 0 / 0.5);
+      --soft-hover: oklch(100% 0 0 / 0.8);
+      --ink: oklch(27% 0.042 318);
+      --ink-2: oklch(40% 0.036 315);
+      --ink-3: oklch(53% 0.03 318);
+      --rule: oklch(87% 0.03 72);
+      --accent: oklch(50% 0.13 42);
+      --accent-hover: oklch(43% 0.145 40);
+      --link-underline: oklch(50% 0.13 42 / 0.32);
+      --chip-bg: oklch(93.5% 0.03 82);
+      --chip-fg: oklch(32% 0.045 318);
+      --chip-border: oklch(88.5% 0.03 78);
+      --nav-bg: oklch(96.5% 0.022 88 / 0.96);
+      --nav-sep: oklch(76% 0.03 72);
+      --scroll-thumb: oklch(27% 0.042 318 / 0.22);
+      --scroll-thumb-hover: oklch(27% 0.042 318 / 0.38);
+
+      --demo-shadow: 0 2px 5px oklch(27% 0.042 318 / 0.12), 0 18px 38px -10px oklch(27% 0.042 318 / 0.45);
+
+      --sky-1: oklch(92.5% 0.04 268);
+      --sky-2: oklch(91.5% 0.045 330);
+      --sky-3: oklch(90% 0.06 28);
+      --cloud-deep: oklch(86.5% 0.055 20);
+      --moon-face: oklch(96% 0.09 92);
+      --moon-glow: oklch(92% 0.09 85 / 0.35);
+      --star: oklch(99% 0.055 95);
+      --star-op: 0.9;
+    }
+
+    html {
+      /* no background here on purpose: the body's paper propagates to the canvas instead. a
+         background on the root pins the canvas, and the canvas is what the transparent
+         scrollbar track and the overscroll region show, so sky here paints a lavender gutter
+         down a page that is paper for most of its height */
+      overscroll-behavior: none;
+      scroll-padding-top: calc(var(--nav-h) + 1.5rem);
+      scroll-behavior: smooth;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    body {
+      font-family: var(--font-body);
+      font-size: 16px;
+      line-height: 1.6;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    /* the page's own scrollbar stays native. a transparent track shows the canvas, and the
+       canvas is one colour while the page runs sky, paper, sky, so the gutter reads as a band
+       of the wrong colour beside whatever section you are on. inner scrollers keep the tint */
+    :not(html) { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+    :not(html)::-webkit-scrollbar { width: 8px; height: 8px; }
+    :not(html)::-webkit-scrollbar-track { background: transparent; }
+    :not(html)::-webkit-scrollbar-thumb {
+      background: var(--scroll-thumb);
+      border-radius: 99px;
+    }
+    :not(html)::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
+    a { color: var(--accent); text-decoration: none; }
+    p a, figcaption a {
+      text-decoration: underline;
+      text-decoration-color: var(--link-underline);
+      text-underline-offset: 2px;
+    }
+    p a:hover, figcaption a:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      background: var(--chip-bg);
+      color: var(--chip-fg);
+      border: 1px solid var(--chip-border);
+      border-radius: 4px;
+      padding: 0.06rem 0.3rem;
+    }
+    a code {
+      background: none;
+      border: 0;
+      padding: 0;
+      color: inherit;
+    }
+
+    /* ── nav ── */
+    nav {
+      position: fixed;
+      inset: 0 0 auto 0;
+      z-index: 100;
+      height: var(--nav-h);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 clamp(1rem, 3vw, 1.75rem);
+      background: transparent;
+      border-bottom: 1px solid transparent;
+      transition: background 0.18s ease, border-color 0.18s ease;
+    }
+    nav.scrolled {
+      background: var(--nav-bg);
+      border-bottom-color: var(--rule);
+    }
+    /* watched instead of listening to scroll, so nothing of ours runs on the scroll path */
+    #top-sentinel {
+      position: absolute;
+      top: 24px;
+      width: 1px;
+      height: 1px;
+      pointer-events: none;
+    }
+    .nav-left { display: flex; align-items: baseline; gap: 0.5rem; }
+    .nav-crumb {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--ink-3);
+      opacity: 0;
+      transition: opacity 0.16s ease;
+    }
+    .nav-crumb.on { opacity: 1; }
+    .key-hint { display: flex; }
+    .key-hint kbd {
+      font-family: var(--font-mono);
+      font-size: 0.76rem;
+      line-height: 1.4;
+      padding: 0 0.4rem;
+      border: 1px solid var(--rule);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--rule);
+      background: var(--soft);
+      color: var(--ink-2);
+      border-color: var(--nav-sep);
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .key-hint:hover kbd { color: var(--accent); border-color: var(--accent); }
+    .nav-logo {
+      font-weight: 800;
+      font-size: 1.15rem;
+      letter-spacing: -0.03em;
+      color: var(--ink);
+    }
+    .nav-logo:hover { color: var(--accent); }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .nav-right a {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
+    }
+    .nav-right a:hover { color: var(--ink); }
+    .nav-sep { height: 14px; border-left: 1px solid var(--nav-sep); }
+    /* laid out from the start, only faded in, so arriving star counts never nudge the nav */
+    .star-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.2rem;
+      min-width: 1.9rem;
+      opacity: 0;
+      transition: opacity 0.22s ease;
+    }
+    .star-badge.loaded { opacity: 1; }
+    .star-badge svg { fill: currentColor; opacity: 0.75; transition: fill 0.1s, opacity 0.1s; }
+    .nav-github:hover .star-badge svg { fill: var(--accent); opacity: 1; }
+    .theme-toggle {
+      display: flex;
+      margin-left: 0.65rem;
+      padding: 0.15rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
+    }
+    .theme-toggle:hover { color: var(--ink); }
+    .theme-toggle svg { width: 16px; height: 16px; }
+    .theme-toggle .icon-sun { display: none; }
+    [data-theme="light"] .theme-toggle .icon-sun { display: block; }
+    [data-theme="light"] .theme-toggle .icon-moon { display: none; }
+
+    /* ── hero ── */
+    .hero {
+      position: relative;
+      overflow: hidden;
+      min-height: min(100svh, 47rem);
+      display: flex;
+      align-items: center;
+      padding: calc(var(--nav-h) + clamp(2rem, 5vw, 3.5rem)) clamp(2rem, 4vw, 4rem) clamp(4rem, 9vw, 7rem);
+      background: linear-gradient(180deg, var(--sky-1) 0%, var(--sky-2) 58%, var(--sky-3) 100%);
+    }
+
+    /* ── sky ── */
+    .sky {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .sky::after {
+      content: '';
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: clamp(90px, 12vw, 160px);
+      background: linear-gradient(180deg, transparent, var(--paper) 88%);
+    }
+    .moon {
+      position: absolute;
+      pointer-events: auto;
+      transition: transform 0.18s var(--ease);
+      top: 4rem;
+      right: clamp(1.5rem, 4vw, 3rem);
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--moon-face);
+      box-shadow: 0 0 18px 2px var(--moon-glow), 0 0 55px 18px var(--moon-glow);
+    }
+    .moon::after {
+      content: '';
+      position: absolute;
+      top: -5px;
+      left: 8px;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: color-mix(in oklab, var(--sky-1) 80%, var(--sky-2));
+    }
+    .moon:hover { transform: scale(1.12); }
+    .star {
+      position: absolute;
+      background: var(--star);
+      opacity: var(--star-op);
+      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
+      animation: twinkle 6s ease-in-out infinite;
+    }
+    .star-1 { top: 14%; left: 12%; width: 11px; height: 11px; }
+    .star-2 { top: 26%; left: 30%; width: 7px; height: 7px; animation-delay: 2.4s; }
+    .star-3 { top: 9%;  left: 47%; width: 9px;  height: 9px;  animation-delay: 1.2s; }
+    .star-4 { top: 30%; right: 22%; width: 8px; height: 8px; animation-delay: 3.6s; }
+    .star-5 { top: 18%; right: 7%;  width: 6px;  height: 6px;  animation-delay: 4.8s; }
+    @keyframes twinkle {
+      0%, 100% { opacity: calc(var(--star-op) * 0.35); }
+      50% { opacity: var(--star-op); }
+    }
+    .clouds {
+      position: absolute;
+      left: -3%;
+      right: -3%;
+      bottom: -1px;
+      height: clamp(70px, 9vw, 130px);
+    }
+    .cloud {
+      position: absolute;
+      bottom: -1px;
+      display: block;
+      fill: var(--cloud);
+    }
+    .cloud-a { left: -2%;  width: clamp(300px, 34vw, 480px); animation: drift 38s ease-in-out infinite; }
+    .cloud-b { right: -3%; width: clamp(260px, 30vw, 430px); animation: drift 52s ease-in-out infinite reverse; }
+    .cloud-c { left: 40%;  width: clamp(170px, 20vw, 280px); opacity: 0.8; }
+    @keyframes drift {
+      0%, 100% { transform: translateX(0); }
+      50% { transform: translateX(28px); }
+    }
+
+    .hero-grid {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      min-width: 0;
+      max-width: 1280px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 30%) minmax(0, 1fr);
+      gap: 2.5rem;
+      align-items: center;
+    }
+    /* the install command is typeset from this width, so the column has to be a query container */
+    .hero-intro { container-type: inline-size; }
+    .hero h1 {
+      font-weight: 800;
+      font-size: clamp(2.5rem, 5vw, 3.5rem);
+      letter-spacing: -0.03em;
+      line-height: 1.05;
+      margin-bottom: 0.3rem;
+    }
+    .hero-tagline {
+      font-weight: 700;
+      font-size: clamp(1.05rem, 2.2vw, 1.3rem);
+      color: var(--ink-3);
+    }
+    .hero-sub {
+      max-width: 44ch;
+      margin-top: 1.35rem;
+      font-size: 1.1rem;
+      color: var(--ink-2);
+      text-wrap: pretty;
+    }
+    .hero-sub + .hero-sub { margin-top: 0.6rem; }
+
+    /* the fill hugs the command instead of the column: the box is as wide as the command's
+       longest unbreakable run, and the type is sized from the column so that run always fits */
+    .install {
+      display: block;
+      width: min-content;
+      max-width: 100%;
+      margin-top: 1.75rem;
+      padding: 0.7rem 0.9rem;
+      border-radius: 8px;
+      background: var(--soft);
+      transition: background 0.1s;
+      font-family: var(--font-mono);
+      font-size: min(1.02rem, calc((100cqw - 1.8rem) / var(--install-run)));
+      line-height: 1.55;
+      color: var(--ink);
+      text-align: left;
+    }
+    /* mono advance is 0.6em, so a run of N characters needs N * 0.6 of them. the url onwards
+       is one run for curl, and the whole line is one run for the shorter powershell command */
+    .install .nb, .install .for-win { white-space: nowrap; }
+    [data-os="unix"] .install { --install-run: 18.6; }
+    [data-os="win"] .install { --install-run: 23.4; }
+    [data-os="win"] .for-unix, [data-os="unix"] .for-win { display: none; }
+    .install .sh-p { color: var(--accent); }
+    .install .sh-dim { color: var(--ink-3); }
+    .install:hover { background: var(--soft-hover); }
+    .install-note {
+      margin-top: 0.45rem;
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      color: var(--ink-3);
+    }
+    .os-swap {
+      color: var(--ink-3);
+      text-decoration: underline;
+      text-decoration-color: var(--rule);
+      text-underline-offset: 3px;
+    }
+    .os-swap:hover { color: var(--accent); }
+
+    /* ── terminal frame ── */
+    .hero-preview { min-width: 0; }
+    .tui-scale-wrap { min-width: 0; overflow: hidden; }
+    .tui-scale-wrap > .tui { width: fit-content; }
+    /* a fixed radius is a fixed number of pixels off the corner, so on a phone, where a
+       terminal row is 8px tall, the corners bite into the status bar. scale it with the cast */
+    .tui-scale-wrap, .tui-scale-wrap > .tui {
+      border-radius: clamp(4px, calc(var(--cast-font, 18px) * 0.6), 10px);
+    }
+    .tui-scale-wrap, .doom-demo .tui { box-shadow: var(--demo-shadow); }
+    .tui {
+      display: block;
+      background: var(--term-bg);
+      border-radius: 10px;
+      overflow: hidden;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      line-height: 1.5;
+    }
+    .tui-body {
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      background: var(--term-bg);
+    }
+    /* holds the cast's size before the player exists, then gets out of its way */
+    .tui-scale-wrap > .tui:not(.booted) .tui-body { min-height: 330px; min-width: 774px; }
+    .tui-loader {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--term-bg);
+      z-index: 5;
+      transition: opacity 0.18s ease;
+    }
+    .tui-loader.hidden { opacity: 0; pointer-events: none; }
+    /* a speed change mounts a second player: both share one cell so the swap never blinks */
+    #demo-player { display: grid; }
+    #demo-player > * { grid-area: 1 / 1; }
+    .tui-spinner {
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--term-line);
+      border-top-color: var(--t-fn);
+      border-radius: 50%;
+      animation: spin 0.55s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .tui-body .ap-wrapper {
+      background: var(--term-bg) !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      justify-content: start !important;
+    }
+    /* the cast is re-laid out at this size rather than transform-scaled to fit, so every glyph
+       is rasterized at the size it is shown at and the terminal stays crisp */
+    .tui-body .ap-player {
+      font-size: var(--cast-font, 18px) !important;
+      background: var(--term-bg) !important;
+      padding: 0 !important;
+      border-radius: 0 !important;
+      margin: 0 !important;
+    }
+    .tui-body pre.ap-terminal {
+      padding: 0 !important;
+      margin: 0 !important;
+      border-width: 0 !important;
+      box-sizing: border-box !important;
+    }
+    .tui-body .ap-control-bar, .tui-body .ap-overlay-start { display: none !important; }
+
+    /* ── player controls ── */
+    .player-controls {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 6;
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      padding: 0.45rem 0.6rem;
+      background: var(--ctl-bg);
+      border-top: 1px solid var(--term-line);
+      /* chrome, not terminal output: the body font stays legible once the frame is scaled
+         down, and Nunito's digits are tabular so the clock never jitters */
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+      opacity: 0;
+      transform: translateY(6px);
+      pointer-events: none;
+      transition: opacity 0.13s ease, transform 0.13s ease;
+    }
+    @media (hover: hover) {
+      .tui-body:hover .player-controls {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+    }
+    .tui-body .player-controls:focus-within {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .player-btn, .speed-toggle, .speed-option {
+      color: var(--ctl-fg);
+      transition: background 0.1s, color 0.1s;
+    }
+    .player-btn:hover, .speed-toggle:hover, .speed-option:hover { background: var(--ctl-hover); color: #fff; }
+    .player-btn {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--term-line);
+    }
+    .player-btn svg { width: 12px; height: 12px; fill: currentColor; }
+    .player-btn .icon-pause, .player-btn.playing .icon-play { display: none; }
+    .player-btn.playing .icon-pause { display: block; }
+    .player-progress {
+      position: relative;
+      flex: 1;
+      height: 3px;
+      background: var(--ctl-track);
+      cursor: pointer;
+    }
+    .player-progress::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: -10px;
+      bottom: -10px;
+    }
+    /* scaled rather than resized: the fill is repainted every frame while playing */
+    .player-progress-bar {
+      width: 100%;
+      height: 100%;
+      background: var(--t-fn);
+      transform: scaleX(0);
+      transform-origin: left;
+    }
+    .player-time {
+      flex-shrink: 0;
+      min-width: 68px;
+      text-align: right;
+      color: var(--ctl-fg);
+    }
+    .player-speed { position: relative; }
+    .speed-toggle {
+      min-width: 34px;
+      padding: 0.15rem 0.4rem;
+      border: 1px solid var(--term-line);
+    }
+    .speed-menu {
+      position: absolute;
+      right: 0;
+      bottom: calc(100% + 6px);
+      min-width: 70px;
+      padding: 0.2rem 0;
+      background: var(--ctl-bg);
+      border: 1px solid var(--term-line);
+      opacity: 0;
+      transform: translateY(4px);
+      pointer-events: none;
+      transition: opacity 0.1s ease, transform 0.1s ease;
+      z-index: 10;
+    }
+    .speed-menu.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
+    .speed-option {
+      position: relative;
+      display: block;
+      width: 100%;
+      padding: 0.3rem 0.8rem 0.3rem 1.5rem;
+      text-align: left;
+    }
+    .speed-option.active { color: var(--t-fn); }
+    .speed-option.active::before { content: '>'; position: absolute; left: 0.55rem; }
+    .player-hint {
+      margin-top: 0.85rem;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      color: var(--ink-3);
+      text-align: center;
+    }
+    .player-hint button {
+      -webkit-user-select: text;
+      user-select: text;
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-color: var(--link-underline);
+      text-underline-offset: 3px;
+      cursor: pointer;
+    }
+    .player-hint button:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+
+    /* ── sections ── */
+    .content {
+      max-width: 1332px;
+      margin: 0 auto;
+      padding: 0 clamp(1.25rem, 7vw, 6rem);
+    }
+    .block {
+      border-top: 1px solid var(--rule);
+      padding: clamp(2.75rem, 5.5vw, 4rem) 0;
+    }
+    h2 {
+      font-weight: 700;
+      font-size: clamp(1.55rem, 2.8vw, 2rem);
+      letter-spacing: -0.025em;
+      line-height: 1.2;
+      text-wrap: balance;
+    }
+    .sec-head { margin-bottom: 1.75rem; }
+    .sec-head p + p { margin-top: 0.55rem; }
+    .sec-head p {
+      max-width: 58ch;
+      margin-top: 0.85rem;
+      font-size: 1.1rem;
+      color: var(--ink-2);
+      text-wrap: pretty;
+    }
+
+    /* ── features ── */
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.7rem clamp(2rem, 4vw, 3.5rem);
+      align-items: start;
+    }
+    .feature { max-width: 54ch; }
+    .feature strong {
+      display: block;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.6rem;
+    }
+    .feature p + p { margin-top: 0.5rem; }
+    .feature p, .feature-rest {
+      font-size: 1.06rem;
+      line-height: 1.62;
+      color: var(--ink-2);
+      text-wrap: pretty;
+    }
+    .feature strong a { color: inherit; }
+    .feature strong a::after {
+      content: '↓';
+      margin-left: 0.35em;
+      font-weight: 400;
+      opacity: 0.5;
+    }
+    .feature strong a[href^="/docs"]::after, .feature strong a[href^="http"]::after { content: '↗'; }
+    .feature strong a:hover { color: var(--accent); }
+    .feature code { white-space: nowrap; }
+    .feature-rest {
+      grid-column: 1 / -1;
+      max-width: 74ch;
+      margin-top: 0.6rem;
+      color: var(--ink-3);
+    }
+
+    /* ── dark panes ── */
+    .pane-split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--pane-line);
+      border: 1px solid var(--pane-line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--pane-bg);
+    }
+    .pane-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.45rem 0.95rem;
+      background: var(--pane-head);
+      border-bottom: 1px solid var(--pane-line);
+      font-family: var(--font-mono);
+      font-size: 0.86rem;
+      color: var(--pane-label);
+    }
+    .pane-label b { font-weight: 400; color: #C3C9DA; }
+    .pane-hint { display: none; opacity: 0; transition: opacity 0.18s ease; }
+    @media (hover: hover) { .pane-hint { display: block; } }
+    .dissolved .pane-hint { opacity: 1; }
+    .dissolved .pane-src:hover .pane-hint { opacity: 0; }
+    .pane pre {
+      flex: 1;
+      margin: 0;
+      --scroll-thumb: oklch(100% 0 0 / 0.14);
+      --scroll-thumb-hover: oklch(100% 0 0 / 0.26);
+      padding: 0.95rem 1rem;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      line-height: 1.62;
+      color: var(--t-ink);
+    }
+    .pane .kw { color: var(--t-kw); }
+    .pane .ty { color: var(--t-ty); }
+    .pane .fn { color: var(--t-fn); }
+    .pane .at, .pane .sec { color: var(--t-con); }
+    .pane .cm, .pane .rng { color: var(--t-com); }
+    .pane .st, .pane .out { color: var(--t-str); }
+
+    /* the source file dissolves into what index keeps */
+    .pane .l { display: block; }
+    .src .l:not(.keep) { transition: opacity 0.35s ease 0.25s; }
+    .dissolved .src .l:not(.keep) { opacity: 0.34; }
+    .dissolved .pane-src:hover .l:not(.keep) { opacity: 1; transition-delay: 0s; }
+
+    .stat {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-top: 1.1rem;
+      font-family: var(--font-mono);
+      font-size: 0.94rem;
+      color: var(--ink-3);
+    }
+    .stat-num { color: var(--ink); font-weight: 700; }
+    .stat-arrow { color: var(--ink-3); }
+    .stat-result { color: var(--accent); }
+    .stat-result::before { content: '·'; margin-right: 0.45rem; color: var(--ink-3); }
+
+    .pane-split.wide-left { grid-template-columns: 1.4fr 1fr; }
+    .pane-duo {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+    .pane-solo { border: 1px solid var(--pane-line); border-radius: 10px; overflow: hidden; }
+
+    /* ── benchmark ── */
+    .bench { margin: 0; }
+    .bench img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 10px;
+      background: #000;
+      box-shadow: var(--demo-shadow);
+    }
+    .bench figcaption {
+      margin-top: 0.85rem;
+      font-size: 0.95rem;
+      color: var(--ink-2);
+      text-align: center;
+    }
+
+    /* ── doom ── */
+    .doom-demo {
+      max-width: 900px;
+      margin: clamp(2.5rem, 5vw, 3.5rem) auto 0;
+    }
+    .doom-line {
+      font-family: var(--font-mono);
+      font-size: 1.05rem;
+      color: var(--ink-2);
+      text-align: center;
+      margin-bottom: 0.85rem;
+    }
+    .doom-video {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1920 / 970;
+      background: #000;
+      cursor: pointer;
+    }
+
+    /* ── bottom sky ── */
+    .bottom-sky {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(180deg, var(--paper) 0%, var(--sky-3) 55%, var(--sky-2) 78%, var(--sky-1) 100%);
+    }
+    .bottom-sky .block { border-top: 0; }
+    .bottom-sky .clouds { --cloud: var(--cloud-deep); }
+    .bottom-sky > .content, .bottom-sky > footer { position: relative; z-index: 1; }
+
+    /* ── providers ── */
+    .provider-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      margin-bottom: 1.5rem;
+    }
+    .provider-chip {
+      padding: 0.62rem 0.95rem;
+      border-radius: 8px;
+      background: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 0.96rem;
+      color: var(--ink-2);
+      transition: background 0.1s, color 0.1s;
+    }
+    .provider-chip:hover { background: var(--soft-hover); color: var(--accent); }
+    /* Lua is Portuguese for moon, and the hero already hangs one in the sky */
+    .lua-mark, .provider-chip.lua::after {
+      content: '';
+      display: inline-block;
+      width: 0.62em;
+      height: 0.62em;
+      border-radius: 50%;
+      box-shadow: inset 0.17em -0.1em 0 0 var(--accent);
+    }
+    .provider-chip.lua::after { margin-left: 0.45em; }
+    /* the border eats into the padding so the empty slot is the same size as its neighbours */
+    .provider-chip.yours {
+      padding: calc(0.62rem - 1px) calc(0.95rem - 1px);
+      background: none;
+      border: 1px dashed var(--nav-sep);
+      color: var(--ink-3);
+    }
+    .provider-chip.yours:hover { background: none; border-color: var(--accent); }
+    .provider-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+      gap: clamp(2rem, 4vw, 3.5rem);
+      align-items: start;
+    }
+    .provider-plus {
+      max-width: 58ch;
+      font-size: 1.06rem;
+      color: var(--ink-2);
+    }
+    .provider-plus p + p { margin-top: 0.5rem; }
+
+    /* ── footer ── */
+    footer {
+      padding: clamp(4rem, 9vw, 7rem) 1.5rem clamp(1.5rem, 3vw, 2rem);
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      color: var(--ink-3);
+    }
+    footer a { color: var(--ink-2); }
+    footer a:hover { color: var(--accent); }
+
+    /* ── keys card ── */
+    .overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      display: flex;
+      justify-content: center;
+      padding-top: 16vh;
+      background: oklch(25% 0.03 300 / 0.35);
+    }
+    .overlay[hidden] { display: none; }
+    .overlay-card {
+      width: min(520px, 92vw);
+      height: fit-content;
+      background: var(--pane-bg);
+      border: 1px solid var(--pane-line);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 24px 60px oklch(20% 0.04 300 / 0.35);
+      font-family: var(--font-mono);
+    }
+    .overlay-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.7rem 0.9rem;
+      border-bottom: 1px solid var(--pane-line);
+    }
+    .overlay-mark { color: var(--t-fn); }
+    .keys-title { color: var(--t-com); font-size: 0.94rem; }
+    .keys-list { list-style: none; padding: 0.35rem 0; }
+    .keys-list li {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.4rem 0.9rem;
+      font-size: 0.9rem;
+      color: var(--t-com);
+    }
+    .keys-list span { margin-left: 0.5rem; }
+    .keys-list kbd {
+      min-width: 1.5rem;
+      padding: 0 0.35rem;
+      border: 1px solid var(--pane-line);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--pane-line);
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      text-align: center;
+      color: var(--t-ink);
+    }
+
+    /* the sandbox prints its result when you reach it */
+    .exec-out .l {
+      opacity: 0;
+      transform: translateY(3px);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    .exec-out .l:nth-child(2) { transition-delay: 0.12s; }
+    .exec-out .l:nth-child(3) { transition-delay: 0.24s; }
+    .ran .exec-out .l { opacity: 1; transform: none; }
+    .run-caret {
+      display: inline-block;
+      width: 0.55em;
+      height: 1em;
+      vertical-align: text-bottom;
+      background: var(--t-fn);
+      animation: blink 1.15s steps(1) infinite;
+    }
+    .ran .run-caret { display: none; }
+    @keyframes blink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+
+    /* the hero borrows the same entrance, but from CSS: it starts on the first paint instead of
+       waiting for the parser to reach the script at the end of the body */
+    .hero-intro, .hero-preview { animation: rise 0.32s var(--ease) both; }
+    .hero-preview { animation-delay: 0.06s; }
+    @keyframes rise { from { opacity: 0; transform: translateY(14px); } }
+
+    /* ── reveal ── */
+    .reveal {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 0.32s var(--ease), transform 0.32s var(--ease);
+    }
+    .reveal.visible { opacity: 1; transform: none; }
+    .hero-preview.reveal { transition-delay: 0.06s; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .reveal { opacity: 1; transform: none; }
+    }
+
+    /* ── responsive ── */
+    /* the two Lua samples need 1098px of band between them, so they stack first */
+    @media (max-width: 1340px) {
+      .pane-duo { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 1220px) {
+      .pane-split, .pane-split.wide-left, .provider-split { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 1000px) {
+      .hero { min-height: 0; }
+      .hero-grid { grid-template-columns: minmax(0, 1fr); }
+      .features { grid-template-columns: 1fr; gap: 1.55rem; }
+      .feature { max-width: 68ch; }
+    }
+    @media (max-width: 768px) {
+      .nav-label, .nav-crumb { display: none; }
+      /* no keyboard to shortcut with, and the modal it opens is a desktop affordance */
+      .key-hint, .key-hint + .nav-sep { display: none; }
+      .nav-right { gap: 0.85rem; }
+      /* a phone cannot host these lines: wrapped code reads, a line cut mid-token does not */
+      .pane pre { white-space: pre-wrap; overflow-wrap: break-word; font-size: 0.8rem; }
+      .hero-preview > .player-controls, .doom-demo .player-controls {
+        position: static;
+        opacity: 1;
+        transform: none;
+        pointer-events: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<div id="top-sentinel" aria-hidden="true"></div>
+
+<nav id="nav">
+  <div class="nav-left">
+    <a href="#" class="nav-logo">maki</a>
+    <span class="nav-crumb" id="nav-crumb" aria-hidden="true"></span>
+  </div>
+  <div class="nav-right">
+    <button class="key-hint" id="keys-open" aria-label="Keyboard shortcuts"><kbd>?</kbd></button>
+    <span class="nav-sep"></span>
+    <a href="/docs/">Docs</a>
+    <span class="nav-sep"></span>
+    <a href="/plugins/">Plugins</a>
+    <span class="nav-sep"></span>
+    <a href="https://discord.gg/8VKuA4naC3" target="_blank" rel="noopener" class="nav-discord" aria-label="Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.369a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.036A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.009c.12.099.246.198.373.292a.077.077 0 01-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.028zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+    <span class="nav-sep"></span>
+    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="nav-github" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg><span class="nav-label">GitHub</span><span class="star-badge" data-stars><svg width="10" height="10" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span></a>
+    <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</nav>
+
+<header class="hero" data-section="intro">
+  <div class="sky">
+    <span class="star star-1"></span>
+    <span class="star star-2"></span>
+    <span class="star star-3"></span>
+    <span class="star star-4"></span>
+    <span class="star star-5"></span>
+    <button class="moon" id="moon" aria-label="Toggle dark mode"></button>
+  </div>
+  <div class="clouds" aria-hidden="true">
+    <svg class="cloud cloud-a" viewBox="0 0 380 120"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
+    <svg class="cloud cloud-b" viewBox="0 0 300 110"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
+    <svg class="cloud cloud-c" viewBox="0 0 160 65"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
+  </div>
+  <div class="hero-grid">
+    <div class="hero-intro">
+      <h1>maki</h1>
+      <p class="hero-tagline">the efficient coder</p>
+      <p class="hero-sub">I got frustrated with existing coding agents and hitting hourly/weekly token limits.</p>
+      <p class="hero-sub">So I built Maki, a lightweight Rust TUI with some novel context token reduction techniques.</p>
+      <p class="hero-sub">In benchmarks, it reduces cost by 2x and finishes them 2x faster too.</p>
+      <button class="install" id="install" aria-keyshortcuts="c"><span class="for-unix"><span class="sh-p">$</span> curl <span class="sh-dim">-fsSL</span> <span class="nb">https://maki.sh/install.sh <span class="sh-dim">|</span> sh</span></span><span class="for-win"><span class="sh-p">&gt;</span> <span class="nb">irm https://maki.sh/install.ps1 <span class="sh-dim">|</span> iex</span></span></button>
+      <p class="install-note"><button class="os-swap" id="os-swap"><span class="for-unix">on Windows?</span><span class="for-win">on macOS or Linux?</span></button><span id="install-hint"></span></p>
+    </div>
+
+    <div class="hero-preview">
+      <div class="tui-scale-wrap">
+        <div class="tui">
+          <div class="tui-body">
+            <div class="tui-loader" id="demo-loader"><div class="tui-spinner"></div></div>
+            <div id="demo-player"></div>
+            <div class="player-controls">
+              <button class="player-btn" id="play-btn" aria-label="Play/Pause">
+                <svg viewBox="0 0 24 24" class="icon-play"><path d="M8 5v14l11-7z"/></svg>
+                <svg viewBox="0 0 24 24" class="icon-pause"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              </button>
+              <div class="player-progress" id="progress-bar">
+                <div class="player-progress-bar" id="progress-fill"></div>
+              </div>
+              <span class="player-time" id="time-display">0:00 / 0:00</span>
+              <div class="player-speed">
+                <button class="speed-toggle" id="speed-toggle" aria-haspopup="true" aria-expanded="false">2.0x</button>
+                <div class="speed-menu" id="speed-menu" role="menu">
+                  <button class="speed-option" data-speed="0.5" role="menuitem">0.5x</button>
+                  <button class="speed-option" data-speed="1" role="menuitem">1.0x</button>
+                  <button class="speed-option" data-speed="1.5" role="menuitem">1.5x</button>
+                  <button class="speed-option active" data-speed="2" role="menuitem">2.0x</button>
+                  <button class="speed-option" data-speed="3" role="menuitem">3.0x</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="player-hint"><button type="button" id="skip-hint-btn" data-seek="67">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
+    </div>
+  </div>
+</header>
+
+<main class="content">
+
+  <section class="block" id="benchmark" data-section="benchmark">
+    <figure class="bench">
+      <a href="bench.svg" target="_blank" rel="noopener"><img src="bench.svg" width="1344" height="940" alt="Maki 0.5.5 at 70% pass rate and $2.06 per pass, against the FrontierHarness Eval baselines (Codex 66.7% at $3.47, Claude Code 63.3% at $18.34)"></a>
+      <figcaption><a href="https://frontierharness.org/" target="_blank" rel="noopener">FrontierHarness Eval</a> benchmark result, <a href="https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-21.zip">click here to download report.zip</a></figcaption>
+    </figure>
+  </section>
+
+  <section class="block reveal" id="tokens" data-section="tokens">
+    <div class="sec-head">
+      <h2>Where tokens go</h2>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <strong><a href="#index">index</a></strong>
+        <p>Parses 15 languages into skeletons: imports, type defs, function signatures with their line ranges.</p>
+        <p>Costs 59 tok/turn, saves 224 on reads. Reads were ~65% of my tokens, so this one is big.</p>
+      </div>
+      <div class="feature">
+        <strong><a href="#exec">code_execution</a></strong>
+        <p>A sandboxed Python interpreter where every tool is an <code>async</code> function.</p>
+        <p>The model gathers 50 reads, greps them, prints the 3 lines that matter. The rest never touches your context.</p>
+      </div>
+      <div class="feature">
+        <strong><a href="/docs/mcp/#tool-search" target="_blank" rel="noopener">tool_search</a></strong>
+        <p>Datadog's MCP server has over 100 tools. Every definition sits in your context on every request, used or not.</p>
+        <p>Maki hides them behind one search tool and loads what the model asks for.</p>
+      </div>
+      <div class="feature">
+        <strong>task</strong>
+        <p>The model picks weak, medium, or strong for each subagent. Haiku-tier for grep-heavy research, opus-tier for architecture.</p>
+        <p>You get a summary, not the transcript.</p>
+      </div>
+      <div class="feature">
+        <strong>compaction</strong>
+        <p>Long sessions get compacted: images and thinking blocks go first, then old turns get summarized.</p>
+        <p>The system prompt and tool descriptions are short too.</p>
+      </div>
+    </div>
+
+  </section>
+
+  <section class="block reveal" id="index" data-section="index">
+    <div class="sec-head">
+      <h2>index: read less, know more</h2>
+      <p>Instead of reading full files, <code>index</code> parses with tree-sitter and returns a compact skeleton.</p>
+      <p>The model sees the structure, then reads only the lines it needs.</p>
+    </div>
+
+    <div class="pane-split" id="index-demo">
+      <div class="pane pane-src">
+        <div class="pane-label"><b>main.rs</b><span class="pane-hint">hover to restore</span></div>
+        <pre class="src"><span class="l keep"><span class="kw">use</span> std::fs;</span><span class="l keep"><span class="kw">use</span> clap::<span class="ty">Parser</span>;</span><span class="l keep"><span class="kw">use</span> color_eyre::<span class="ty">Result</span>;</span><span class="l"> </span><span class="l keep"><span class="at">#[derive(Parser)]</span></span><span class="l keep"><span class="kw">struct</span> <span class="ty">Args</span> {</span><span class="l keep">    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;,</span><span class="l">    <span class="at">#[arg(short, long)]</span></span><span class="l keep">    lines: <span class="kw">bool</span>,</span><span class="l keep">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {</span><span class="l">    text.<span class="fn">split_whitespace</span>().<span class="fn">count</span>()</span><span class="l">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {</span><span class="l">    text.<span class="fn">lines</span>().<span class="fn">count</span>()</span><span class="l">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; {</span><span class="l">    <span class="kw">let</span> args = <span class="ty">Args</span>::<span class="fn">parse</span>();</span><span class="l">    <span class="kw">for</span> path <span class="kw">in</span> &amp;args.paths {</span><span class="l">        <span class="kw">let</span> text = fs::<span class="fn">read_to_string</span>(path)?;</span><span class="l">        <span class="kw">let</span> n = <span class="kw">if</span> args.lines {</span><span class="l">            <span class="fn">count_lines</span>(&amp;text)</span><span class="l">        } <span class="kw">else</span> {</span><span class="l">            <span class="fn">count_words</span>(&amp;text)</span><span class="l">        };</span><span class="l">        <span class="fn">println!</span>(<span class="st">"{}: {n}"</span>, path.<span class="fn">display</span>());</span><span class="l">    }</span><span class="l">    <span class="ty">Ok</span>(())</span><span class="l">}</span></pre>
+      </div>
+      <div class="pane">
+        <div class="pane-label"><b>maki index main.rs</b><span>skeleton</span></div>
+        <pre><span class="sec">imports:</span> <span class="rng">[1-3]</span>
+  clap::<span class="ty">Parser</span>, color_eyre::<span class="ty">Result</span>, std::fs
+
+<span class="sec">types:</span>
+  <span class="at">#[derive(Parser)]</span>
+  <span class="kw">struct</span> <span class="ty">Args</span> <span class="rng">[5-9]</span>
+    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;
+    lines: <span class="kw">bool</span>
+
+<span class="sec">fns:</span>
+  <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> <span class="rng">[11-13]</span>
+  <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> <span class="rng">[15-17]</span>
+  <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; <span class="rng">[19-29]</span></pre>
+      </div>
+    </div>
+
+    <div class="stat">
+      <span><span class="stat-num">164</span> tokens</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">94</span> tokens</span>
+      <span class="stat-result">43% smaller</span>
+    </div>
+  </section>
+
+  <section class="block reveal" id="exec" data-section="code_execution">
+    <div class="sec-head">
+      <h2>code_execution: think inside the sandbox</h2>
+      <p>Tools are exposed as <code>async</code> Python functions.</p>
+      <p>The model writes a script, runs it sandboxed, and only the <code>print()</code> output enters your context.</p>
+    </div>
+
+    <div class="pane-split wide-left">
+      <div class="pane">
+        <div class="pane-label"><b>script</b><span>python</span></div>
+        <pre><span class="cm"># find dead exports in a TS repo</span>
+files = <span class="kw">await</span> <span class="fn">glob</span>(pattern=<span class="st">'src/**/*.ts'</span>)
+srcs = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(
+    *[<span class="fn">read</span>(path=f) <span class="kw">for</span> f <span class="kw">in</span> files]
+)
+
+exports = {}
+imports = <span class="fn">set</span>()
+<span class="kw">for</span> f, src <span class="kw">in</span> <span class="fn">zip</span>(files, srcs):
+    <span class="kw">for</span> m <span class="kw">in</span> re.<span class="fn">finditer</span>(<span class="st">r'^export \w+ (\w+)'</span>, src, re.M):
+        exports[m.<span class="fn">group</span>(1)] = f
+    <span class="kw">for</span> m <span class="kw">in</span> re.<span class="fn">finditer</span>(<span class="st">r'import\s*\{([^}]+)\}'</span>, src):
+        imports.<span class="fn">update</span>(n.<span class="fn">strip</span>() <span class="kw">for</span> n <span class="kw">in</span> m.<span class="fn">group</span>(1).<span class="fn">split</span>(<span class="st">','</span>))
+
+<span class="kw">for</span> name, f <span class="kw">in</span> exports.<span class="fn">items</span>():
+    <span class="kw">if</span> name <span class="kw">not in</span> imports:
+        <span class="fn">print</span>(<span class="st">f'{f}  {name}'</span>)</pre>
+      </div>
+      <div class="pane">
+        <div class="pane-label"><b>output</b><span>3 lines</span></div>
+        <pre class="exec-out"><span class="l out">src/lib/csv.ts       parseCsvLegacy</span><span class="l out">src/auth/jwt.ts      signV1</span><span class="l out">src/utils/phone.ts   formatE164</span><span class="run-caret"></span></pre>
+      </div>
+    </div>
+
+    <div class="stat">
+      <span><span class="stat-num">~40k</span> tokens</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">~30</span> tokens</span>
+      <span class="stat-result">1300x reduction</span>
+    </div>
+  </section>
+
+  <section class="block reveal" id="usage" data-section="usage">
+    <div class="sec-head">
+      <h2>What you get</h2>
+    </div>
+
+    <div class="features">
+    <div class="feature">
+      <strong><a href="#lua">Lua plugins</a></strong>
+      <p>Extend maki in Lua with a Neovim-style plugin API: add tools, providers, slash commands, keymaps, and UI.</p>
+      <p>Anything maki does out of the box, your plugins can do too.</p>
+    </div>
+    <div class="feature">
+      <strong>Rust TUI, 60 FPS</strong>
+      <p>Native binary. No javascript runtime, no react. Even the splash screen animation uses SIMD.</p>
+      <p>Syntax highlighting runs on a background thread pool so it never blocks your input.</p>
+    </div>
+    <div class="feature">
+      <strong>Full visibility</strong>
+      <p>Philosophy: don't hide anything. Token count, cost, and model are always in the status bar.</p>
+      <p>Each subagent gets its own chat window you can flip through with <code>/tasks</code> (Ctrl-X). Ctrl-F for fuzzy search.</p>
+      <p><code>/btw</code> runs a side query without touching the current session. <code>!</code> runs shell commands, <code>!!</code> runs them silently.</p>
+    </div>
+    <div class="feature">
+      <strong>Sensible permissions</strong>
+      <p>Bash commands are parsed with tree-sitter so maki knows what's actually being run.</p>
+      <p><code>git diff &amp;&amp; rm -rf /</code> correctly flags both <code>git</code> and <code>rm</code>. Most agents only see <code>git</code>. Handles subshells, command substitution, pipes.</p>
+      <p>Per-tool allow/deny rules, or <code>--yolo</code> to skip it all.</p>
+    </div>
+
+    <p class="feature-rest">Also in there: parallel sessions you can switch away from, long-term memory, double-Escape to rewind, plan mode, MCP over stdio or HTTP, skills, ACP, opt-in <a href="/docs/telemetry/">OpenTelemetry</a>, 26 themes, image paste, and <code>--print</code> for headless.</p>
+    </div>
+  </section>
+
+  <section class="block reveal" id="lua" data-section="lua">
+    <div class="sec-head">
+      <h2>Lua plugins: hackable all the way down</h2>
+      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>.</p>
+      <p>The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar.</p>
+      <p>Drop a file in <code>~/.config/maki/lua/</code> and <code>require</code> it from <code>init.lua</code> to add tools, slash commands, keymaps, UI, or a whole <a href="#providers">provider</a>.</p>
+      <p>Others publish theirs too: browse the <a href="/plugins/">community plugins</a>.</p>
+    </div>
+
+    <div class="pane-duo">
+      <div class="pane pane-solo">
+        <div class="pane-label"><b>add a ci_status tool: the model checks CI itself</b></div>
+        <pre><span class="fn">maki.api.register_tool</span>({
+  name = <span class="st">"ci_status"</span>,
+  description = <span class="st">"Latest CI run for this branch"</span>,
+  schema = { type = <span class="st">"object"</span>, properties = {} },
+  handler = <span class="kw">function</span>()
+    <span class="kw">local</span> res, err = <span class="fn">maki.net.request</span>(
+      <span class="st">"https://ci.internal/runs/json?branch=main"</span>)
+    <span class="kw">if</span> err <span class="kw">then</span>
+      <span class="kw">return</span> { llm_output = err, is_error = <span class="kw">true</span> }
+    <span class="kw">end</span>
+    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
+    <span class="fn">buf:lines</span>(<span class="fn">maki.ui.highlight</span>(res.body, <span class="st">"json"</span>))
+    <span class="kw">return</span> { llm_output = res.body, body = buf }
+  <span class="kw">end</span>,
+})</pre>
+      </div>
+      <div class="pane pane-solo">
+        <div class="pane-label"><b>add /standup: show yesterday's commits</b></div>
+        <pre><span class="fn">maki.api.register_command</span>({
+  name = <span class="st">"/standup"</span>,
+  description = <span class="st">"Yesterday's commits"</span>,
+  handler = <span class="kw">function</span>()
+    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
+    <span class="kw">local</span> win = <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
+    <span class="fn">maki.fn.jobstart</span>(
+      <span class="st">"git log --since=yesterday --oneline"</span>, {
+        on_stdout = <span class="kw">function</span>(_, line) <span class="fn">buf:line</span>(line) <span class="kw">end</span>,
+      })
+    <span class="kw">repeat</span>
+      <span class="kw">local</span> ev = <span class="fn">win:recv</span>()
+    <span class="kw">until</span> <span class="kw">not</span> ev <span class="kw">or</span> ev.key == <span class="st">"esc"</span>
+    <span class="fn">win:close</span>()
+  <span class="kw">end</span>,
+})</pre>
+      </div>
+    </div>
+
+    <div class="doom-demo">
+      <p class="doom-line">And yes... it can even run DOOM!</p>
+      <div class="tui">
+        <div class="tui-body">
+          <video class="doom-video" width="1920" height="970" muted loop playsinline preload="none" data-poster="doom-poster.webp" aria-label="maki running DOOM through a Lua plugin">
+            <source src="doom-av1.mp4" type="video/mp4; codecs=av01.0.04M.08">
+            <source src="doom.mp4" type="video/mp4">
+          </video>
+          <div class="player-controls">
+            <button class="player-btn doom-play-btn" aria-label="Play/Pause">
+              <svg viewBox="0 0 24 24" class="icon-play"><path d="M8 5v14l11-7z"/></svg>
+              <svg viewBox="0 0 24 24" class="icon-pause"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+            </button>
+            <div class="player-progress doom-progress">
+              <div class="player-progress-bar doom-progress-fill"></div>
+            </div>
+            <span class="player-time doom-time">0:00 / 0:00</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+</main>
+
+<div class="bottom-sky">
+  <div class="content">
+  <section class="block reveal" id="providers" data-section="providers">
+    <div class="sec-head">
+      <h2>Providers: any&nbsp;API, one Lua&nbsp;file</h2>
+      <p>Set an API key env var, or use <code>maki auth login openai</code> for OAuth.</p>
+    </div>
+    <div class="provider-split">
+      <div>
+        <div class="provider-grid">
+          <a href="/docs/providers/#anthropic" class="provider-chip">Anthropic</a>
+          <a href="/docs/providers/#openai" class="provider-chip">OpenAI</a>
+          <a href="/docs/providers/#xai" class="provider-chip">xAI</a>
+          <a href="/docs/providers/#google" class="provider-chip">Google</a>
+          <a href="/docs/providers/#copilot" class="provider-chip">Copilot</a>
+          <a href="/docs/providers/#ollama" class="provider-chip">Ollama</a>
+          <a href="/docs/providers/#llamacpp" class="provider-chip">llama.cpp</a>
+          <a href="/docs/providers/#z-ai" class="provider-chip">Z.AI</a>
+          <a href="/docs/providers/#opencode-zen" class="provider-chip">OpenCode Zen</a>
+          <a href="/docs/providers/#opencode-go" class="provider-chip">OpenCode Go</a>
+          <a href="/docs/providers/#aperture" class="provider-chip">Aperture</a>
+          <a href="/docs/providers/#mistral" class="provider-chip lua" title="Lua plugin">Mistral</a>
+          <a href="/docs/providers/#deepseek" class="provider-chip lua" title="Lua plugin">DeepSeek</a>
+          <a href="/docs/providers/#openrouter" class="provider-chip lua" title="Lua plugin">OpenRouter</a>
+          <a href="/docs/providers/#requesty" class="provider-chip lua" title="Lua plugin">Requesty</a>
+          <a href="/docs/providers/#synthetic" class="provider-chip lua" title="Lua plugin">Synthetic</a>
+          <a href="/docs/providers/#regolo" class="provider-chip lua" title="Lua plugin">Regolo</a>
+          <a href="/docs/providers/#tensorx" class="provider-chip lua" title="Lua plugin">TensorX</a>
+          <a href="/docs/providers/#plugin-providers" class="provider-chip yours">+ yours</a>
+        </div>
+        <div class="provider-plus">
+          <p>Anything that speaks the OpenAI or Anthropic API works too.</p>
+          <p>Anything else takes a short <a href="/docs/providers/#plugin-providers">Lua plugin</a>: a table of models, an auth hook, done.</p>
+          <p>The ones with a <span class="lua-mark" role="img" aria-label="moon"></span> already are. <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener">Read them</a>.</p>
+        </div>
+      </div>
+      <div>
+        <div class="pane pane-solo">
+          <div class="pane-label"><b>add your company's gateway, behind SSO</b></div>
+          <pre><span class="fn">maki.provider.register</span>({
+  slug = <span class="st">"corp"</span>,
+  display_name = <span class="st">"Corp gateway"</span>,
+  codec = <span class="st">"anthropic"</span>,
+  base_url = <span class="st">"https://llm.corp.example"</span>,
+  models = {
+    { prefixes = { <span class="st">"claude-opus-4-6"</span> }, tier = <span class="st">"strong"</span> },
+    { prefixes = { <span class="st">"claude-haiku-4-5"</span> }, tier = <span class="st">"weak"</span> },
+  },
+  auth = <span class="kw">function</span>()
+    <span class="kw">local</span> sso = <span class="fn">maki.fs.read</span>(<span class="st">"~/.corp/sso.json"</span>)
+    <span class="kw">local</span> bearer = <span class="st">"Bearer "</span> .. <span class="fn">maki.json.decode</span>(sso).token
+    <span class="kw">return</span> { headers = { authorization = bearer } }
+  <span class="kw">end</span>,
+})</pre>
+        </div>
+        <div class="stat">
+          <span><span class="stat-num">15</span> lines</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">corp/claude-opus-4-6</span> in <span class="stat-num">/model</span></span>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+
+  <footer>
+    Created by <a href="https://tontinton.com" target="_blank" rel="noopener">tontinton</a>.
+  </footer>
+
+  <div class="clouds" aria-hidden="true">
+    <svg class="cloud cloud-a" viewBox="0 0 380 120"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
+    <svg class="cloud cloud-b" viewBox="0 0 300 110"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
+    <svg class="cloud cloud-c" viewBox="0 0 160 65"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
+  </div>
+</div>
+
+
+<div class="overlay" id="keys" hidden>
+  <div class="overlay-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="overlay-row"><span class="overlay-mark">?</span><span class="keys-title">keys</span></div>
+    <ul class="keys-list">
+      <li><kbd>j</kbd><kbd>k</kbd><span>next / previous section</span></li>
+      <li><kbd>g</kbd><kbd>G</kbd><span>top / bottom</span></li>
+      <li><kbd>t</kbd><span>light or dark</span></li>
+      <li><kbd>c</kbd><span>copy the install command</span></li>
+      <li><kbd>esc</kbd><span>close</span></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  const COPY_HINT_MS = 1500;
+  const COPIED_HINT = ' \u00b7 copied';
+  const DOOM = 'doom';
+  const INSTALL_CMD = {
+    unix: 'curl -fsSL https://maki.sh/install.sh | sh',
+    win: 'irm https://maki.sh/install.ps1 | iex',
+  };
+
+  const root = document.documentElement;
+  const nav = document.getElementById('nav');
+  const navCrumb = document.getElementById('nav-crumb');
+
+  const navObs = new IntersectionObserver(([entry]) => {
+    nav.classList.toggle('scrolled', !entry.isIntersecting);
+  });
+  navObs.observe(document.getElementById('top-sentinel'));
+
+  const sections = [...document.querySelectorAll('[data-section]')];
+  let sectionAt = 0;
+  const sectionObs = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      sectionAt = sections.indexOf(entry.target);
+      const name = entry.target.dataset.section;
+      navCrumb.textContent = name === 'intro' ? '' : '/ ' + name;
+      navCrumb.classList.toggle('on', name !== 'intro');
+    });
+  }, { rootMargin: '-45% 0px -45% 0px' });
+  sections.forEach(el => sectionObs.observe(el));
+
+  function gotoSection(step) {
+    const next = Math.min(sections.length - 1, Math.max(0, sectionAt + step));
+    sections[next].scrollIntoView({ behavior: 'smooth' });
+  }
+
+  function toggleTheme() {
+    const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  }
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+  document.getElementById('moon').addEventListener('click', toggleTheme);
+
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (localStorage.getItem('theme')) return;
+    document.documentElement.setAttribute('data-theme', e.matches ? 'light' : 'dark');
+  });
+
+  // sets a class the first time an element is scrolled into view, then stops watching it
+  function onceVisible(el, cls, options) {
+    new IntersectionObserver(([entry], obs) => {
+      if (!entry.isIntersecting) return;
+      el.classList.add(cls);
+      obs.disconnect();
+    }, options).observe(el);
+  }
+
+  document.querySelectorAll('.reveal').forEach(el =>
+    onceVisible(el, 'visible', { threshold: 0.08, rootMargin: '0px 0px -40px 0px' }));
+
+  // the file fades down to what index actually keeps, and the sandbox prints its result
+  onceVisible(document.getElementById('index-demo'), 'dissolved', { threshold: 0.3 });
+  onceVisible(document.getElementById('exec'), 'ran', { threshold: 0.3 });
+
+  // on phones the terminal is scaled down to fit, so the transport moves out of it
+  if (matchMedia('(max-width: 768px)').matches) {
+    const preview = document.querySelector('.hero-preview');
+    preview.insertBefore(preview.querySelector('.player-controls'), preview.querySelector('.player-hint'));
+  }
+
+  // both install lines ship in the markup and CSS picks one off data-os, which the head
+  // script already set, so the right command is in the very first paint
+  const installHint = document.getElementById('install-hint');
+  let copyTimer = 0;
+
+  document.getElementById('os-swap').addEventListener('click', () => {
+    root.dataset.os = root.dataset.os === 'win' ? 'unix' : 'win';
+    localStorage.setItem('os', root.dataset.os);
+  });
+
+  function copyInstall() {
+    navigator.clipboard.writeText(INSTALL_CMD[root.dataset.os] ?? INSTALL_CMD.unix);
+    installHint.textContent = COPIED_HINT;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => { installHint.textContent = ''; }, COPY_HINT_MS);
+  }
+  document.getElementById('install').addEventListener('click', copyInstall);
+
+  // the whole page answers to the keyboard, the way the TUI does
+  const keys = document.getElementById('keys');
+  keys.addEventListener('click', e => { if (e.target === keys) keys.hidden = true; });
+  document.getElementById('keys-open').addEventListener('click', () => { keys.hidden = false; });
+
+  let typed = '';
+  document.addEventListener('keydown', e => {
+    if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Escape') { keys.hidden = true; return; }
+
+    // typing the magic word takes you where you want to go
+    typed = (typed + e.key.toLowerCase()).slice(-DOOM.length);
+    if (typed === DOOM) {
+      document.querySelector('.doom-demo').scrollIntoView({ behavior: 'smooth' });
+      document.querySelector('.doom-video').play().catch(() => {});
+      return;
+    }
+
+    if (e.key === '?') { e.preventDefault(); keys.hidden = !keys.hidden; }
+    else if (e.key === 'j') { e.preventDefault(); gotoSection(1); }
+    else if (e.key === 'k') { e.preventDefault(); gotoSection(-1); }
+    else if (e.key === 'g') { e.preventDefault(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+    else if (e.key === 'G') { e.preventDefault(); window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); }
+    else if (e.key === 't') { e.preventDefault(); toggleTheme(); }
+    else if (e.key === 'c') { e.preventDefault(); copyInstall(); }
+  });
+
+  const starBadge = document.querySelector('[data-stars]');
+  const starCount = starBadge.querySelector('[data-star-count]');
+
+  function showStars(count) {
+    starCount.textContent = count;
+    starBadge.classList.add('loaded');
+  }
+
+  // paint the last known count instantly, then refresh once the page is idle
+  const cachedStars = localStorage.getItem('stars');
+  if (cachedStars) showStars(cachedStars);
+
+  const idle = window.requestIdleCallback || (fn => setTimeout(fn, 200));
+  idle(() => {
+    fetch('https://api.github.com/repos/tontinton/maki', { headers: { Accept: 'application/vnd.github.v3+json' } })
+      .then(r => r.json())
+      .then(data => {
+        if (!data.stargazers_count) return;
+        const count = data.stargazers_count >= 1000
+          ? (data.stargazers_count / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
+          : String(data.stargazers_count);
+        if (count === cachedStars) return;
+        localStorage.setItem('stars', count);
+        showStars(count);
+      })
+      .catch(() => {});
+  });
+</script>
+<script src="asciinema-player.min.js"></script>
+<script>
+  const LOADER_FADE_MS = 300;
+  const FONT_WAIT_MS = 1200;
+  const SWAP_SETTLE_MS = 150;
+  const TUI_MIN_WIDTH = 774;
+  const CAST_FONT_PX = 18;
+  const TERMINAL_FONT = "'JetBrains Mono'";
+  const PLAYER_OPTS = {
+    autoPlay: true,
+    preload: true,
+    loop: true,
+    idleTimeLimit: 2,
+    fit: false,
+    terminalFontSize: 'medium',
+    controls: false,
+    terminalFontFamily: `${TERMINAL_FONT}, monospace`,
+    theme: 'dracula',
+  };
+
+  const playBtn = document.getElementById('play-btn');
+  const progressBar = document.getElementById('progress-bar');
+  const progressFill = document.getElementById('progress-fill');
+  const timeDisplay = document.getElementById('time-display');
+  const playerContainer = document.getElementById('demo-player');
+  const speedToggle = document.getElementById('speed-toggle');
+  const speedMenu = document.getElementById('speed-menu');
+  const speedOptions = [...speedMenu.querySelectorAll('.speed-option')];
+  const scaleWrap = document.querySelector('.tui-scale-wrap');
+  const heroTui = scaleWrap.firstElementChild;
+
+  let player = null;
+  let castText = '';
+  let booted = false;
+  let isPlaying = false;
+  let userPaused = false;
+  let offScreen = false;
+  let progressRaf = 0;
+  let shownTime = '';
+  let tuiWidth = TUI_MIN_WIDTH;
+  let wrapWidth = -1;
+
+  // the cast has a fixed column count, so it is re-laid out at the font size its column can
+  // take. the terminal's own size is cached, so a resize is pure writes and never a reflow
+  function applyScale() {
+    if (scaleWrap.clientWidth === wrapWidth) return;
+    wrapWidth = scaleWrap.clientWidth;
+    const scale = Math.min(1, wrapWidth / tuiWidth);
+    scaleWrap.style.setProperty('--cast-font', CAST_FONT_PX * scale + 'px');
+  }
+
+  function measureTui() {
+    heroTui.classList.add('booted');
+    scaleWrap.style.removeProperty('--cast-font');
+    tuiWidth = heroTui.offsetWidth || TUI_MIN_WIDTH;
+    wrapWidth = -1;
+    applyScale();
+  }
+
+  // scaled from the CSS floor before the player exists, so the frame never jumps once it does
+  applyScale();
+  new ResizeObserver(applyScale).observe(document.querySelector('.hero-preview'));
+
+  function hideLoader() {
+    const loader = document.getElementById('demo-loader');
+    if (!loader) return;
+    loader.classList.add('hidden');
+    setTimeout(() => loader.remove(), LOADER_FADE_MS);
+  }
+
+  function formatTime(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  function updateProgress() {
+    progressRaf = isPlaying ? requestAnimationFrame(updateProgress) : 0;
+    const duration = player.getDuration();
+    if (!duration) return;
+    const current = player.getCurrentTime();
+    progressFill.style.transform = `scaleX(${current / duration})`;
+    const text = `${formatTime(current)} / ${formatTime(duration)}`;
+    if (text === shownTime) return;
+    shownTime = text;
+    timeDisplay.textContent = text;
+  }
+
+  function setPlaying(playing) {
+    isPlaying = playing;
+    playBtn.classList.toggle('playing', playing);
+    cancelAnimationFrame(progressRaf);
+    progressRaf = 0;
+    if (!playing) return;
+    hideLoader();
+    measureTui();
+    progressRaf = requestAnimationFrame(updateProgress);
+  }
+
+  // the recording is fetched once and replayed from memory, so switching speed costs nothing
+  function createPlayer(speed, startTime) {
+    const host = document.createElement('div');
+    playerContainer.appendChild(host);
+    const src = castText ? { driver: 'recording', data: () => castText } : 'demo.cast';
+    const created = AsciinemaPlayer.create(src, host, { ...PLAYER_OPTS, speed });
+    created.host = host;
+    created.addEventListener('play', () => {
+      if (player !== created) return;
+      // the player rejects play/pause/seek until it has parsed the recording, so nothing
+      // touches it before its first frame
+      booted = true;
+      setPlaying(true);
+      syncPlayback();
+    });
+    created.addEventListener('pause', () => { if (player === created) setPlaying(false); });
+    if (startTime) created.seek(startTime);
+    return created;
+  }
+
+  function syncPlayback() {
+    if (!booted) return;
+    if (offScreen) { if (isPlaying) player.pause(); }
+    else if (!userPaused && !isPlaying) player.play();
+  }
+
+  // the player measures a character cell when it mounts, so it waits for the real mono font;
+  // otherwise the whole grid stays sized to whatever fallback happened to be up
+  const fontReady = document.fonts
+    ? Promise.race([
+        document.fonts.load(`400 15px ${TERMINAL_FONT}`),
+        new Promise(resolve => setTimeout(resolve, FONT_WAIT_MS)),
+      ])
+    : Promise.resolve();
+
+  Promise.all([window.castText.catch(() => ''), fontReady.catch(() => {})]).then(([text]) => {
+    castText = text;
+    player = createPlayer(parseFloat(speedMenu.querySelector('.active').dataset.speed), 0);
+  });
+
+  // a player nobody can see still diffs a full terminal every frame, so it stops off screen
+  new IntersectionObserver(([entry]) => {
+    offScreen = !entry.isIntersecting;
+    syncPlayback();
+  }).observe(scaleWrap);
+
+  function togglePlayback() {
+    if (!booted) return;
+    userPaused = isPlaying;
+    if (isPlaying) player.pause();
+    else player.play();
+  }
+  playBtn.addEventListener('click', togglePlayback);
+  playerContainer.addEventListener('click', togglePlayback);
+
+  progressBar.addEventListener('click', e => {
+    if (!booted) return;
+    const rect = progressBar.getBoundingClientRect();
+    player.seek(player.getDuration() * ((e.clientX - rect.left) / rect.width));
+  });
+
+  const skipBtn = document.getElementById('skip-hint-btn');
+  skipBtn.addEventListener('click', () => {
+    if (!booted) return;
+    userPaused = false;
+    player.seek(Number(skipBtn.dataset.seek));
+    player.play();
+  });
+
+  function closeSpeedMenu() {
+    speedMenu.classList.remove('open');
+    speedToggle.setAttribute('aria-expanded', 'false');
+  }
+  speedToggle.addEventListener('click', e => {
+    e.stopPropagation();
+    speedToggle.setAttribute('aria-expanded', speedMenu.classList.toggle('open'));
+  });
+  document.addEventListener('click', e => {
+    if (!speedMenu.contains(e.target) && e.target !== speedToggle) closeSpeedMenu();
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSpeedMenu(); });
+
+  // speed is fixed per player, so the new one is mounted over the old one in the same
+  // grid cell and the old one is only torn down once the swap has painted
+  speedOptions.forEach(opt => opt.addEventListener('click', () => {
+    speedOptions.forEach(other => other.classList.toggle('active', other === opt));
+    speedToggle.textContent = opt.textContent;
+    closeSpeedMenu();
+    if (!booted) return;
+    const previous = player;
+    booted = false;
+    player = createPlayer(parseFloat(opt.dataset.speed), previous.getCurrentTime());
+    setTimeout(() => { previous.dispose(); previous.host.remove(); }, SWAP_SETTLE_MS);
+  }));
+
+  // the DOOM capture is a plain <video> behind the same transport
+  (() => {
+    const demo = document.querySelector('.doom-demo');
+    const video = demo.querySelector('.doom-video');
+    const btn = demo.querySelector('.doom-play-btn');
+    const progress = demo.querySelector('.doom-progress');
+    const fill = demo.querySelector('.doom-progress-fill');
+    const time = demo.querySelector('.doom-time');
+    let pausedByUser = false;
+
+    function render() {
+      const duration = video.duration || 0;
+      fill.style.transform = `scaleX(${duration ? video.currentTime / duration : 0})`;
+      time.textContent = `${formatTime(video.currentTime)} / ${formatTime(duration)}`;
+      btn.classList.toggle('playing', !video.paused);
+    }
+    ['timeupdate', 'loadedmetadata', 'play', 'pause'].forEach(ev => video.addEventListener(ev, render));
+
+    function toggleVideo() {
+      pausedByUser = !video.paused;
+      if (video.paused) video.play();
+      else video.pause();
+    }
+    btn.addEventListener('click', toggleVideo);
+    video.addEventListener('click', toggleVideo);
+
+    progress.addEventListener('click', e => {
+      const rect = progress.getBoundingClientRect();
+      video.currentTime = ((e.clientX - rect.left) / rect.width) * (video.duration || 0);
+      render();
+    });
+
+    // it plays while on screen, unless you paused it yourself
+    new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) video.pause();
+      else if (!pausedByUser) video.play().catch(() => {});
+    }, { threshold: 0.35 }).observe(video);
+
+    // neither the poster nor the 3 MB capture is worth taking bandwidth from the hero for the
+    // majority who never get here, so both start a screen out and have landed on arrival
+    new IntersectionObserver(([entry], obs) => {
+      if (!entry.isIntersecting) return;
+      obs.disconnect();
+      video.poster = video.dataset.poster;
+      video.preload = 'auto';
+      video.load();
+    }, { rootMargin: '1500px 0px' }).observe(video);
+  })();
+</script>
+
+</body>
+</html>

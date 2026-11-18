@@ -1,0 +1,185 @@
+#!/bin/sh
+set -eu
+
+REPO="tontinton/maki"
+BINARY="maki"
+
+github_curl() {
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "${token}" ]; then
+        curl -fsSL \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: maki-install" \
+            "$@"
+    else
+        curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: maki-install" \
+            "$@"
+    fi
+}
+
+is_windows() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Works for both pretty-printed and single-line GitHub API JSON.
+latest_tag() {
+    github_curl "https://api.github.com/repos/${REPO}/releases/latest" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
+
+default_install_dir() {
+    if is_windows; then
+        if [ -n "${LOCALAPPDATA:-}" ]; then
+            printf '%s\n' "${LOCALAPPDATA}/maki"
+        else
+            printf '%s\n' "${HOME}/.local/bin"
+        fi
+    else
+        printf '%s\n' "${HOME}/.local/bin"
+    fi
+}
+
+path_has_dir() {
+    dir="$1"
+    case ":${PATH}:" in
+        *":${dir}:"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+warn_path() {
+    dir="$1"
+    if path_has_dir "${dir}"; then
+        return 0
+    fi
+    echo "note: ${dir} is not in PATH; add it to your shell config, e.g.:"
+    echo "  export PATH=\"${dir}:\$PATH\""
+}
+
+warn_shadowed() {
+    dest="$1"
+    resolved="$(command -v "${BINARY}" 2>/dev/null || true)"
+    if [ -n "${resolved}" ] && [ "${resolved}" != "${dest}" ]; then
+        echo "note: '${BINARY}' resolves to ${resolved}, which shadows ${dest};"
+        echo "  remove it or reorder PATH so the new install comes first"
+    fi
+}
+
+add_windows_user_path() {
+    dir="$1"
+    # Convert to Windows path when possible so PATH works outside Git Bash.
+    if command -v cygpath > /dev/null 2>&1; then
+        win_dir="$(cygpath -w "${dir}")"
+    else
+        win_dir="${dir}"
+    fi
+    powershell.exe -NoProfile -Command "
+\$dir = '${win_dir}' -replace '/', '\\'
+\$sep = [IO.Path]::PathSeparator
+\$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (\$null -eq \$userPath) { \$userPath = '' }
+\$entries = \$userPath -split [regex]::Escape(\$sep) | Where-Object { \$_ -ne '' }
+\$already = \$entries | Where-Object { \$_.TrimEnd('\\') -ieq \$dir.TrimEnd('\\') }
+if (\$already) { exit 0 }
+\$newPath = if (\$userPath.Trim()) { \"\$userPath\$sep\$dir\" } else { \$dir }
+[Environment]::SetEnvironmentVariable('Path', \$newPath, 'User')
+Write-Host \"added \$dir to user PATH (restart terminal if maki is not found)\"
+" || true
+}
+
+main() {
+    need_cmd curl
+
+    if is_windows; then
+        # Only x86_64 Windows builds are published; ARM64 runs them under emulation.
+        target="x86_64-pc-windows-msvc"
+        archive_ext="zip"
+        bin_name="${BINARY}.exe"
+        need_cmd unzip
+    else
+        case "$(uname -s)" in
+            Linux)   os="unknown-linux-musl" ;;
+            Darwin)  os="apple-darwin" ;;
+            FreeBSD) os="unknown-freebsd" ;;
+            NetBSD)  os="unknown-netbsd" ;;
+            *) err "unsupported OS: $(uname -s)" ;;
+        esac
+
+        # NetBSD arm64 reports the machine as evbarm, the cpu as aarch64
+        machine="$(uname -m)"
+        [ "$machine" = "evbarm" ] && machine="$(uname -p)"
+        case "$machine" in
+            x86_64|amd64)   arch="x86_64" ;;
+            aarch64|arm64)  arch="aarch64" ;;
+            *) err "unsupported architecture: $machine" ;;
+        esac
+
+        target="${arch}-${os}"
+        archive_ext="tar.gz"
+        bin_name="${BINARY}"
+    fi
+
+    INSTALL_DIR="${MAKI_INSTALL_DIR:-$(default_install_dir)}"
+
+    tag="${1:-$(latest_tag)}"
+    [ -n "${tag}" ] || err "failed to determine latest release tag"
+
+    url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.${archive_ext}"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+
+    echo "downloading ${BINARY} ${tag} for ${target}..."
+    if [ "${archive_ext}" = "zip" ]; then
+        github_curl "${url}" -o "${tmp}/maki.zip"
+        unzip -qo "${tmp}/maki.zip" -d "${tmp}"
+    else
+        github_curl "${url}" | tar xz -C "${tmp}"
+    fi
+
+    [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
+
+    dest="${INSTALL_DIR}/${bin_name}"
+
+    if mkdir -p "${INSTALL_DIR}" 2>/dev/null && [ -w "${INSTALL_DIR}" ]; then
+        mv "${tmp}/${bin_name}" "${dest}"
+        chmod +x "${dest}"
+    elif command -v sudo > /dev/null 2>&1; then
+        echo "installing to ${INSTALL_DIR} (requires sudo)..."
+        sudo sh -c '
+            set -e
+            mkdir -p "$1"
+            mv "$2" "$3"
+            chmod +x "$3"
+        ' maki-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
+    else
+        err "cannot write to ${INSTALL_DIR} (set MAKI_INSTALL_DIR to a writable directory)"
+    fi
+
+    echo "${BINARY} ${tag} installed to ${dest}"
+
+    if is_windows; then
+        add_windows_user_path "${INSTALL_DIR}"
+    else
+        warn_path "${INSTALL_DIR}"
+        warn_shadowed "${dest}"
+    fi
+    echo ""
+}
+
+need_cmd() {
+    command -v "$1" > /dev/null 2>&1 || err "need '$1' (not found)"
+}
+
+err() {
+    echo "error: $1" >&2
+    exit 1
+}
+
+main "$@"

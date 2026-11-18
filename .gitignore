@@ -1,0 +1,9 @@
+/target
+__pycache__/
+runs.csv
+/.direnv/
+/site/_build/
+/site/.bin/
+/.playwright-mcp/
+/result
+AGENTS.local.md

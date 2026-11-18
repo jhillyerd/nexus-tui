@@ -1,0 +1,530 @@
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+
+use crate::lock::Lock;
+use crate::{StateDir, StorageError, atomic_write_permissions};
+
+const AUTH_DIR: &str = "auth";
+/// Plugin providers keep their credentials apart from everything else under
+/// [`AUTH_DIR`]: a plugin picks its own slug, and in a shared directory that
+/// name could be `mcp-<server>` or a catalog provider's slug, the file maki
+/// keeps somebody else's secret in.
+const PLUGIN_AUTH_DIR: &str = "plugins";
+const AUTH_FILE_MODE: u32 = 0o600;
+const REFRESH_BUFFER_SECS: u64 = 60;
+const LOCK_SUFFIX: &str = ".lock";
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(50);
+/// RFC 7591 §3.2.1: a `client_secret_expires_at` of 0 means the secret never
+/// expires. Atlassian's MCP server registers clients this way.
+const CLIENT_SECRET_NEVER_EXPIRES: u64 = 0;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OAuthTokens {
+    pub access: String,
+    pub refresh: String,
+    pub expires: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+impl OAuthTokens {
+    pub fn is_expired(&self) -> bool {
+        now_millis() + REFRESH_BUFFER_SECS * 1000 >= self.expires
+    }
+
+    pub fn is_hard_expired(&self) -> bool {
+        now_millis() >= self.expires
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpAuthData {
+    pub server_url: String,
+    pub tokens: Option<OAuthTokens>,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub client_secret_expires_at: Option<u64>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// Token endpoint pinned at interactive auth. Silent refresh reuses it
+    /// instead of trusting fresh discovery, so a later-compromised server
+    /// cannot redirect the refresh token and client secret elsewhere.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    /// The auth server's RFC 8414 metadata as discovered at interactive auth,
+    /// pinned for the same reason as `token_endpoint`. Records from before it
+    /// existed fall back to discovery checked against `token_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_server: Option<serde_json::Value>,
+    /// The RFC 8707 resource named at interactive auth, which refreshes name
+    /// again. Records from before it existed named the server URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProviderCredentials {
+    pub api_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl ProviderCredentials {
+    pub fn masked_api_key(&self) -> String {
+        if self.api_key.len() > 8 {
+            format!(
+                "{}...{}",
+                &self.api_key[..4],
+                &self.api_key[self.api_key.len() - 4..]
+            )
+        } else {
+            "****".to_string()
+        }
+    }
+}
+
+/// Refresh tokens rotate and a rotated one is single use, so two processes
+/// refreshing at once leave the loser replaying a spent token, which providers
+/// answer by revoking the whole family instead of failing the one call. Waiting
+/// forever would be worse than the race though, since this runs on the ui
+/// thread too, so a lock that does not arrive in time is given up and the
+/// caller carries on as before.
+pub fn lock_exclusive(path: &Path) -> Option<File> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            fs::create_dir_all(path.parent()?).ok()?;
+            OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .create(true)
+                .open(path)
+                .ok()?
+        }
+    };
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => sleep(LOCK_POLL),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Every write replaces the token file, so the lock sits beside it under a name
+/// no loader reads. Waits like [`lock_exclusive`], on the timer.
+pub async fn lock_tokens_async(dir: &StateDir, provider: &str) -> Option<Lock> {
+    let path = auth_path(dir, &format!("{provider}{LOCK_SUFFIX}"));
+    Lock::acquire_within(&path, LOCK_WAIT, LOCK_POLL)
+        .await
+        .inspect_err(|e| warn!(provider, error = %e, "OAuth refresh lock not acquired"))
+        .ok()
+}
+
+pub async fn lock_mcp_auth_async(dir: &StateDir, server_name: &str) -> Option<Lock> {
+    lock_tokens_async(dir, &mcp_auth_name(server_name)).await
+}
+
+/// The cross-process half of [`lock_credentials`]: a plugin provider's store,
+/// locked against every other maki process.
+pub fn lock_plugin_store(dir: &StateDir, slug: &str) -> Option<File> {
+    lock_exclusive(&plugin_auth_path(dir, &format!("{slug}{LOCK_SUFFIX}")))
+}
+
+/// The slugs this process currently holds the credential lock for.
+static HELD_CREDENTIALS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// One provider's credential lock, re-entrant within this process and released
+/// on drop.
+///
+/// A plugin's auth hook runs while the host already holds this lock, and the
+/// whole reason the host owns the store is that such a hook can persist the
+/// token it just minted. Taking the file lock again from inside it would park
+/// the write until the hook times out, so a slug this process already holds
+/// hands back a guard that locks nothing.
+///
+/// What that still guarantees is the part that matters: no *other process* can
+/// be writing meanwhile, because the outermost guard holds the exclusive file
+/// lock for as long as it lives, and the refresh gate single-flights the
+/// refresh path per slug.
+///
+/// What it does not guarantee is in-process exclusion against a write from
+/// somewhere else entirely -- a `login` hook, a timer, a user command -- which
+/// takes the re-entrant guard and writes under the outer holder's lock. That
+/// is safe rather than merely tolerated because every write replaces the file
+/// in one atomic step, so the loser of such a race loses its whole write and
+/// never half of it, and both values were minted by the same plugin.
+pub struct CredentialLock {
+    /// Set only on the guard that claimed the slug, so a re-entrant guard
+    /// releases nothing, and an early return or a panic inside a hook cannot
+    /// leak the claim either.
+    slug: Option<String>,
+    _file: Option<File>,
+}
+
+pub fn lock_credentials(dir: &StateDir, provider: &str) -> CredentialLock {
+    let claimed = HELD_CREDENTIALS.lock().unwrap().insert(provider.to_owned());
+    if !claimed {
+        return CredentialLock {
+            slug: None,
+            _file: None,
+        };
+    }
+    CredentialLock {
+        slug: Some(provider.to_owned()),
+        _file: lock_plugin_store(dir, provider),
+    }
+}
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        if let Some(slug) = self.slug.take() {
+            HELD_CREDENTIALS.lock().unwrap().remove(&slug);
+        }
+    }
+}
+
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
+    dir.path().join(AUTH_DIR).join(format!("{filename}.json"))
+}
+
+fn plugin_auth_path(dir: &StateDir, slug: &str) -> PathBuf {
+    dir.path()
+        .join(AUTH_DIR)
+        .join(PLUGIN_AUTH_DIR)
+        .join(format!("{slug}.json"))
+}
+
+fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+}
+
+async fn load_auth_async<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+}
+
+fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(data)?;
+    atomic_write_permissions(path, json.as_bytes(), AUTH_FILE_MODE)?;
+    debug!(path = %path.display(), "auth data saved");
+    Ok(())
+}
+
+fn delete_auth(path: &Path) -> Result<bool, StorageError> {
+    if path.exists() {
+        fs::remove_file(path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
+    load_auth(&auth_path(dir, provider))
+}
+
+pub async fn load_tokens_async(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
+    load_auth_async(&auth_path(dir, provider)).await
+}
+
+pub fn save_tokens(
+    dir: &StateDir,
+    provider: &str,
+    tokens: &OAuthTokens,
+) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, provider), tokens)
+}
+
+pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
+    delete_auth(&auth_path(dir, provider))
+}
+
+pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> Option<McpAuthData> {
+    load_auth(&mcp_auth_path(dir, server_name)).filter(|data| mcp_auth_usable(data, expected_url))
+}
+
+pub async fn load_mcp_auth_async(
+    dir: &StateDir,
+    server_name: &str,
+    expected_url: &str,
+) -> Option<McpAuthData> {
+    load_auth_async(&mcp_auth_path(dir, server_name))
+        .await
+        .filter(|data| mcp_auth_usable(data, expected_url))
+}
+
+fn mcp_auth_usable(data: &McpAuthData, expected_url: &str) -> bool {
+    data.server_url == expected_url
+        && data.client_secret_expires_at.is_none_or(|expires_at| {
+            expires_at == CLIENT_SECRET_NEVER_EXPIRES || now_millis() / 1000 < expires_at
+        })
+}
+
+pub fn save_mcp_auth(
+    dir: &StateDir,
+    server_name: &str,
+    data: &McpAuthData,
+) -> Result<(), StorageError> {
+    save_auth(&mcp_auth_path(dir, server_name), data)
+}
+
+pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, StorageError> {
+    delete_auth(&mcp_auth_path(dir, server_name))
+}
+
+fn mcp_auth_path(dir: &StateDir, server_name: &str) -> PathBuf {
+    auth_path(dir, &mcp_auth_name(server_name))
+}
+
+fn mcp_auth_name(server_name: &str) -> String {
+    format!("mcp-{server_name}")
+}
+
+pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
+    load_auth(&auth_path(dir, slug))
+}
+
+pub fn save_provider_credentials(
+    dir: &StateDir,
+    slug: &str,
+    creds: &ProviderCredentials,
+) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, slug), creds)
+}
+
+pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
+    delete_auth(&auth_path(dir, slug))
+}
+
+/// Whatever a plugin provider decided its credentials are.
+///
+/// No schema, so a plugin gets the object back exactly as it wrote it. An
+/// object rather than any JSON value so a later version of the plugin has
+/// somewhere to add a field. Lives under [`PLUGIN_AUTH_DIR`], so no slug a
+/// plugin can choose addresses a file maki writes for anything else.
+pub type PluginAuthData = serde_json::Map<String, serde_json::Value>;
+
+pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
+    load_auth(&plugin_auth_path(dir, slug))
+}
+
+/// A fingerprint of what a plugin stored, or `None` when it stored nothing.
+/// A process compares two of these to notice that another one swapped the
+/// credentials. Hashing means it never keeps a second copy of the secret.
+pub fn plugin_auth_stamp(dir: &StateDir, slug: &str) -> Option<u64> {
+    let bytes = fs::read(plugin_auth_path(dir, slug)).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+pub fn save_plugin_auth(
+    dir: &StateDir,
+    slug: &str,
+    data: &PluginAuthData,
+) -> Result<(), StorageError> {
+    save_auth(&plugin_auth_path(dir, slug), data)
+}
+
+pub fn delete_plugin_auth(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
+    delete_auth(&plugin_auth_path(dir, slug))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    const TEST_URL: &str = "https://mcp.example.com";
+    const PLUGIN_SLUG: &str = "acme";
+    const PLUGIN_TOKEN_KEY: &str = "access_token";
+    const PLUGIN_TOKEN: &str = "tok-1";
+    const MCP_SERVER: &str = "github";
+
+    fn test_mcp_data() -> McpAuthData {
+        McpAuthData {
+            server_url: TEST_URL.into(),
+            tokens: None,
+            client_id: "client-123".into(),
+            client_secret: None,
+            client_secret_expires_at: None,
+            redirect_uri: None,
+            token_endpoint: None,
+            auth_server: None,
+            resource: None,
+        }
+    }
+
+    #[test_case(0,                              true  ; "epoch_is_expired")]
+    #[test_case(now_millis() + 3_600_000,       false ; "future_is_valid")]
+    fn token_expiry(expires: u64, expected: bool) {
+        let tokens = OAuthTokens {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires,
+            account_id: None,
+        };
+        assert_eq!(tokens.is_expired(), expected);
+    }
+
+    #[test]
+    fn save_load_delete_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let tokens = OAuthTokens {
+            access: "access_tok".into(),
+            refresh: "refresh_tok".into(),
+            expires: 9999999999,
+            account_id: None,
+        };
+        save_tokens(&dir, "anthropic", &tokens).unwrap();
+
+        let loaded = load_tokens(&dir, "anthropic").unwrap();
+        assert_eq!(loaded.access, "access_tok");
+        assert_eq!(loaded.refresh, "refresh_tok");
+        assert_eq!(loaded.expires, 9999999999);
+
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
+        }
+
+        assert!(delete_tokens(&dir, "anthropic").unwrap());
+        assert!(load_tokens(&dir, "anthropic").is_none());
+        assert!(!delete_tokens(&dir, "anthropic").unwrap());
+    }
+
+    /// The file is the plugin's to shape: no schema, so whatever object went in
+    /// is the object that comes back.
+    #[test]
+    fn plugin_auth_keeps_the_object_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut data = PluginAuthData::new();
+        data.insert(PLUGIN_TOKEN_KEY.into(), serde_json::json!(PLUGIN_TOKEN));
+        data.insert("nested".into(), serde_json::json!({ "any": [1, 2] }));
+        save_plugin_auth(&dir, PLUGIN_SLUG, &data).unwrap();
+
+        assert_eq!(load_plugin_auth(&dir, PLUGIN_SLUG).unwrap(), data);
+    }
+
+    /// A plugin names its own slug, so its store must not be where maki keeps
+    /// an MCP server's tokens or a provider's key under that same name.
+    #[test_case(&format!("mcp-{MCP_SERVER}") ; "an_mcp_server")]
+    #[test_case(PLUGIN_SLUG                   ; "a_provider_key")]
+    fn plugin_auth_cannot_reach_another_owners_file(slug: &str) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        save_mcp_auth(&dir, MCP_SERVER, &test_mcp_data()).unwrap();
+        let creds = ProviderCredentials {
+            api_key: PLUGIN_TOKEN.into(),
+            host: None,
+        };
+        save_provider_credentials(&dir, PLUGIN_SLUG, &creds).unwrap();
+
+        assert!(load_plugin_auth(&dir, slug).is_none());
+        assert!(!delete_plugin_auth(&dir, slug).unwrap());
+    }
+
+    /// What a plugin's auth hook does: it writes the store while the host
+    /// already holds the same slug's lock. Taking the file lock a second time
+    /// would park the write for [`LOCK_WAIT`], so the nested guard must hold no
+    /// file, and must leave the slug to the outer one when it goes.
+    #[test]
+    fn a_nested_credential_lock_takes_no_file_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let outer = lock_credentials(&dir, PLUGIN_SLUG);
+
+        let nested = lock_credentials(&dir, PLUGIN_SLUG);
+        assert!(nested._file.is_none());
+
+        drop(nested);
+        assert!(HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
+        drop(outer);
+        assert!(!HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
+    }
+
+    #[test]
+    fn mcp_auth_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let data = McpAuthData {
+            tokens: Some(OAuthTokens {
+                access: "acc".into(),
+                refresh: "ref".into(),
+                expires: 9999999999,
+                account_id: None,
+            }),
+            ..test_mcp_data()
+        };
+        save_mcp_auth(&dir, "srv", &data).unwrap();
+        let loaded = load_mcp_auth(&dir, "srv", TEST_URL).unwrap();
+        assert_eq!(loaded.client_id, "client-123");
+        assert_eq!(loaded.tokens.unwrap().access, "acc");
+    }
+
+    #[test_case(
+        test_mcp_data(),
+        "https://other.example.com"
+        ; "url_mismatch"
+    )]
+    #[test_case(
+        McpAuthData {
+            client_secret: Some("s".into()),
+            client_secret_expires_at: Some(1),
+            ..test_mcp_data()
+        },
+        TEST_URL
+        ; "expired_client_secret"
+    )]
+    fn mcp_auth_load_returns_none(data: McpAuthData, lookup_url: &str) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        save_mcp_auth(&dir, "srv", &data).unwrap();
+        assert!(load_mcp_auth(&dir, "srv", lookup_url).is_none());
+    }
+
+    #[test_case(None ; "no_expiry")]
+    #[test_case(Some(CLIENT_SECRET_NEVER_EXPIRES) ; "zero_never_expires")]
+    #[test_case(Some(now_millis() / 1000 + 3_600) ; "future_expiry")]
+    fn mcp_auth_load_keeps_unexpired_client(client_secret_expires_at: Option<u64>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let data = McpAuthData {
+            client_secret_expires_at,
+            ..test_mcp_data()
+        };
+        save_mcp_auth(&dir, "srv", &data).unwrap();
+        assert!(load_mcp_auth(&dir, "srv", TEST_URL).is_some());
+    }
+}

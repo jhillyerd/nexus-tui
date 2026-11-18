@@ -1,0 +1,742 @@
+//! Per-model tier assignments (strong / medium / weak).
+//!
+//! Three layers, checked in order: user overrides (persisted, one model per
+//! tier) > static entries (the provider registry for builtins, `providers.toml`
+//! declarations for custom providers) > auto-assignment by position in
+//! `list_models()`.
+//!
+//! Discovered metadata (context windows, pricing) from `/models` endpoints is
+//! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
+//!
+//! The global lock never escapes this module: accessors lock internally and
+//! return owned data, so a caller can never hold a read guard across model
+//! construction (recursive read + queued writer = deadlock). The module owns
+//! persistence: [`load`] at startup, [`set_and_persist`] on user edits.
+//! Callers never touch the on-disk format directly.
+//!
+//! Lookups never read a file. `providers.toml` declarations are pushed in by
+//! [`load`] and by custom provider discovery, the same way listings are, so a
+//! test that calls neither never sees the config of the machine it runs on.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use maki_storage::{StateDir, atomic_write};
+use tracing::warn;
+
+use crate::model::{ModelInfo, ModelTier};
+use crate::providers::custom;
+use crate::spec::ProviderRegistry;
+
+const TIERS_FILE: &str = "model-tiers";
+
+/// Each custom provider's `providers.toml` models, slug -> tier -> model id.
+pub(crate) type DeclaredTiers = BTreeMap<String, BTreeMap<ModelTier, String>>;
+
+static REGISTRY: LazyLock<RwLock<ModelRegistry>> = LazyLock::new(RwLock::default);
+
+fn read() -> RwLockReadGuard<'static, ModelRegistry> {
+    REGISTRY.read().unwrap()
+}
+
+fn write() -> RwLockWriteGuard<'static, ModelRegistry> {
+    REGISTRY.write().unwrap()
+}
+
+pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
+    read().spec_for_tier(provider, tier)
+}
+
+/// The model a tier resolves to, layering user overrides on top of provider
+/// defaults: the user's pick for the tier (whatever provider it names) first,
+/// then the tier within `provider`, then the tier in any provider.
+pub fn resolve_tier(provider: Option<&str>, tier: ModelTier) -> Option<String> {
+    read().resolve_tier(provider, tier)
+}
+
+pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
+    read().discovered(provider, model_id).cloned()
+}
+
+pub fn discovery_complete(provider: &str) -> bool {
+    read().known_models.contains_key(provider)
+}
+
+/// Typed `provider_info` for a discovered model. Key by the builtin slug, not
+/// `model.provider`: a dynamic wrap's model carries its own slug.
+pub fn provider_info<T: Send + Sync + 'static>(provider: &str, model_id: &str) -> Option<Arc<T>> {
+    let info = read()
+        .discovered(provider, model_id)?
+        .provider_info
+        .clone()?;
+    Arc::downcast(info).ok()
+}
+
+pub fn tier_for(spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
+    read().tier_for(spec, provider, static_tier)
+}
+
+pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
+    write().set_known_models(provider, models);
+}
+
+/// Read `providers.toml` before calling, never under the registry lock.
+pub(crate) fn set_declared(declared: DeclaredTiers) {
+    write().declared = declared;
+}
+
+/// Subagents and new sessions build their model from here, so the window a
+/// server reported belongs here too, or each of them would learn it again.
+pub fn record_context_window(provider: &str, model_id: &str, window: u32) {
+    if let Some(info) = write()
+        .known_models
+        .get_mut(provider)
+        .and_then(|models| models.iter_mut().find(|m| m.id == model_id))
+    {
+        info.context_window = Some(window);
+    }
+}
+
+/// Tiers whose override points at `spec`, in descending tier order.
+pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
+    read().override_tiers(spec)
+}
+
+/// Seeds the registry at startup: the user's tier picks from `dir`, and the
+/// tiers custom providers declare in `providers.toml`.
+pub fn load(dir: &StateDir) {
+    let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
+    write().set_overrides(overrides);
+    set_declared(custom::declared_tiers());
+}
+
+pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
+    update_and_persist(dir, |reg| reg.set(spec, tier));
+}
+
+pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
+    update_and_persist(dir, |reg| reg.unset(spec, tier));
+}
+
+/// Snapshot under the lock, persist outside it: file IO must never run while
+/// holding the registry lock.
+fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut ModelRegistry)) {
+    let snapshot = {
+        let mut reg = write();
+        update(&mut reg);
+        reg.overrides.clone()
+    };
+    write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
+}
+
+#[derive(Debug, Default)]
+struct ModelRegistry {
+    /// Keyed by tier (not spec) so inserting a model automatically evicts the
+    /// previous holder. Persisted to disk.
+    overrides: BTreeMap<ModelTier, String>,
+    /// Ordered model info per provider, populated from `list_models()`.
+    /// Not persisted - rebuilt every session. Used for auto-tier assignment
+    /// and discovered metadata lookup.
+    known_models: HashMap<String, Vec<ModelInfo>>,
+    /// Custom providers' static tier tables, what the provider registry is
+    /// for builtins.
+    declared: DeclaredTiers,
+}
+
+impl ModelRegistry {
+    fn set_overrides(&mut self, overrides: BTreeMap<ModelTier, String>) {
+        self.overrides = overrides;
+    }
+
+    fn set_known_models(&mut self, provider: &str, models: Vec<ModelInfo>) {
+        self.known_models.insert(provider.to_string(), models);
+    }
+
+    fn set(&mut self, spec: String, tier: ModelTier) {
+        self.overrides.insert(tier, spec);
+    }
+
+    fn unset(&mut self, spec: &str, tier: ModelTier) {
+        if self.has_override(spec, tier) {
+            self.overrides.remove(&tier);
+        }
+    }
+
+    fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
+        self.overrides.get(&tier).map(String::as_str) == Some(spec)
+    }
+
+    /// Lookup discovered metadata for a model by ID.
+    fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
+        self.known_models
+            .get(provider)?
+            .iter()
+            .find(|m| m.id == model_id)
+    }
+
+    fn tier_for(&self, spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
+        // A spec may hold several tiers; prefer the strongest agent tier,
+        // falling back to Compaction only when it is the sole assignment.
+        let mut tiers = self.override_tiers(spec).into_iter();
+        if let Some(first) = tiers.next() {
+            return match first {
+                ModelTier::Compaction => tiers.next().unwrap_or(first),
+                t => t,
+            };
+        }
+        if tiers_from_discovery(provider)
+            && let Some((_, model_id)) = spec.split_once('/')
+            && let Some(models) = self.known_models.get(provider)
+            && let Some(pos) = models.iter().position(|model| model.id == model_id)
+        {
+            if let Some(tier) = models[pos].tier {
+                return tier;
+            }
+            if static_tier.is_none() {
+                return tier_for_position(pos);
+            }
+        }
+        if let Some(t) = static_tier {
+            return t;
+        }
+        ModelTier::Medium
+    }
+
+    fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        let prefix = format!("{provider}/");
+        if let Some(spec) = self.overrides.get(&tier)
+            && spec.starts_with(&prefix)
+        {
+            return Some(spec.clone());
+        }
+
+        let candidate = if tiers_from_discovery(provider) {
+            self.discovered_static_candidate(provider, tier)
+                .or_else(|| self.metadata_candidate(provider, tier))
+                .or_else(|| {
+                    // A custom provider's listing is all it serves, so once it
+                    // answered, a declared model it does not list is not picked.
+                    let listed_all = self.known_models.contains_key(provider)
+                        && ProviderRegistry::get(provider)
+                            .is_none_or(|spec| spec.catalog_is_authoritative);
+                    if listed_all {
+                        None
+                    } else {
+                        self.static_candidate(provider, tier)
+                    }
+                })
+                .or_else(|| self.positional_candidate(provider, tier))
+        } else {
+            self.static_candidate(provider, tier)
+        }?;
+
+        (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
+    }
+
+    /// The curated default of a registered provider, the `providers.toml`
+    /// declaration of any other. Checked at lookup, not when declarations are
+    /// stored, so a plugin that registers a slug later still owns it.
+    fn static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        let id = if ProviderRegistry::get(provider).is_some() {
+            static_prefixes(provider, tier).next()?
+        } else {
+            self.declared.get(provider)?.get(&tier)?.as_str()
+        };
+        Some(format!("{provider}/{id}"))
+    }
+
+    /// The curated default the provider actually offers, so discovery cannot
+    /// replace a still available default with whatever it lists first.
+    fn discovered_static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        static_prefixes(provider, tier)
+            .find(|prefix| self.discovered(provider, prefix).is_some())
+            .map(|prefix| format!("{provider}/{prefix}"))
+    }
+
+    /// Lowest ID wins, so the tier default survives provider list reordering.
+    fn metadata_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        self.known_models
+            .get(provider)?
+            .iter()
+            .filter(|model| model.tier == Some(tier))
+            .map(|model| model.id.as_str())
+            .min()
+            .map(|id| format!("{provider}/{id}"))
+    }
+
+    fn positional_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        let models = self.known_models.get(provider).filter(|m| !m.is_empty())?;
+        let slot = match tier {
+            ModelTier::Strong => 0,
+            ModelTier::Medium => 1,
+            ModelTier::Weak => 2,
+            ModelTier::Compaction => return None,
+        };
+        Some(format!(
+            "{provider}/{}",
+            models[slot.min(models.len() - 1)].id
+        ))
+    }
+
+    fn claimed_elsewhere(&self, spec: &str, tier: ModelTier) -> bool {
+        self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
+    }
+
+    fn resolve_tier(&self, provider: Option<&str>, tier: ModelTier) -> Option<String> {
+        self.overrides
+            .get(&tier)
+            .cloned()
+            .or_else(|| provider.and_then(|p| self.spec_for_tier(p, tier)))
+            .or_else(|| self.spec_for_tier_any(tier))
+    }
+
+    /// Slug order, so the pick is the same in every process.
+    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
+        self.known_models
+            .keys()
+            .chain(self.declared.keys())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .find_map(|provider| self.spec_for_tier(provider, tier))
+    }
+
+    fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
+        self.overrides
+            .iter()
+            .rev()
+            .filter(|(_, s)| s.as_str() == spec)
+            .map(|(&t, _)| t)
+            .collect()
+    }
+}
+
+/// Discovery metadata (context window, pricing, vision) is stored for every
+/// provider, but only providers that accept arbitrary models may use the
+/// discovered list for tier auto-assignment; curated providers keep their
+/// static tier tables.
+fn tiers_from_discovery(provider: &str) -> bool {
+    ProviderRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
+}
+
+fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
+    ProviderRegistry::get(provider)
+        .into_iter()
+        .flat_map(|spec| spec.models())
+        .filter(move |entry| entry.default && entry.tier == tier)
+        .flat_map(|entry| entry.prefixes.iter().map(String::as_str))
+}
+
+fn tier_for_position(pos: usize) -> ModelTier {
+    [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak][pos.min(2)]
+}
+
+// On-disk format: { "tier": "spec", ... } keyed by tier, matching the in-memory
+// `BTreeMap<ModelTier, String>`. Tier-keyed storage preserves a model assigned
+// to multiple tiers; a spec-keyed file would collapse them to a single entry.
+// Legacy files were spec-keyed and are inverted on read.
+
+fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    if raw.trim().is_empty() {
+        return BTreeMap::new();
+    }
+    if let Ok(map) = serde_json::from_str::<BTreeMap<ModelTier, String>>(&raw) {
+        return map;
+    }
+    // Legacy format: { "provider/model": "tier" } — invert on read.
+    match serde_json::from_str::<BTreeMap<String, ModelTier>>(&raw) {
+        Ok(legacy) => legacy.into_iter().map(|(s, t)| (t, s)).collect(),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to parse tier overrides, ignoring");
+            BTreeMap::new()
+        }
+    }
+}
+
+fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
+    let json = match serde_json::to_vec_pretty(overrides) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize tier overrides");
+            return;
+        }
+    };
+    if let Err(e) = atomic_write(path, &json) {
+        warn!(path = %path.display(), error = %e, "failed to persist tier overrides");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    fn make_map(overrides: &[(ModelTier, &str)], models: &[&str]) -> ModelRegistry {
+        let mut reg = ModelRegistry::default();
+        reg.set_overrides(overrides.iter().map(|(t, s)| (*t, s.to_string())).collect());
+        if !models.is_empty() {
+            reg.set_known_models(
+                "ollama",
+                models
+                    .iter()
+                    .map(|s| ModelInfo::id_only(s.to_string()))
+                    .collect(),
+            );
+        }
+        reg
+    }
+
+    #[test]
+    fn tier_for_resolution_priority() {
+        let mut reg = make_map(&[], &["pos0", "pos1", "pos2"]);
+        reg.set("ollama/pos1".into(), ModelTier::Weak);
+
+        let t = |spec, static_tier| reg.tier_for(spec, "ollama", static_tier);
+
+        assert_eq!(t("ollama/pos1", Some(ModelTier::Strong)), ModelTier::Weak);
+        assert_eq!(t("ollama/pos0", Some(ModelTier::Weak)), ModelTier::Weak);
+        assert_eq!(t("ollama/pos0", None), ModelTier::Strong);
+        assert_eq!(t("ollama/pos1", None), ModelTier::Weak);
+        assert_eq!(t("ollama/pos2", None), ModelTier::Weak);
+        assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
+    }
+
+    #[test]
+    fn curated_provider_ignores_discovered_tiers() {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models(
+            "zai",
+            vec![ModelInfo {
+                tier: Some(ModelTier::Strong),
+                ..ModelInfo::id_only("glm-large-vision".into())
+            }],
+        );
+
+        assert_ne!(
+            reg.tier_for("zai/glm-large-vision", "zai", None),
+            ModelTier::Strong
+        );
+        assert_ne!(
+            reg.spec_for_tier("zai", ModelTier::Strong),
+            Some("zai/glm-large-vision".into())
+        );
+    }
+
+    fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models(
+            "copilot",
+            models
+                .iter()
+                .map(|&(id, tier)| ModelInfo {
+                    tier: Some(tier),
+                    ..ModelInfo::id_only(id.into())
+                })
+                .collect(),
+        );
+        reg
+    }
+
+    #[test]
+    fn discovered_category_tier_beats_position_and_static_fallback() {
+        let reg = make_tiered(&[
+            ("terra", ModelTier::Medium),
+            ("luna", ModelTier::Weak),
+            ("gpt-5.6-sol", ModelTier::Strong),
+        ]);
+
+        assert_eq!(
+            reg.tier_for("copilot/gpt-5.6-sol", "copilot", Some(ModelTier::Medium)),
+            ModelTier::Strong
+        );
+        assert_eq!(
+            reg.tier_for("copilot/terra", "copilot", None),
+            ModelTier::Medium
+        );
+        assert_eq!(
+            reg.tier_for("copilot/luna", "copilot", None),
+            ModelTier::Weak
+        );
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Strong),
+            Some("copilot/gpt-5.6-sol".into())
+        );
+    }
+
+    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
+    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
+    #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
+    fn spec_for_tier_prefers_entitled_curated_default(
+        models: &[(&str, ModelTier)],
+        expected: &str,
+    ) {
+        let reg = make_tiered(models);
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Strong),
+            Some(expected.into())
+        );
+    }
+
+    #[test]
+    fn tier_default_stays_in_an_answered_authoritative_catalog() {
+        let reg = make_tiered(&[("alpha", ModelTier::Strong)]);
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Weak),
+            Some("copilot/alpha".into())
+        );
+    }
+
+    #[test]
+    fn spec_for_tier_ignores_discovery_list_order() {
+        let models = [
+            ("zeta", ModelTier::Strong),
+            ("alpha", ModelTier::Strong),
+            ("mid", ModelTier::Medium),
+        ];
+        let mut reversed = models;
+        reversed.reverse();
+
+        assert_eq!(
+            make_tiered(&models).spec_for_tier("copilot", ModelTier::Strong),
+            make_tiered(&reversed).spec_for_tier("copilot", ModelTier::Strong)
+        );
+    }
+
+    #[test]
+    fn tier_for_prefers_strongest_over_multi_tier_spec() {
+        let mut reg = make_map(&[], &[]);
+        reg.set("ollama/multi".into(), ModelTier::Medium);
+        reg.set("ollama/multi".into(), ModelTier::Strong);
+        reg.set("ollama/multi".into(), ModelTier::Compaction);
+        reg.set("ollama/compact-only".into(), ModelTier::Compaction);
+
+        let t = |spec| reg.tier_for(spec, "ollama", None);
+
+        assert_eq!(t("ollama/multi"), ModelTier::Strong);
+        assert_eq!(t("ollama/compact-only"), ModelTier::Compaction);
+    }
+
+    #[test]
+    fn resolve_tier_override_beats_the_scoped_provider() {
+        let reg = make_map(&[(ModelTier::Weak, "zai/glm-5")], &["big", "mid", "small"]);
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Weak),
+            Some("zai/glm-5".into())
+        );
+    }
+
+    /// `spec_for_tier` is provider-scoped: an override with another provider is
+    /// invisible to a different provider's lookup.
+    #[test]
+    fn spec_for_tier_is_provider_scoped() {
+        let reg = make_map(
+            &[(ModelTier::Strong, "ollama/custom")],
+            &["big", "mid", "small"],
+        );
+        let s = |t| reg.spec_for_tier("ollama", t);
+
+        assert_eq!(s(ModelTier::Strong), Some("ollama/custom".into()));
+        assert_eq!(s(ModelTier::Medium), Some("ollama/mid".into()));
+        assert_eq!(s(ModelTier::Weak), Some("ollama/small".into()));
+
+        let scoped = make_map(&[(ModelTier::Strong, "openai/gpt-foo")], &[]);
+        assert_eq!(scoped.spec_for_tier("ollama", ModelTier::Strong), None);
+
+        let conflict = make_map(&[(ModelTier::Weak, "ollama/big")], &["big", "mid", "small"]);
+        assert_eq!(conflict.spec_for_tier("ollama", ModelTier::Strong), None);
+    }
+
+    #[test]
+    fn discovered_looks_up_by_id() {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models(
+            "llama-cpp",
+            vec![
+                ModelInfo::id_only("model-a".into()),
+                ModelInfo {
+                    context_window: Some(128_000),
+                    ..ModelInfo::id_only("model-b".into())
+                },
+            ],
+        );
+        let info = reg.discovered("llama-cpp", "model-b").unwrap();
+        assert_eq!(info.context_window, Some(128_000));
+        assert!(reg.discovered("llama-cpp", "model-x").is_none());
+        assert!(reg.discovered("ollama", "model-a").is_none());
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(TIERS_FILE);
+
+        assert!(read_overrides(&path).is_empty());
+
+        let mut m = BTreeMap::new();
+        m.insert(ModelTier::Strong, "ollama/qwen3".into());
+        m.insert(ModelTier::Medium, "ollama/qwen3:8b".into());
+        write_overrides(&path, &m);
+
+        let loaded = read_overrides(&path);
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3:8b");
+    }
+
+    #[test]
+    fn persistence_handles_missing_or_invalid_input() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_overrides(&tmp.path().join("does-not-exist")).is_empty());
+
+        for bad in [
+            b"".as_slice(),
+            b"   \n".as_slice(),
+            b"not json at all".as_slice(),
+        ] {
+            let path = tmp.path().join(TIERS_FILE);
+            std::fs::write(&path, bad).unwrap();
+            assert!(read_overrides(&path).is_empty());
+        }
+    }
+
+    #[test]
+    fn unset_removes_matching_override() {
+        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        reg.unset("ollama/a", ModelTier::Strong);
+        assert!(!reg.has_override("ollama/a", ModelTier::Strong));
+        assert!(reg.overrides.is_empty());
+    }
+
+    #[test]
+    fn unset_ignores_mismatched_spec() {
+        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        reg.unset("ollama/b", ModelTier::Strong);
+        assert!(reg.has_override("ollama/a", ModelTier::Strong));
+    }
+
+    #[test]
+    fn unset_ignores_mismatched_tier() {
+        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        reg.unset("ollama/a", ModelTier::Weak);
+        assert!(reg.has_override("ollama/a", ModelTier::Strong));
+    }
+
+    #[test]
+    fn has_override_returns_false_for_no_override() {
+        let reg = make_map(&[], &[]);
+        assert!(!reg.has_override("ollama/a", ModelTier::Strong));
+    }
+
+    #[test]
+    fn backwards_compat_reads_legacy_format() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(TIERS_FILE);
+        let legacy = r#"{"ollama/a": "strong", "ollama/b": "strong", "ollama/c": "weak"}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = read_overrides(&path);
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/b");
+        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/c");
+    }
+
+    #[test]
+    fn write_then_read_preserves_multi_tier_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(TIERS_FILE);
+
+        let mut m = BTreeMap::new();
+        m.insert(ModelTier::Strong, "ollama/qwen3".into());
+        m.insert(ModelTier::Medium, "ollama/qwen3".into());
+        m.insert(ModelTier::Weak, "ollama/qwen3:8b".into());
+        write_overrides(&path, &m);
+
+        let loaded = read_overrides(&path);
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+    }
+
+    const SESSION_SLUG: &str = "mybox";
+    const DECLARED_ID: &str = "declared";
+    const DECLARED_SPEC: &str = "mybox/declared";
+    const SESSION_DECLARED: &[(&str, &str)] = &[(SESSION_SLUG, DECLARED_ID)];
+    const BUILTIN_SLUG: &str = "anthropic";
+
+    fn declare_compaction(reg: &mut ModelRegistry, entries: &[(&str, &str)]) {
+        for &(slug, id) in entries {
+            reg.declared
+                .entry(slug.to_owned())
+                .or_default()
+                .insert(ModelTier::Compaction, id.to_owned());
+        }
+    }
+
+    fn tiered_models(ids: &[&str], tier: Option<ModelTier>) -> Vec<ModelInfo> {
+        ids.iter()
+            .map(|id| ModelInfo {
+                tier,
+                ..ModelInfo::id_only(id.to_string())
+            })
+            .collect()
+    }
+
+    #[test_case(&[(ModelTier::Compaction, "zai/glm-5")], &[], SESSION_DECLARED, Some("zai/glm-5") ; "override_beats_declared")]
+    #[test_case(&[], &[], &[("abox", "a"), (SESSION_SLUG, DECLARED_ID)], Some(DECLARED_SPEC) ; "session_provider_declared_beats_another_providers")]
+    #[test_case(&[], &["listed"], SESSION_DECLARED, None ; "discovered_listing_beats_declared")]
+    #[test_case(&[(ModelTier::Strong, DECLARED_SPEC)], &[], SESSION_DECLARED, None ; "declared_model_claimed_by_another_tier")]
+    fn resolve_tier_precedence(
+        overrides: &[(ModelTier, &str)],
+        listed: &[&str],
+        declared: &[(&str, &str)],
+        expected: Option<&str>,
+    ) {
+        let mut reg = make_map(overrides, &[]);
+        declare_compaction(&mut reg, declared);
+        if !listed.is_empty() {
+            reg.set_known_models(SESSION_SLUG, tiered_models(listed, None));
+        }
+        assert_eq!(
+            reg.resolve_tier(Some(SESSION_SLUG), ModelTier::Compaction),
+            expected.map(String::from)
+        );
+    }
+
+    #[test_case(&["mbox", "nbox"], &[("zbox", "z"), ("abox", "a")], "abox/a" ; "declared_slug_first")]
+    #[test_case(&["nbox", "mbox"], &[("zbox", "z")], "mbox/m" ; "discovered_slug_first")]
+    fn any_provider_walk_is_slug_ordered(
+        discovered: &[&str],
+        declared: &[(&str, &str)],
+        expected: &str,
+    ) {
+        let mut reg = ModelRegistry::default();
+        declare_compaction(&mut reg, declared);
+        for slug in discovered {
+            reg.set_known_models(slug, tiered_models(&["m"], Some(ModelTier::Compaction)));
+        }
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Compaction),
+            Some(expected.into())
+        );
+    }
+
+    /// Declarations are stored before plugins register their slugs, so the
+    /// lookup itself has to keep a registered provider on its own table.
+    #[test]
+    fn declarations_never_shadow_a_registered_provider() {
+        let mut reg = ModelRegistry::default();
+        declare_compaction(&mut reg, &[(BUILTIN_SLUG, DECLARED_ID)]);
+        assert_eq!(reg.spec_for_tier(BUILTIN_SLUG, ModelTier::Compaction), None);
+    }
+}

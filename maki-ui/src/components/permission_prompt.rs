@@ -1,0 +1,822 @@
+use std::collections::VecDeque;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_config::ToolKey;
+use maki_config::project::TrustState;
+
+use crate::components::Overlay;
+use crate::components::form::{FORM_WRAP, render_form};
+use crate::components::hint_line;
+use crate::components::is_ctrl;
+use crate::components::{Caret, field_line, painted_caret};
+use crate::text_buffer::TextBuffer;
+use crate::theme;
+
+const HINT_ALLOW_ROW: &[(&str, &str)] = &[
+    ("y", "Allow"),
+    ("a", "Always (project)"),
+    ("A", "Always (all projects)"),
+    ("s", "Session"),
+];
+const HINT_DENY_ROW: &[(&str, &str)] = &[
+    ("n", "Deny"),
+    ("d", "Deny-always (project)"),
+    ("D", "Deny-always (all)"),
+];
+
+// An untrusted folder keeps its project answers in memory, so the rows say
+// what the answer really does instead of promising a saved rule.
+const HINT_ALLOW_ROW_UNTRUSTED: &[(&str, &str)] = &[
+    ("y", "Allow"),
+    ("a", "Project (this session)"),
+    ("A", "Always (all projects, saved)"),
+    ("s", "Session"),
+];
+const HINT_DENY_ROW_UNTRUSTED: &[(&str, &str)] = &[
+    ("n", "Deny"),
+    ("d", "Deny project (this session)"),
+    ("D", "Deny-always (all, saved)"),
+];
+const UNTRUSTED_NOTICE: &str = "folder not trusted, project answers last for this session only";
+/// Nothing is written into a folder the user declined, so the answer that
+/// survives a restart is the global one and the prompt has to name it.
+const UNTRUSTED_DURABLE_ANSWER: &str = "use D to save a deny that outlives this session";
+const TRUST_TO_SAVE_NOTICE: &str =
+    "/trust saves later project answers here, this folder has no .maki files to load";
+
+const CONFIRM_ALLOW_PROJECT_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm allow-always (project)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_ALLOW_ALL_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm allow-always (all projects)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_SESSION_HINTS: &[(&str, &str)] =
+    &[("Enter / y", "Confirm allow (session)"), ("any", "Cancel")];
+const CONFIRM_DENY_PROJECT_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm deny-always (project)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_DENY_ALL_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm deny-always (all projects)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_ALLOW_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm allow (project, this session)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm deny (project, this session)"),
+    ("any", "Cancel"),
+];
+
+const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
+const QUEUED_NOTICE: &str = "more request(s) waiting";
+
+fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut col_widths = vec![0usize; max_cols];
+    for row in rows {
+        for (i, (key, desc)) in row.iter().enumerate() {
+            let cell_len = key.len() + 1 + desc.len();
+            col_widths[i] = col_widths[i].max(cell_len);
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let mut spans = Vec::with_capacity(row.len() * 2);
+            for (i, (key, desc)) in row.iter().enumerate() {
+                spans.push(Span::styled(format!("  {key}"), t.keybind_key));
+                let cell_len = key.len() + 1 + desc.len();
+                let pad = if i + 1 < row.len() {
+                    col_widths[i].saturating_sub(cell_len)
+                } else {
+                    0
+                };
+                spans.push(Span::styled(
+                    format!(" {desc}{:width$}", "", width = pad),
+                    t.tool_dim,
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PromptState {
+    #[default]
+    Normal,
+    ConfirmAllowAlwaysProject,
+    ConfirmAllowAlwaysGlobal,
+    ConfirmAllowSession,
+    ConfirmDenyAlwaysProject,
+    ConfirmDenyAlwaysGlobal,
+    DenyEditing,
+}
+
+/// Where a project answer lands, which decides what the rows promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAnswers {
+    Saved,
+    /// Untrusted, and `/trust` would load nothing. Only here may the prompt
+    /// suggest it, because anywhere else that yes runs the repository's code.
+    SessionUntilTrusted,
+    SessionOnly,
+}
+
+impl ProjectAnswers {
+    pub fn new(project_trusted: bool, trust: &TrustState) -> Self {
+        match (project_trusted, trust) {
+            (true, _) => Self::Saved,
+            (false, TrustState::Vacant(_)) => Self::SessionUntilTrusted,
+            (false, _) => Self::SessionOnly,
+        }
+    }
+}
+
+struct Request {
+    id: String,
+    tool: ToolKey,
+    scopes: Vec<String>,
+    subagent_id: Option<String>,
+    allow_scopes: Vec<String>,
+    project_answers: ProjectAnswers,
+    /// Set when a plugin escalated the call, so the user sees why they are
+    /// asked about a call their rules might have let through.
+    reason: Option<String>,
+}
+
+/// An answer carries the ask it settles: the agent only accepts one naming the
+/// request it is parked on, and the ask on screen is not always the last one in.
+#[derive(Debug)]
+pub struct AnsweredRequest {
+    pub id: String,
+    pub subagent_id: Option<String>,
+    pub answer: PermissionAnswer,
+}
+
+/// Where the deny field's caret sits in the prompt's lines, before wrapping.
+struct FieldCaret {
+    row: usize,
+    caret: Caret,
+}
+
+/// Every request parks a tool call until it is answered, so asks that arrive
+/// while one is on screen queue up behind it instead of replacing it.
+pub struct PermissionPrompt {
+    /// The front is the one on screen; `state` and `buffer` belong to it and
+    /// reset whenever it leaves.
+    queue: VecDeque<Request>,
+    state: PromptState,
+    buffer: TextBuffer,
+}
+
+impl Overlay for PermissionPrompt {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
+    fn is_open(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    fn is_modal(&self) -> bool {
+        false
+    }
+
+    /// Only reached by a cancel or a session reset, and the prompt takes every
+    /// key while it holds an ask, so neither runs over one: an ask from a task
+    /// that outlives them would wait on an answer that never comes.
+    fn close(&mut self) {
+        self.queue.clear();
+        self.reset_entry();
+    }
+}
+
+impl PermissionPrompt {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            state: PromptState::Normal,
+            buffer: TextBuffer::new(String::new()),
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        id: String,
+        tool: ToolKey,
+        scopes: Vec<String>,
+        subagent_id: Option<String>,
+        project_answers: ProjectAnswers,
+        reason: Option<String>,
+    ) {
+        let allow_scopes = generalized_scopes(&tool, &scopes);
+        let allow_scopes = if allow_scopes == scopes {
+            vec![]
+        } else {
+            allow_scopes
+        };
+        self.queue.push_back(Request {
+            id,
+            tool,
+            scopes,
+            subagent_id,
+            allow_scopes,
+            project_answers,
+            reason,
+        });
+    }
+
+    fn reset_entry(&mut self) {
+        self.state = PromptState::Normal;
+        self.buffer = TextBuffer::new(String::new());
+    }
+
+    /// A cancelled subagent has nothing left to answer with, so its asks leave
+    /// with it instead of parking the panel on a dead tool call.
+    pub fn drop_subagent(&mut self, subagent_id: &str) {
+        let owns = |request: &Request| request.subagent_id.as_deref() == Some(subagent_id);
+        if self.queue.front().is_some_and(owns) {
+            self.reset_entry();
+        }
+        self.queue.retain(|request| !owns(request));
+    }
+
+    pub(crate) fn is_asking(&self, id: &str) -> bool {
+        self.queue.iter().any(|request| request.id == id)
+    }
+
+    pub(crate) fn tool(&self) -> Option<&ToolKey> {
+        self.queue.front().map(|request| &request.tool)
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<AnsweredRequest> {
+        let answer = self.key_answer(key)?;
+        let request = self.queue.pop_front()?;
+        self.reset_entry();
+        Some(AnsweredRequest {
+            id: request.id,
+            subagent_id: request.subagent_id,
+            answer,
+        })
+    }
+
+    fn key_answer(&mut self, key: KeyEvent) -> Option<PermissionAnswer> {
+        if !self.is_open() {
+            return None;
+        }
+        let (state, buffer) = (&mut self.state, &mut self.buffer);
+        if is_ctrl(&key) && key.code == KeyCode::Char('c') {
+            return Some(PermissionAnswer::Deny);
+        }
+        if *state == PromptState::DenyEditing {
+            return match key.code {
+                KeyCode::Enter => {
+                    let text = buffer.value().trim().to_string();
+                    if text.is_empty() {
+                        Some(PermissionAnswer::Deny)
+                    } else {
+                        Some(PermissionAnswer::DenyWithGuidance(text))
+                    }
+                }
+                KeyCode::Esc => {
+                    *buffer = TextBuffer::new(String::new());
+                    *state = PromptState::Normal;
+                    None
+                }
+                _ => {
+                    buffer.handle_key(key);
+                    None
+                }
+            };
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        let confirm_answer = match *state {
+            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject),
+            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal),
+            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession),
+            PromptState::ConfirmDenyAlwaysProject => Some(PermissionAnswer::DenyAlwaysProject),
+            PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
+            _ => None,
+        };
+        if let Some(answer) = confirm_answer {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => Some(answer),
+                _ => {
+                    *state = PromptState::Normal;
+                    None
+                }
+            };
+        }
+        match key.code {
+            KeyCode::Char('y') => Some(PermissionAnswer::AllowOnce),
+            KeyCode::Char('n') => {
+                *state = PromptState::DenyEditing;
+                None
+            }
+            KeyCode::Char('a') => {
+                *state = PromptState::ConfirmAllowAlwaysProject;
+                None
+            }
+            KeyCode::Char('A') => {
+                *state = PromptState::ConfirmAllowAlwaysGlobal;
+                None
+            }
+            KeyCode::Char('d') => {
+                *state = PromptState::ConfirmDenyAlwaysProject;
+                None
+            }
+            KeyCode::Char('D') => {
+                *state = PromptState::ConfirmDenyAlwaysGlobal;
+                None
+            }
+            KeyCode::Char('s') => {
+                *state = PromptState::ConfirmAllowSession;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Only the deny editor has a place for {text}, anywhere else it is
+    /// dropped.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.state == PromptState::DenyEditing {
+            self.buffer.insert_text(text);
+        }
+    }
+
+    fn build_lines(&self) -> Vec<Line<'static>> {
+        self.build_lines_with_caret().0
+    }
+
+    fn build_lines_with_caret(&self) -> (Vec<Line<'static>>, Option<FieldCaret>) {
+        let Some(Request {
+            tool,
+            scopes,
+            subagent_id,
+            allow_scopes,
+            project_answers,
+            reason,
+            ..
+        }) = self.queue.front()
+        else {
+            return (vec![], None);
+        };
+        let (state, buffer) = (&self.state, &self.buffer);
+        let t = theme::current();
+        let label_style = t.tool_dim;
+        let value_style = Style::new().fg(t.foreground);
+
+        let mut tool_spans = vec![Span::raw("  "), Span::styled("tool  ", label_style)];
+        if subagent_id.is_some() {
+            tool_spans.push(Span::styled("[subtask] ", t.item_desc));
+        }
+        tool_spans.push(Span::styled(tool.to_string(), value_style));
+
+        let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        if let Some(reason) = reason {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("why   ", label_style),
+                Span::styled(reason.clone(), value_style),
+            ]));
+        }
+        let waiting = self.queue.len() - 1;
+        if waiting > 0 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("queue ", label_style),
+                Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
+            ]));
+        }
+        for (i, s) in scopes.iter().enumerate() {
+            let label = if i == 0 { "scope " } else { "    + " };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label, label_style),
+                Span::styled(s.clone(), value_style),
+            ]));
+        }
+
+        if !allow_scopes.is_empty() {
+            for (i, g) in allow_scopes.iter().enumerate() {
+                let label = if i == 0 { "allow " } else { "    + " };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(label, label_style),
+                    Span::styled(g.clone(), value_style),
+                ]));
+            }
+        }
+
+        let mut field = None;
+        if *state == PromptState::DenyEditing {
+            let (text, cursor_byte, tail_style) = if buffer.value().is_empty() {
+                (DEFAULT_DENY_GUIDANCE, 0, t.input_placeholder)
+            } else {
+                (buffer.value(), buffer.cursor_byte(), Style::default())
+            };
+            let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
+            let (line, caret) =
+                field_line(prefix, text, cursor_byte, tail_style.reversed(), tail_style);
+            field = Some(FieldCaret {
+                row: lines.len(),
+                caret,
+            });
+            lines.push(line);
+        }
+
+        let saved = *project_answers == ProjectAnswers::Saved;
+        let notices: &[&'static str] = match project_answers {
+            ProjectAnswers::Saved => &[],
+            ProjectAnswers::SessionUntilTrusted => &[UNTRUSTED_NOTICE, TRUST_TO_SAVE_NOTICE],
+            ProjectAnswers::SessionOnly => &[UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER],
+        };
+        for &notice in notices {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(notice, t.tool_dim),
+            ]));
+        }
+
+        lines.push(Line::raw(""));
+        match *state {
+            PromptState::ConfirmAllowAlwaysProject => {
+                lines.push(hint_line(if saved {
+                    CONFIRM_ALLOW_PROJECT_HINTS
+                } else {
+                    CONFIRM_ALLOW_PROJECT_SESSION_HINTS
+                }));
+            }
+            PromptState::ConfirmAllowAlwaysGlobal => {
+                lines.push(hint_line(CONFIRM_ALLOW_ALL_HINTS));
+            }
+            PromptState::ConfirmAllowSession => {
+                lines.push(hint_line(CONFIRM_SESSION_HINTS));
+            }
+            PromptState::ConfirmDenyAlwaysProject => {
+                lines.push(hint_line(if saved {
+                    CONFIRM_DENY_PROJECT_HINTS
+                } else {
+                    CONFIRM_DENY_PROJECT_SESSION_HINTS
+                }));
+            }
+            PromptState::ConfirmDenyAlwaysGlobal => {
+                lines.push(hint_line(CONFIRM_DENY_ALL_HINTS));
+            }
+            PromptState::DenyEditing => {
+                lines.push(hint_line(DENY_GUIDANCE_HINTS));
+            }
+            PromptState::Normal => {
+                let rows: &[&[(&str, &str)]] = if saved {
+                    &[HINT_ALLOW_ROW, HINT_DENY_ROW]
+                } else {
+                    &[HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                };
+                lines.extend(aligned_hint_rows(rows));
+            }
+        }
+        lines.push(Line::raw(""));
+        (lines, field)
+    }
+
+    /// Returns the cell the deny field painted its caret in. The row comes
+    /// from how far the lines above it wrap, and the cell is reported only if
+    /// the frame really holds the caret there.
+    pub fn view(&self, frame: &mut Frame, area: Rect) -> Option<Position> {
+        if !self.is_open() {
+            return None;
+        }
+        let (lines, field) = self.build_lines_with_caret();
+        let lines_above = field
+            .as_ref()
+            .map(|field| lines[..field.row].to_vec())
+            .unwrap_or_default();
+        let t = theme::current();
+        let inner = render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        let field = field?;
+        let rows_above = Paragraph::new(lines_above)
+            .wrap(FORM_WRAP)
+            .line_count(inner.width);
+        painted_caret(frame.buffer_mut(), inner, &field.caret, rows_above)
+    }
+
+    pub fn height(&self, width: u16) -> u16 {
+        let inner_width = width.saturating_sub(2);
+        let lines = self.build_lines();
+        let para = Paragraph::new(lines).wrap(FORM_WRAP);
+        para.line_count(inner_width) as u16 + 2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use maki_agent::permissions::PermissionAnswer;
+    use maki_config::ToolKey;
+    use maki_config::project::{TrustQuestion, TrustState};
+    use maki_storage::trusted_folders::CanonicalFolder;
+    use test_case::test_case;
+
+    use super::{
+        CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
+        ProjectAnswers, PromptState, QUEUED_NOTICE, TRUST_TO_SAVE_NOTICE, UNTRUSTED_DURABLE_ANSWER,
+        UNTRUSTED_NOTICE,
+    };
+
+    const MAIN_ID: &str = "id";
+    const SUB_ID: &str = "id-2";
+    const SUB_AGENT: &str = "sub-2";
+
+    fn open_with(prompt: &mut PermissionPrompt, project_answers: ProjectAnswers) {
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            project_answers,
+            None,
+        );
+    }
+
+    fn push_subagent_ask(prompt: &mut PermissionPrompt) {
+        prompt.push(
+            SUB_ID.into(),
+            ToolKey::native("read"),
+            vec!["/tmp/x".into()],
+            Some(SUB_AGENT.into()),
+            ProjectAnswers::Saved,
+            None,
+        );
+    }
+
+    /// Most tests only care about the answer, not the ask it came back with.
+    fn answer(prompt: &mut PermissionPrompt, key: KeyEvent) -> Option<PermissionAnswer> {
+        prompt.handle_key(key).map(|answered| answered.answer)
+    }
+
+    fn open_prompt() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        open_with(&mut prompt, ProjectAnswers::Saved);
+        prompt
+    }
+
+    fn rendered(prompt: &PermissionPrompt) -> String {
+        prompt
+            .build_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ctrl_c_denies() {
+        let mut prompt = open_prompt();
+        assert_eq!(answer(&mut prompt, ctrl_c()), Some(PermissionAnswer::Deny));
+        // Also test from editing state
+        let mut prompt2 = open_prompt();
+        prompt2.handle_key(key(KeyCode::Char('n')));
+        prompt2.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(answer(&mut prompt2, ctrl_c()), Some(PermissionAnswer::Deny));
+    }
+
+    #[test]
+    fn n_goes_to_deny_editing() {
+        let mut prompt = open_prompt();
+        assert_eq!(answer(&mut prompt, key(KeyCode::Char('n'))), None);
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+    }
+
+    #[test]
+    fn deny_editing_esc_returns_to_normal() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(answer(&mut prompt, key(KeyCode::Esc)), None);
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert!(prompt.buffer.value().is_empty());
+    }
+
+    #[test]
+    fn deny_editing_enter_empty_sends_deny() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Enter)),
+            Some(PermissionAnswer::Deny)
+        );
+    }
+
+    #[test]
+    fn deny_editing_with_text_sends_guidance() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_paste("Use cat");
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Enter)),
+            Some(PermissionAnswer::DenyWithGuidance("Use cat".into()))
+        );
+    }
+
+    #[test]
+    fn handle_paste_lands_only_in_the_deny_editor() {
+        let mut prompt = open_prompt();
+        prompt.handle_paste("dropped");
+        assert_eq!(prompt.buffer.value(), "");
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_paste("accepted");
+        assert_eq!(prompt.buffer.value(), "accepted");
+    }
+
+    #[test]
+    fn wildcard_tool_key_opens() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::Wildcard,
+            vec![],
+            None,
+            ProjectAnswers::Saved,
+            None,
+        );
+        assert!(prompt.is_open());
+    }
+
+    /// Parallel subagents each park a tool call on their own ask. An ask that
+    /// lands while another is on screen has to wait its turn, not replace it:
+    /// the replaced one would never be answered and its tool call would hang.
+    #[test]
+    fn a_second_request_waits_behind_the_one_on_screen() {
+        let mut prompt = open_prompt();
+        push_subagent_ask(&mut prompt);
+
+        assert!(rendered(&prompt).contains(QUEUED_NOTICE));
+
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_paste("main only");
+        let first = prompt.handle_key(key(KeyCode::Enter)).expect("an answer");
+        assert_eq!(first.id, MAIN_ID);
+        assert_eq!(first.subagent_id, None);
+        assert_eq!(
+            first.answer,
+            PermissionAnswer::DenyWithGuidance("main only".into())
+        );
+
+        assert!(prompt.is_open(), "the queued ask takes the panel");
+        assert!(!rendered(&prompt).contains(QUEUED_NOTICE));
+
+        // 'y' only answers if the half-typed deny left with the ask it was typed
+        // for, otherwise it is still landing in the buffer.
+        let second = prompt
+            .handle_key(key(KeyCode::Char('y')))
+            .expect("an answer");
+        assert_eq!(second.id, SUB_ID);
+        assert_eq!(second.subagent_id.as_deref(), Some(SUB_AGENT));
+        assert_eq!(second.answer, PermissionAnswer::AllowOnce);
+        assert!(!prompt.is_open());
+    }
+
+    #[test]
+    fn a_cancelled_subagent_takes_its_request_with_it() {
+        let mut prompt = PermissionPrompt::new();
+        push_subagent_ask(&mut prompt);
+        open_with(&mut prompt, ProjectAnswers::Saved);
+        prompt.handle_key(key(KeyCode::Char('n')));
+
+        prompt.drop_subagent(SUB_AGENT);
+
+        let answered = prompt
+            .handle_key(key(KeyCode::Char('y')))
+            .expect("the ask behind it moves up with a clean entry state");
+        assert_eq!(answered.id, MAIN_ID);
+        assert!(!prompt.is_open());
+    }
+
+    /// The always-answers are scoped to the project, and the hint has to say so
+    /// before the user commits to one. In an untrusted folder the answer only
+    /// holds for the session, and the hint says that instead.
+    #[test_case(KeyCode::Char('a'), ProjectAnswers::Saved, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_HINTS ; "allow_always")]
+    #[test_case(KeyCode::Char('d'), ProjectAnswers::Saved, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_HINTS ; "deny_always")]
+    #[test_case(KeyCode::Char('a'), ProjectAnswers::SessionOnly, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_SESSION_HINTS ; "allow_always_untrusted")]
+    #[test_case(KeyCode::Char('d'), ProjectAnswers::SessionOnly, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_SESSION_HINTS ; "deny_always_untrusted")]
+    fn project_answers_confirm_before_they_apply(
+        code: KeyCode,
+        project_answers: ProjectAnswers,
+        expected: PromptState,
+        hints: &[(&str, &str)],
+    ) {
+        let mut prompt = PermissionPrompt::new();
+        open_with(&mut prompt, project_answers);
+
+        assert_eq!(answer(&mut prompt, key(code)), None);
+
+        assert_eq!(prompt.state, expected);
+        let text = rendered(&prompt);
+        assert!(text.contains(hints[0].1), "hint missing from: {text}");
+    }
+
+    /// The project answers stay on the screen in an untrusted folder, so the
+    /// prompt has to say how long they last and what would make them stick.
+    #[test_case(ProjectAnswers::Saved, &[] ; "trusted_folder_says_nothing")]
+    #[test_case(ProjectAnswers::SessionOnly, &[UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER] ; "untrusted_folder_warns")]
+    #[test_case(ProjectAnswers::SessionUntilTrusted, &[UNTRUSTED_NOTICE, TRUST_TO_SAVE_NOTICE] ; "vacant_folder_points_at_trust")]
+    fn untrusted_folder_notice_follows_trust(project_answers: ProjectAnswers, expected: &[&str]) {
+        let mut prompt = PermissionPrompt::new();
+        open_with(&mut prompt, project_answers);
+
+        let text = rendered(&prompt);
+        for notice in [
+            UNTRUSTED_NOTICE,
+            UNTRUSTED_DURABLE_ANSWER,
+            TRUST_TO_SAVE_NOTICE,
+        ] {
+            assert_eq!(
+                text.contains(notice),
+                expected.contains(&notice),
+                "{notice:?} in: {text}"
+            );
+        }
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Char('a'))),
+            None,
+            "the project answer stays available either way"
+        );
+    }
+
+    /// Only a folder with nothing to load may point at `/trust`. Anywhere else
+    /// that yes runs repository code the card already asked about, a declined
+    /// folder included.
+    #[test_case(true, |_| TrustState::Inert, ProjectAnswers::Saved ; "trusted_project_saves")]
+    #[test_case(false, TrustState::Vacant, ProjectAnswers::SessionUntilTrusted ; "vacant_points_at_trust")]
+    #[test_case(false, TrustState::Unanswered, ProjectAnswers::SessionOnly ; "unanswered")]
+    #[test_case(false, TrustState::Declined, ProjectAnswers::SessionOnly ; "declined")]
+    #[test_case(false, |_| TrustState::Inert, ProjectAnswers::SessionOnly ; "inert")]
+    fn project_answers_follow_trust(
+        project_trusted: bool,
+        trust: fn(TrustQuestion) -> TrustState,
+        expected: ProjectAnswers,
+    ) {
+        let folder = CanonicalFolder::resolve(&env::temp_dir()).unwrap();
+        let trust = trust(TrustQuestion::for_folder(&folder));
+
+        assert_eq!(ProjectAnswers::new(project_trusted, &trust), expected);
+    }
+
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const WHY_LABEL: &str = "why";
+
+    #[test_case(Some(ASK_REASON) ; "with_reason")]
+    #[test_case(None ; "without_reason")]
+    fn why_row_follows_reason(reason: Option<&str>) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            ProjectAnswers::Saved,
+            reason.map(str::to_owned),
+        );
+
+        let why_row = prompt.build_lines().iter().find_map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            text.trim_start()
+                .starts_with(WHY_LABEL)
+                .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
+        });
+        assert_eq!(why_row.as_deref(), reason);
+    }
+}

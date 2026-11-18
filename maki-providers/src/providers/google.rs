@@ -1,0 +1,1234 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::TryStreamExt;
+use maki_storage::blocking;
+use maki_storage::id::{MakiId, SessionRef};
+use reqwest::{Client, Request, RequestBuilder};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::warn;
+
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelFamily};
+use crate::provider::{BoxFuture, Provider};
+use crate::providers::Timeouts;
+use crate::providers::aperture::GEMINI_PATH_PREFIX;
+use crate::providers::openai_compat::assistant_response;
+use crate::spec::{
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    sends_as_chosen,
+};
+use crate::{
+    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
+};
+
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, http_client, ok_sse, ok_text};
+
+pub(crate) const SLUG: &str = "google";
+const DISPLAY_NAME: &str = "Google";
+const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const ENV_VAR: &str = "GEMINI_API_KEY";
+const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
+const LOGIN_URL: &str = "https://aistudio.google.com/apikey";
+const FEATURES: &str = "Native Gemini API with thinking support";
+pub(crate) const API_KEY_HEADER: &str = "x-goog-api-key";
+const FLASH_MAX_THINKING: u32 = 24_576;
+const PRO_MAX_THINKING: u32 = 32_768;
+
+/// The generic per-model max, capped by Google's documented `thinkingBudget`
+/// hard limits per family.
+fn max_thinking(model: &Model) -> u32 {
+    let cap = if model.id.contains("flash") {
+        FLASH_MAX_THINKING
+    } else {
+        PRO_MAX_THINKING
+    };
+    model.max_thinking_budget().map_or(cap, |m| m.min(cap))
+}
+
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Gemini,
+    supports_thinking: true,
+    supports_deferred_tools: false,
+    sends_thinking: sends_as_chosen,
+    thinking_fields_fallback: |_| None,
+    accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
+    fallback_max_output: Some(65_536),
+    fallback_context_window: 1_000_000,
+    models_toml: include_str!("../../models/google.toml"),
+    pricing_schedule: None,
+    build: Build::Native(Native {
+        new: create,
+        with_auth: create_with_auth,
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: GEMINI_PATH_PREFIX,
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Google,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Google::new(timeouts)?))
+}
+
+/// Google drops the system prefix and always has. Script providers and Aperture
+/// routing do hand one over, so honouring it now would change what they send.
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    _system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Google::with_auth(auth, timeouts))
+}
+
+inventory::submit!(SPEC.config_row());
+
+fn resolve_google_base_url() -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::resolve_base_url(SLUG, config.get(SLUG))
+}
+
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new(SLUG, vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
+}
+
+pub struct Google {
+    client: Client,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
+    stream_timeout: Duration,
+    /// Env / `providers.toml` / inventory default, resolved once at construction.
+    resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
+}
+
+impl Google {
+    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+        let resolved_base_url = resolve_google_base_url();
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
+        Ok(Self {
+            client: http_client(timeouts),
+            auth: Arc::new(Mutex::new(resolved)),
+            key_pool: Some(pool),
+            stream_timeout: timeouts.stream,
+            resolved_base_url,
+            fallback_base_url: None,
+        })
+    }
+
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<super::ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
+        let resolved_base_url = auth.lock().unwrap().base_url.clone();
+        Self {
+            client: http_client(timeouts),
+            auth,
+            key_pool: None,
+            stream_timeout: timeouts.stream,
+            resolved_base_url,
+            fallback_base_url: None,
+        }
+    }
+
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    fn base_url(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(BASE_URL)
+            .to_string()
+    }
+
+    fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        self.auth.lock().unwrap().finish(builder)
+    }
+
+    fn api_key(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.header(API_KEY_HEADER).unwrap_or_default().to_owned()
+    }
+
+    fn stream_url(&self, model_id: &str) -> String {
+        let base = self.base_url();
+        let encoded = super::urlenc(model_id);
+        format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
+    }
+
+    fn models_url(&self) -> String {
+        let base = self.base_url();
+        let key = self.api_key();
+        format!("{base}/models?key={key}&pageSize=1000")
+    }
+
+    fn build_body(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: ThinkingConfig,
+        top_p: Option<f64>,
+    ) -> Value {
+        let mut body = json!({
+            "contents": convert_messages(messages),
+        });
+
+        if !system.is_empty() {
+            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+        }
+
+        thinking.apply_google_thinking(&mut body, model, max_thinking(model));
+
+        if let Some(max_output) = model.output_tokens() {
+            body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
+        }
+
+        let tool_decls = convert_tools(tools);
+        if !tool_defs_empty(&tool_decls) {
+            body["tools"] = json!([{"functionDeclarations": tool_decls}]);
+        }
+
+        body
+    }
+
+    async fn do_stream(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        event_tx: &UnboundedSender<ProviderEvent>,
+        thinking: ThinkingConfig,
+    ) -> Result<StreamResponse, AgentError> {
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
+        let url = self.stream_url(&model.id);
+        let json_body = serde_json::to_vec(&body)?;
+
+        let request = self.finish(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(json_body),
+        )?;
+
+        ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx)
+        })
+        .await
+    }
+}
+
+impl Provider for Google {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
+        opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+        let url = self.models_url();
+        let request = self.finish(self.client.get(&url));
+        let client = self.client.clone();
+        Box::pin(async move {
+            let body_text = ok_text(&client, request?).await?;
+            let models_response: ModelsListResponse = serde_json::from_str(&body_text)?;
+            let mut infos: Vec<crate::model::ModelInfo> = models_response
+                .models
+                .into_iter()
+                .filter(|m| {
+                    m.supported_generation_methods
+                        .iter()
+                        .any(|m| m == "generateContent")
+                })
+                .map(|m| {
+                    let id = m
+                        .name
+                        .strip_prefix("models/")
+                        .map(String::from)
+                        .unwrap_or(m.name);
+                    crate::model::ModelInfo::id_only(id)
+                })
+                .collect();
+            infos.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(infos)
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
+            let pool = blocking(|| KeyPool::resolve(SLUG, ENV_VAR)).await?;
+            *self.auth.lock().unwrap() =
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
+            Ok(())
+        })
+    }
+
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
+    }
+}
+
+fn convert_messages(messages: &[Message]) -> Vec<Value> {
+    let tool_names: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<Value> = Vec::new();
+
+    for msg in messages {
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "model",
+        };
+
+        let mut parts: Vec<Value> = Vec::new();
+        // Gemini is strict about function-response turns: tool-returned
+        // images get their own user turn instead of mixing inlineData into
+        // the functionResponse content.
+        let has_tool_results = msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        let mut image_parts: Vec<Value> = Vec::new();
+
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    parts.push(json!({"text": text}));
+                }
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                    ..
+                } => {
+                    let mut part = json!({"text": thinking, "thought": true});
+                    if let Some(sig) = signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
+                }
+                ContentBlock::RedactedThinking { .. } | ContentBlock::Unknown(_) => {}
+                ContentBlock::ToolUse {
+                    id: _,
+                    name,
+                    input,
+                    thought_signature,
+                } => {
+                    let mut part = json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": input,
+                        }
+                    });
+                    if let Some(sig) = thought_signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let parsed = serde_json::from_str::<Value>(content);
+                    let mut response_val = match parsed {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        Ok(other) => json!({"result": other}),
+                        Err(_) => json!({"result": content}),
+                    };
+                    if *is_error {
+                        response_val = json!({"error": response_val});
+                    }
+                    let name = tool_names
+                        .get(tool_use_id.as_str())
+                        .copied()
+                        .unwrap_or("unknown");
+                    parts.push(json!({
+                        "functionResponse": {
+                            "name": name,
+                            "response": response_val,
+                        }
+                    }));
+                }
+                ContentBlock::Image { source } => {
+                    let part = json!({
+                        "inlineData": {
+                            "mimeType": source.media_type.mime(),
+                            "data": source.data,
+                        }
+                    });
+                    if has_tool_results {
+                        image_parts.push(part);
+                    } else {
+                        parts.push(part);
+                    }
+                }
+            }
+        }
+
+        if !parts.is_empty() {
+            out.push(json!({"role": role, "parts": parts}));
+        }
+        if !image_parts.is_empty() {
+            out.push(json!({"role": "user", "parts": image_parts}));
+        }
+    }
+
+    out
+}
+
+fn convert_tools(tools: &Value) -> Vec<Value> {
+    let Some(arr) = tools.as_array() else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let description = t.get("description")?.as_str().unwrap_or("");
+            let mut decl = json!({
+                "name": name,
+                "description": description,
+            });
+            if let Some(parameters) = tool_parameters(t) {
+                decl["parametersJsonSchema"] = parameters;
+            }
+            Some(decl)
+        })
+        .collect()
+}
+
+/// The schema goes out as `parametersJsonSchema`, which takes JSON Schema as
+/// is. The older `parameters` field knows only Gemini's OpenAPI subset and 400s
+/// on every other key (`additionalProperties`, `$schema`, MCP's `x-mcp-header`),
+/// so MCP servers kept tripping it one key at a time.
+///
+/// Gemini turns down an object schema that lists no properties, while MiniMax
+/// turns down a bare `{}`, so no single payload pleases both. A tool that takes
+/// no arguments simply travels here without a schema.
+fn tool_parameters(tool: &Value) -> Option<Value> {
+    let schema = tool.get("input_schema")?;
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    has_properties.then(|| schema.clone())
+}
+
+fn tool_defs_empty(tool_decls: &[Value]) -> bool {
+    tool_decls.is_empty()
+}
+
+// --- SSE response types ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SseCandidate {
+    content: Option<SseContent>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SseContent {
+    parts: Option<Vec<SsePart>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SsePart {
+    text: Option<String>,
+    thought: Option<bool>,
+    thought_signature: Option<String>,
+    function_call: Option<SseFunctionCall>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SseFunctionCall {
+    name: String,
+    args: Option<Value>,
+    #[serde(default)]
+    thought_signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SseUsageMetadata {
+    #[serde(default)]
+    prompt_token_count: u64,
+    #[serde(default)]
+    candidates_token_count: u64,
+    #[serde(default)]
+    thoughts_token_count: u64,
+    #[serde(default)]
+    cached_content_token_count: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SseResponse {
+    candidates: Option<Vec<SseCandidate>>,
+    usage_metadata: Option<SseUsageMetadata>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelsListResponse {
+    models: Vec<ApiModelInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiModelInfo {
+    name: String,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
+}
+
+/// Append `text` to the last block when it is already a `Text`, else push a new
+/// `Text` block. Gemini streams a single assistant message as many small text
+/// parts across SSE chunks; coalescing keeps them as one content block so
+/// session restore renders one `maki>` block instead of one per delta.
+fn push_or_extend_text(blocks: &mut Vec<ContentBlock>, text: String) {
+    if let Some(ContentBlock::Text { text: prev }) = blocks.last_mut() {
+        prev.push_str(&text);
+    } else {
+        blocks.push(ContentBlock::Text { text });
+    }
+}
+
+/// Same as `push_or_extend_text` for thinking parts. The `thoughtSignature`
+/// arrives on the final thinking delta, so a later signature overwrites an
+/// earlier one; a `Some` on an earlier delta is preserved if the last is None.
+fn push_or_extend_thinking(
+    blocks: &mut Vec<ContentBlock>,
+    text: String,
+    signature: Option<String>,
+) {
+    if let Some(ContentBlock::Thinking {
+        thinking: prev,
+        signature: prev_sig,
+        ..
+    }) = blocks.last_mut()
+    {
+        prev.push_str(&text);
+        if signature.is_some() {
+            *prev_sig = signature;
+        }
+    } else {
+        blocks.push(ContentBlock::Thinking {
+            thinking: text,
+            signature,
+            reasoning_id: None,
+        });
+    }
+}
+
+async fn parse_sse(
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
+) -> Result<StreamResponse, AgentError> {
+    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    let mut usage = TokenUsage::default();
+    let mut stop_reason: Option<StopReason> = None;
+
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data else {
+            continue;
+        };
+
+        let chunk: SseResponse = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "failed to parse Gemini SSE chunk");
+                continue;
+            }
+        };
+
+        if let Some(meta) = chunk.usage_metadata {
+            if let Some(cached) = meta.cached_content_token_count {
+                usage.cache_read = cached;
+            }
+            // Google's prompt count includes cache hits; TokenUsage keeps them separate.
+            usage.input = meta.prompt_token_count.saturating_sub(usage.cache_read);
+            usage.output = meta
+                .candidates_token_count
+                .saturating_add(meta.thoughts_token_count);
+        }
+
+        let Some(candidates) = chunk.candidates else {
+            continue;
+        };
+
+        for candidate in candidates {
+            if let Some(reason) = candidate.finish_reason {
+                stop_reason = Some(StopReason::from_google(&reason)).or(stop_reason);
+            }
+
+            let Some(content) = candidate.content else {
+                continue;
+            };
+            let Some(parts) = content.parts else {
+                continue;
+            };
+
+            for part in parts {
+                if let Some(func_call) = part.function_call {
+                    let id = format!("call_{}_{}", func_call.name, MakiId::generate());
+                    let input = func_call.args.unwrap_or_default();
+                    let thought_signature = func_call.thought_signature.or(part.thought_signature);
+                    event_tx.send(ProviderEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: func_call.name.clone(),
+                    })?;
+                    content_blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name: func_call.name,
+                        input,
+                        thought_signature,
+                    });
+                    stop_reason = Some(StopReason::ToolUse);
+                } else if let Some(text) = part.text {
+                    if part.thought.unwrap_or(false) {
+                        if !text.is_empty() {
+                            event_tx.send(ProviderEvent::ThinkingDelta { text: text.clone() })?;
+                        }
+                        push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
+                    } else if !text.is_empty() {
+                        // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
+                        event_tx.send(ProviderEvent::TextDelta { text: text.clone() })?;
+                        push_or_extend_text(&mut content_blocks, text);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(assistant_response(content_blocks, usage, stop_reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorProjection;
+    use crate::model::{ModelPricing, ModelTier};
+    use crate::test_support::sse_body;
+    use std::sync::Arc;
+    use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    const GEMINI_API_KEY: &str = "test-key";
+    const MALFORMED_BASE_URL: &str = "http://[";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const PATH_PROP: &str = "path";
+    const EMPTY_PROPERTIES_REJECTED: &str =
+        "Gemini rejects a function whose parameters is an object with no properties";
+
+    fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
+        )))
+    }
+
+    fn test_timeouts() -> super::super::Timeouts {
+        super::super::Timeouts {
+            connect: Duration::from_secs(5),
+            ..Default::default()
+        }
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "gemini-2.5-flash".into(),
+            provider: Arc::<str>::from("google"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gemini,
+            supports_vision_override: Some(true),
+            supports_fast_override: None,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 1_048_576,
+            thinking_fields: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_on_a_malformed_base_url_is_a_config_error() {
+        let google = Google::with_auth(test_auth(), test_timeouts())
+            .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
+        let error = google.list_models().await.unwrap_err();
+        assert_eq!(error.projection(), ErrorProjection::Config);
+    }
+
+    #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
+    #[test_case(json!({"type": "object"}) ; "missing_properties")]
+    fn convert_tools_omits_empty_parameters(input_schema: Value) {
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": input_schema,
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(decls[0]["name"], json!(TOOL_NAME));
+        assert_eq!(
+            decls[0].get("parametersJsonSchema"),
+            None,
+            "{EMPTY_PROPERTIES_REJECTED}"
+        );
+    }
+
+    #[test]
+    fn convert_tools_sends_input_schema_as_json_schema() {
+        let input_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                PATH_PROP: {"type": "string", "x-mcp-header": "Path"},
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"verbose": {"type": "boolean"}}
+                }
+            },
+            "additionalProperties": false,
+        });
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": input_schema,
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(
+            decls[0],
+            json!({
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parametersJsonSchema": input_schema,
+            })
+        );
+    }
+
+    #[test]
+    fn google_build_body_basic() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let model = test_model();
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &model,
+            &messages,
+            "be helpful",
+            &json!([]),
+            ThinkingConfig::Off,
+            None,
+        );
+
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
+        assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
+    }
+
+    #[test]
+    fn google_build_body_thinking_adaptive() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("think".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            ThinkingConfig::Adaptive,
+            None,
+        );
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+    }
+
+    #[test]
+    fn google_build_body_thinking_budget() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("think hard".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            ThinkingConfig::Budget(8192),
+            None,
+        );
+
+        // Clamped to the model's max thinking budget (half of 8192 output tokens).
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts": true, "thinkingBudget": 4096})
+        );
+    }
+
+    #[test_case("STOP", StopReason::EndTurn ; "stop")]
+    #[test_case("MAX_TOKENS", StopReason::MaxTokens ; "max_tokens")]
+    #[test_case("SAFETY", StopReason::EndTurn ; "safety")]
+    #[test_case("RECITATION", StopReason::EndTurn ; "recitation")]
+    #[test_case("unknown", StopReason::EndTurn ; "unknown")]
+    fn stop_reason_from_google(input: &str, expected: StopReason) {
+        assert_eq!(StopReason::from_google(input), expected);
+    }
+
+    #[test]
+    fn convert_messages_user_and_assistant() {
+        let messages = vec![
+            Message::user("hello".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "hi there".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["role"], "user");
+        assert_eq!(result[0]["parts"][0]["text"], "hello");
+        assert_eq!(result[1]["role"], "model");
+        assert_eq!(result[1]["parts"][0]["text"], "hi there");
+    }
+
+    #[test]
+    fn convert_messages_thinking_block() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "hmm".into(),
+                signature: Some("sig123".into()),
+                reasoning_id: None,
+            }],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result[0]["parts"][0]["text"], "hmm");
+        assert_eq!(result[0]["parts"][0]["thought"], true);
+        assert_eq!(result[0]["parts"][0]["thoughtSignature"], "sig123");
+    }
+
+    #[test]
+    fn convert_messages_tool_use_and_result() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "call_1",
+                    "read_file",
+                    json!({"path": "/tmp/a"}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("call_1", "file contents", false)],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(result[0]["parts"][0]["functionCall"]["name"], "read_file");
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["name"],
+            "read_file"
+        );
+    }
+
+    #[test_case("not json at all", json!({"result": "not json at all"}) ; "non_json_wraps_string")]
+    #[test_case(r#""a json string""#, json!({"result": "a json string"}) ; "json_scalar_wraps")]
+    #[test_case("42", json!({"result": 42}) ; "json_number_wraps")]
+    #[test_case(r#"{"out": "ok"}"#, json!({"out": "ok"}) ; "json_object_passes_through")]
+    fn convert_messages_tool_result_response_is_always_struct(content: &str, expected: Value) {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("call_1", content, false)],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            expected
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_result_error_wraps_response() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("call_1", "boom", true)],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            json!({"error": {"result": "boom"}})
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_use_preserves_thought_signature() {
+        const SIG: &str = "sig-abc";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "/tmp/a"}),
+                thought_signature: Some(SIG.into()),
+            }],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result[0]["parts"][0]["functionCall"]["name"], "read_file");
+        assert_eq!(result[0]["parts"][0]["thoughtSignature"], SIG);
+        assert!(
+            result[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_returned_image_gets_own_user_turn() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::tool_result("call_1", "[image: pic.png 1KB]", false),
+                ContentBlock::Image {
+                    source: crate::ImageSource::new(
+                        crate::ImageMediaType::Png,
+                        std::sync::Arc::from("aGVsbG8="),
+                    ),
+                },
+            ],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result.len(), 2);
+        assert!(result[0]["parts"][0].get("functionResponse").is_some());
+        assert!(result[0]["parts"].as_array().unwrap().len() == 1);
+        assert_eq!(result[1]["role"], "user");
+        assert_eq!(result[1]["parts"][0]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn convert_messages_chat_pasted_image_stays_in_same_turn() {
+        // Split the turn and the question drifts apart from its picture.
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this?".into(),
+                },
+                ContentBlock::Image {
+                    source: crate::ImageSource::new(
+                        crate::ImageMediaType::Webp,
+                        std::sync::Arc::from("aGVsbG8="),
+                    ),
+                },
+            ],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result.len(), 1);
+        let parts = result[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_plain_text() {
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(result.usage.input, 5);
+        assert_eq!(result.usage.output, 10);
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Text { text } if text == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_coalesces_text_deltas_into_one_block() {
+        let event = |text: &str| {
+            format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}]}}}}]}}\n\n",
+                text
+            )
+        };
+        let mut data = String::new();
+        data.push_str(&event("Hello, "));
+        data.push_str(&event("world."));
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(
+            result.message.content.len(),
+            1,
+            "expected one coalesced text block"
+        );
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Text { text } if text == "Hello, world."
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
+        let event = |text: &str, sig: Option<&str>| match sig {
+            Some(s) => format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true,\"thoughtSignature\":\"{}\"}}]}}}}]}}\n\n",
+                text, s
+            ),
+            None => format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true}}]}}}}]}}\n\n",
+                text
+            ),
+        };
+        let mut data = String::new();
+        data.push_str(&event("reasoning... ", None));
+        data.push_str(&event("more.", Some("sig-final")));
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.message.content.len(), 1);
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Thinking { thinking, signature, .. }
+                if thinking == "reasoning... more." && signature.as_deref() == Some("sig-final")
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
+        let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
+        let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
+        let data = format!("data: {payload}\n\n");
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        let ids: Vec<&str> = result
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "expected two tool calls");
+        assert_ne!(ids[0], ids[1], "ids must be unique for parallel calls");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_thinking_part() {
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.usage.output, 50);
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Thinking { thinking, signature, .. } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
+        ));
+        assert!(matches!(
+            &result.message.content[1],
+            ContentBlock::Text { text } if text == "answer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_tool_call() {
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::ToolUse { name, .. } if name == "bash"
+        ));
+    }
+
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}"#
+        ; "part_level"
+    )]
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
+        ; "nested_fallback"
+    )]
+    #[tokio::test]
+    async fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+        const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
+        let payload = format!(
+            r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
+        );
+        let data = format!("data: {payload}\n\n");
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
+        ));
+    }
+
+    #[test_case(None, 100 ; "missing_cache")]
+    #[test_case(Some(0), 100 ; "zero_cache")]
+    #[test_case(Some(50), 50 ; "partially_cached")]
+    #[test_case(Some(100), 0 ; "fully_cached")]
+    #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
+    #[tokio::test]
+    async fn parse_sse_cached_tokens(cached: Option<u64>, expected_input: u64) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.usage.input, expected_input);
+        assert_eq!(result.usage.output, 10);
+        assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
+    }
+
+    #[test_case(None, 50, 50 ; "missing_cache_preserves_previous")]
+    #[test_case(Some(0), 100, 0 ; "zero_cache_clears_previous")]
+    #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
+    #[tokio::test]
+    async fn parse_sse_cached_tokens_across_chunks(
+        cached: Option<u64>,
+        expected_input: u64,
+        expected_cache_read: u64,
+    ) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let initial_metadata = json!({
+            "promptTokenCount": 80,
+            "candidatesTokenCount": 1,
+            "cachedContentTokenCount": 50,
+        });
+        let data = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"usageMetadata": initial_metadata}),
+            json!({"usageMetadata": metadata}),
+        );
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
+        assert_eq!(result.usage.input, expected_input);
+        assert_eq!(result.usage.output, 10);
+        assert_eq!(result.usage.cache_read, expected_cache_read);
+    }
+}
