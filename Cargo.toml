@@ -24,16 +24,13 @@ maki-storage = { workspace = true }
 maki-lua = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
 

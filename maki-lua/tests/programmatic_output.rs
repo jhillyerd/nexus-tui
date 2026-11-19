@@ -1,9 +1,13 @@
+#[cfg(unix)]
 use std::env;
+#[cfg(unix)]
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};

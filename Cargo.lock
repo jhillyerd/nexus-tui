@@ -3259,7 +3259,6 @@ version = "0.7.2"
 dependencies = [
  "clap",
  "color-eyre",
- "futures",
  "libc",
  "maki-agent",
  "maki-config",
@@ -3270,7 +3269,6 @@ dependencies = [
  "open",
  "reqwest",
  "rustix 1.1.6",
- "serde",
  "serde_json",
  "tempfile",
  "test-case",
@@ -3279,7 +3277,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
- "uuid",
 ]
 
 [[package]]
