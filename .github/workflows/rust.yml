@@ -33,10 +33,6 @@ jobs:
             code:
               - "**"
               - "!*.md"
-              - "!site/*"
-              - "!site/docs/*"
-              - "!site/docs/{extra,static,templates}/**"
-              - "!scripts/**"
               - "!flake.*"
               - "!.github/workflows/{claude-review,claude-triage,nix,python,release}.yml"
             deps:
@@ -181,8 +177,6 @@ jobs:
         with:
           tool: just
       - run: just build
-      # Lives here, off the Test critical path, to reuse the warm dev target dir.
-      - run: just gen-docs-check
 
   # Lint and build share little beyond build scripts, so they run as separate jobs.
   windows:

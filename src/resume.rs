@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
-use maki_agent::session::{Resumed, StoredSession};
+use maki_agent::session::StoredSession;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError};
@@ -32,7 +32,6 @@ pub struct Resolved {
     /// it before the run starts, and always spelled the way whoever named it
     /// spelled it, since every `session_id` the run reports is this reference.
     pub id: SessionRef,
-    pub start_type: &'static str,
     /// The right to write [`Self::id`], and nothing else: the session a copy
     /// was read from stays free. A second run on the same session is refused
     /// right here, before any request goes out.
@@ -51,20 +50,9 @@ impl Resolved {
         let claim = SessionClaim::fresh(storage);
         Self {
             id: SessionRef::from(claim.id()),
-            start_type: maki_otel::emit::START_FRESH,
             claim,
             session: None,
         }
-    }
-
-    /// What the agent needs: the transcript, what it measured and the session
-    /// it came out of, under the id the run writes to.
-    pub fn into_resumed(self) -> (Resumed, SessionClaim) {
-        let resumed = match self.session {
-            Some(session) => Resumed::stored(self.id, session),
-            None => Resumed::empty(self.id),
-        };
-        (resumed, self.claim)
     }
 
     /// What the TUI needs: the stored session itself, or a fresh one. Either
@@ -118,13 +106,6 @@ impl Source {
         }
     }
 
-    fn start_type(&self) -> &'static str {
-        match self {
-            Self::Named(_) => maki_otel::emit::START_RESUME,
-            Self::Latest(_) => maki_otel::emit::START_CONTINUE,
-        }
-    }
-
     /// Starting over suits a latest session that is missing or will not
     /// parse. A busy one is intact and just belongs to someone else, and
     /// quietly opening another session would hide that. A session named by id
@@ -145,9 +126,8 @@ impl Source {
 /// transcript *in place*, which is what decides both the start it reports and
 /// the one stored transcript it may write over. A fork answers no by
 /// construction, and so does a `--session-id` naming anything but the session
-/// being resumed, which is why both land on a transcript of their own, report
-/// [`START_FRESH`](maki_otel::emit::START_FRESH), and find the original as off
-/// limits as any other session's.
+/// being resumed, which is why both land on a transcript of their own, start
+/// fresh, and find the original as off limits as any other session's.
 ///
 /// A run claims only the id it writes. The source of a copy is read without a
 /// claim, so another run holding it open does not stop the copy.
@@ -170,7 +150,6 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
                 session.set_cwd(cwd.to_owned());
                 return Ok(Resolved {
                     id,
-                    start_type: source.start_type(),
                     claim,
                     session: Some(session),
                 });
@@ -190,12 +169,7 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
             None
         }
     };
-    Ok(Resolved {
-        id,
-        start_type: maki_otel::emit::START_FRESH,
-        claim,
-        session,
-    })
+    Ok(Resolved { id, claim, session })
 }
 
 /// `--session-id` when given, else the session continued in place, else a
@@ -212,7 +186,6 @@ fn unwritten(id: SessionRef, forking: bool, storage: &StateDir) -> Result<Resolv
     let claim = claim_unused(&id, forking, storage)?;
     Ok(Resolved {
         id,
-        start_type: maki_otel::emit::START_FRESH,
         claim,
         session: None,
     })
@@ -389,18 +362,13 @@ mod tests {
             .len()
     }
 
-    #[test_case(&[], maki_otel::emit::START_FRESH, false ; "no flags is a fresh session")]
-    #[test_case(&["-r", ID_PLACEHOLDER], maki_otel::emit::START_RESUME, true ; "an explicit id resumes")]
-    #[test_case(&["-c"], maki_otel::emit::START_CONTINUE, true ; "continue takes the latest session")]
-    fn flags_pick_a_session_and_a_start_type(
-        args: &[&str],
-        expected_start: &str,
-        expect_history: bool,
-    ) {
+    #[test_case(&[], false ; "no flags is a fresh session")]
+    #[test_case(&["-r", ID_PLACEHOLDER], true ; "an explicit id resumes")]
+    #[test_case(&["-c"], true ; "continue takes the latest session")]
+    fn flags_pick_a_session(args: &[&str], expect_history: bool) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
         let resolved = resolve(&cli(args, stored), &cwd, &storage).expect("flags resolve");
 
-        assert_eq!(resolved.start_type, expected_start);
         if expect_history {
             assert_eq!(resolved.id.id(), stored);
             assert_eq!(user_texts(&resolved), vec![STORED_MESSAGE]);
@@ -457,7 +425,6 @@ mod tests {
         let resolved = resolve(&cli(&["-c"], MakiId::generate()), &cwd, &storage)
             .expect("missing history must not be an error");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
         assert!(resolved.session.is_none());
     }
 
@@ -473,7 +440,6 @@ mod tests {
         )
         .expect("fork resolves");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
         assert_ne!(resolved.id.id(), stored);
         assert_eq!(user_texts(&resolved), vec![STORED_MESSAGE]);
         assert_eq!(
@@ -558,7 +524,6 @@ mod tests {
         )
         .expect("a redirected write target resolves");
 
-        assert_eq!(resolved.start_type, maki_otel::emit::START_FRESH);
         assert_eq!(resolved.id.id(), target);
         assert_eq!(user_texts(&resolved), vec![STORED_MESSAGE]);
         assert_eq!(
@@ -638,35 +603,24 @@ mod tests {
     /// The measured prompt size travels with the messages, or a resumed run
     /// budgets its first request from an estimate.
     #[test]
-    fn into_resumed_carries_the_measured_context_size() {
+    fn the_claim_covers_the_stored_session_it_resumed() {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
-        let (resumed, claim) = resolve(&cli(&["-c"], stored), &cwd, &storage)
-            .expect("continue resolves")
-            .into_resumed();
+        let resolved = resolve(&cli(&["-c"], stored), &cwd, &storage).expect("continue resolves");
+        let claim = resolved.into_session(FRESH_MODEL, &cwd).claim;
         assert_eq!(claim.id(), stored, "the run writes what it claimed");
-
-        assert_eq!(resumed.context_size, CONTEXT_SIZE);
-        assert_eq!(resumed.history.len(), 1);
-        assert_eq!(resumed.id.id(), stored);
-        let session = resumed.session.expect("the loaded session travels along");
-        assert_eq!(session.id, stored);
     }
 
-    /// The tab the TUI opens and the transcript a headless run writes have to
-    /// be the same session, whichever way `Resolved` is consumed.
+    /// The tab the TUI opens and the session id it reports have to be the
+    /// same, whichever way `Resolved` is consumed.
     #[test_case(&[] ; "a fresh session")]
     #[test_case(&["-c"] ; "a continued session")]
     #[test_case(&["-c", "--fork-session"] ; "a fork")]
-    fn both_consumers_agree_on_the_id(args: &[&str]) {
+    fn into_session_agrees_on_the_id(args: &[&str]) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
         let cli = cli(args, stored);
 
         let as_tab = resolve(&cli, &cwd, &storage).expect("resolves");
         let reported = as_tab.id.id();
         assert_eq!(as_tab.into_session(FRESH_MODEL, &cwd).session.id, reported);
-
-        let as_run = resolve(&cli, &cwd, &storage).expect("resolves");
-        let reported = as_run.id.id();
-        assert_eq!(as_run.into_resumed().0.id.id(), reported);
     }
 }

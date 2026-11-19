@@ -18,24 +18,19 @@ workspace = true
 [dependencies]
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
-maki-acp = { workspace = true }
 maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
-maki-otel = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
 
@@ -48,17 +43,13 @@ test-case = { workspace = true }
 
 [workspace]
 members = [
-  "maki-acp",
   "maki-agent",
   "maki-config",
   "maki-config-macro",
-  "maki-docgen",
   "maki-highlight",
-  "maki-interpreter",
   "maki-lua",
   "maki-lua-macro",
   "maki-markdown",
-  "maki-otel",
   "maki-pack",
   "maki-providers",
   "maki-storage",
@@ -78,9 +69,7 @@ rust-version = "1.99"
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
-maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
-maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
@@ -89,7 +78,6 @@ maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
-maki-otel = { path = "maki-otel" }
 maki-pack = { path = "maki-pack" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -149,12 +137,6 @@ socket2 = "0.6"
 aws-config = { version = "1", features = ["credentials-login"] }
 aws-credential-types = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http"] }
-opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
-opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "logs", "grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "http-proto", "http-json", "gzip-http", "reqwest-blocking-client", "reqwest-rustls", "internal-logs"] }
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "with-serde", "metrics", "logs"] }
-http = "1"
-percent-encoding = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
@@ -202,8 +184,6 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1"
-monty = "1"
-monty-types = "1"
 notify = { version = "9.0.0-rc.8", default-features = false, features = ["macos_fsevent"] }
 notify-rust = "4"
 serde-saphyr = { version = "2", default-features = false }
@@ -211,7 +191,6 @@ serde-value = "0.7"
 serde_path_to_error = "0.1"
 indexmap = { version = "2", features = ["serde"] }
 shell-words = "1"
-agent-client-protocol-schema = "1"
 inventory = "0.3"
 
 [profile.bench]

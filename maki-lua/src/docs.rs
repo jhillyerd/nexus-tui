@@ -5,8 +5,8 @@
 //! consts with `maki_lua_macro::lua_table!` / `lua_class!`. The few functions
 //! that cannot fit (raw `MultiValue`, Lua chunks, conditional registration)
 //! and `maki.setup` keep hand-written `FnDoc`s. `api_docs()` aggregates
-//! everything for maki-docgen, and the drift test below asserts docs match
-//! the real `maki` global.
+//! everything, and the drift test below asserts docs match the real `maki`
+//! global.
 
 use crate::plugin_permissions::Permission;
 
@@ -75,7 +75,6 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::fs::DOCS,
         &api::image::DOCS,
         &api::image::IMAGE_DOCS,
-        &api::interpreter::DOCS,
         &api::json::DOCS,
         &api::json::VALIDATOR_DOCS,
         &api::keymap::DOCS,

@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
@@ -233,7 +233,6 @@ pub(crate) async fn stream_with_retry(
         // rewrites on the way out.
         let fitted = model.with_turn_output(budget);
         let model = &fitted;
-        let started = Instant::now();
         let (ptx, prx) = unbounded_channel();
         let forwarder = tokio::spawn({
             let event_tx = event_tx.clone();
@@ -251,7 +250,6 @@ pub(crate) async fn stream_with_retry(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
-                emit_api_request(model, &r, opts, started.elapsed());
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input().min(u32::MAX as u64) as u32);
                 }
@@ -260,7 +258,6 @@ pub(crate) async fn stream_with_retry(
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) => {
                 attempt += 1;
-                emit_api_error(model, &e, attempt, started.elapsed());
                 // Rotation is decided above anything `retry_kind()` says: a
                 // fresh key and a delay cure different problems. A 401 or a 403
                 // is dead for the key that produced it, fine for the next one,
@@ -334,51 +331,6 @@ pub(crate) async fn stream_with_retry(
     }
 }
 
-fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, took: Duration) {
-    if !maki_otel::enabled() {
-        return;
-    }
-    let usage = &r.usage;
-    maki_otel::emit::api_request(&maki_otel::emit::ApiRequest {
-        model: &model.id,
-        provider: &model.provider,
-        input_tokens: usage.input,
-        output_tokens: usage.output,
-        cache_read_tokens: usage.cache_read,
-        cache_creation_tokens: usage.cache_creation,
-        cost_usd: model.billed_cost(usage, opts.fast).unwrap_or(0.0),
-        duration: took,
-        stop_reason: r.stop_reason.map(<&'static str>::from),
-    });
-}
-
-fn emit_api_error(model: &Model, error: &AgentError, attempt: u32, took: Duration) {
-    if !maki_otel::enabled() {
-        return;
-    }
-    maki_otel::emit::api_error(&maki_otel::emit::ApiError {
-        model: &model.id,
-        provider: &model.provider,
-        error: &error_description(error),
-        status_code: match error {
-            AgentError::Api { status, .. } => Some(*status),
-            _ => None,
-        },
-        attempt,
-        duration: took,
-    });
-}
-
-/// A provider's error body is often echoed request content (quoted message
-/// text, masked keys, whatever a gateway returns), so only the status is
-/// reported. Every other variant is generated locally.
-fn error_description(error: &AgentError) -> String {
-    match error {
-        AgentError::Api { status, .. } => format!("API error ({status})"),
-        other => other.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::iter;
@@ -393,7 +345,6 @@ mod tests {
 
     use super::*;
 
-    const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
     const WINDOW: u32 = 262_144;
     /// The shape that started all this: the declared output cap is the whole
     /// window, so "ask for what fits" asks for everything.
@@ -571,14 +522,6 @@ mod tests {
         canonicalize_tool_names(&mut message);
         let names: Vec<&str> = message.tool_uses().map(|(_, name, _)| name).collect();
         assert_eq!(names, ["bash", "read", "my_functions.x"]);
-    }
-
-    #[test]
-    fn a_reported_api_error_leaves_the_provider_body_behind() {
-        let error = AgentError::api(400, SECRET_BODY);
-        let reported = error_description(&error);
-        assert!(!reported.contains("private"));
-        assert_eq!(reported, "API error (400)");
     }
 
     /// The kind of server this module exists for: it enforces

@@ -61,4 +61,4 @@ jobs:
           purge-primary-key: never
       # Not `nix flake check`: the result links are the GC roots that keep the
       # cargo deps artifacts alive through the cache action's GC.
-      - run: nix build -L .#checks.x86_64-linux.{git-dep-hashes,fmt,build}
+      - run: nix build -L .#checks.x86_64-linux.build

@@ -1,5 +1,3 @@
-mod acp;
-mod migrate;
 mod session;
 mod subcmd;
 mod tui;
@@ -16,7 +14,7 @@ use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, SessionAction, TrustAction};
 use crate::project_trust;
 use crate::setup;
 use crate::update;
@@ -156,9 +154,9 @@ async fn cli_stack(
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load(&storage);
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
+    // The `trust.paths` policy deliberately stops at the session entry point
+    // (`cmd::tui`): a one-shot utility would record a grant the user never
+    // saw, for a session it never runs.
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
@@ -195,7 +193,6 @@ async fn cli_stack(
     )
     .await?;
     setup::init_logging(&config.storage, trust.project_config.config_root());
-    setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     report_warnings(warnings);
     Ok((host, config))
@@ -203,25 +200,6 @@ async fn cli_stack(
 
 pub async fn dispatch(mut cli: Cli) -> Result<()> {
     cli.check_run_path_flags()?;
-    // First, so anything moved out of `~/.maki` lands before this start writes
-    // a file of its own. `migrate xdg` is the same move asked for by hand.
-    let legacy_notice = match cli.command {
-        Some(Command::Migrate { .. }) => None,
-        _ => migrate::startup_notice(),
-    };
-    // The TUI and ACP show it on their own channel, which stderr from here
-    // would sit under. Everything else, `-p` and the SDK included, prints it.
-    let owns_channel = match cli.command {
-        Some(Command::Acp { .. }) => true,
-        None => !cli.print,
-        Some(_) => false,
-    };
-    let legacy_notice = if owns_channel {
-        legacy_notice
-    } else {
-        report_warnings(Vec::from_iter(legacy_notice));
-        None
-    };
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -279,17 +257,6 @@ pub async fn dispatch(mut cli: Cli) -> Result<()> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
-        Some(Command::Acp { model, yolo }) => {
-            acp::run(&cli, model, yolo, trust_mode, legacy_notice).await?;
-        }
-        Some(Command::Migrate { action }) => match action {
-            MigrateAction::Xdg => migrate::xdg()?,
-            MigrateAction::Providers => {
-                // A script counts as ported once a plugin registers its slug.
-                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode).await?;
-                migrate::providers()?
-            }
-        },
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;
             match action {
@@ -315,7 +282,7 @@ pub async fn dispatch(mut cli: Cli) -> Result<()> {
             .await?;
         }
         None => {
-            tui::run(cli, legacy_notice).await?;
+            tui::run(cli).await?;
         }
     }
     Ok(())

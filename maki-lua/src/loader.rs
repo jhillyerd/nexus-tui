@@ -177,10 +177,6 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
-        name: "code_execution",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
-    },
-    BundledPlugin {
         name: "completion",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     },
@@ -3217,7 +3213,6 @@ mod bundled_manifests {
     #[test_case("view_image",     READS_FILES            ; "view_image_reads_files")]
     #[test_case("skill",          READS_FILES            ; "skill_reads_files")]
     #[test_case("batch",          None                   ; "batch_is_undeclared")]
-    #[test_case("code_execution", None                   ; "code_execution_is_undeclared")]
     #[test_case("memory",         None                   ; "memory_is_undeclared")]
     #[test_case("task",           None                   ; "task_is_undeclared")]
     fn bundled_tools_declare_their_reach(tool: &str, expected: Option<ToolReach>) {

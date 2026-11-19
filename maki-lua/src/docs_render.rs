@@ -1,7 +1,7 @@
 //! Renders the Lua API reference and the builtin `maki-plugin-dev` skill
 //! straight from `api_docs()` at runtime, so no generated files live in the
-//! repo. `maki-docgen` calls [`site_page`] for the website; the plugin
-//! `require()` sandbox serves [`virtual_module`] to the skill plugin.
+//! repo. The plugin `require()` sandbox serves [`virtual_module`] to the
+//! skill plugin.
 
 use std::iter;
 

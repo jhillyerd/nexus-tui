@@ -11,26 +11,15 @@ use maki_agent::HostPrompt;
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 use maki_config::AgentConfig;
 
-use crate::print::OutputFormat;
-
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
 const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
-const HOST_PROMPT_PATHS: &[RunPath] = &[
-    RunPath::Tui,
-    RunPath::Print,
-    RunPath::Sdk,
-    RunPath::Acp,
-    RunPath::SystemPromptPreview,
-];
+const HOST_PROMPT_PATHS: &[RunPath] = &[RunPath::Tui, RunPath::SystemPromptPreview];
 
 /// Where a run goes, for flags only some paths read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunPath {
     Tui,
-    Print,
-    Sdk,
-    Acp,
     SystemPromptPreview,
     Other,
 }
@@ -39,9 +28,6 @@ impl fmt::Display for RunPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Tui => "the TUI",
-            Self::Print => "--print",
-            Self::Sdk => "SDK mode (--print --input-format stream-json)",
-            Self::Acp => "maki acp",
             Self::SystemPromptPreview => "maki prompt system (without --tools)",
             Self::Other => "this subcommand",
         })
@@ -70,13 +56,6 @@ pub enum PromptVariant {
     General,
 }
 
-#[derive(Clone, ValueEnum, Default)]
-pub enum InputFormat {
-    #[default]
-    Text,
-    StreamJson,
-}
-
 #[derive(Parser)]
 #[command(name = "maki", version, about = "AI coding agent for the terminal")]
 // Only one way to name the session to load, or the resolver would quietly pick
@@ -87,21 +66,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Non-interactive mode. Runs the prompt and exits. Compatible with Claude Code's --print flag
-    #[arg(short, long)]
-    pub print: bool,
-
-    /// Attach an image to the prompt in --print mode as vision content (repeatable)
-    #[arg(long = "image", value_name = "PATH")]
-    pub images: Vec<PathBuf>,
-
     /// Model spec (provider/model-id). Defaults to last used model, then configured default_model, then auto-detected
     #[arg(short, long)]
     pub model: Option<String>,
-
-    /// Include full turn-by-turn messages in --print output
-    #[arg(long)]
-    pub verbose: bool,
 
     /// Resume the most recent session in this directory
     #[arg(short = 'c', long = "continue")]
@@ -115,14 +82,6 @@ pub struct Cli {
         visible_alias = "session"
     )]
     pub resume: Option<String>,
-
-    /// Output format for --print mode
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    pub output_format: OutputFormat,
-
-    /// Input format (text or stream-json for SDK mode)
-    #[arg(long, value_enum, default_value_t = InputFormat::Text)]
-    pub input_format: InputFormat,
 
     /// Skip loading custom commands from .maki/commands, .claude/commands, etc.
     #[arg(long)]
@@ -170,10 +129,6 @@ pub struct Cli {
     #[arg(long, requires = "loaded")]
     pub fork_session: bool,
 
-    /// Maximum number of agent turns
-    #[arg(long)]
-    pub max_turns: Option<u32>,
-
     /// Replace the main agent's system prompt
     #[arg(long)]
     pub system_prompt: Option<String>,
@@ -182,31 +137,17 @@ pub struct Cli {
     #[arg(long)]
     pub append_system_prompt: Option<String>,
 
-    /// Permission mode for SDK
-    #[arg(long)]
-    pub permission_mode: Option<String>,
-
-    /// Include partial streaming messages in SDK output
-    #[arg(long)]
-    pub include_partial_messages: bool,
-
-    /// How long --print, SDK mode and --exit-on-done stay up for background
-    /// tasks once their input ends. Each result that comes back in time wakes
-    /// the model for another turn. Tasks still running after this are stopped.
-    /// Unset: --print and SDK mode run with background tasks off, so every
-    /// tool call blocks until it finishes and a result means the work is
-    /// done, while --exit-on-done waits 600. 0 turns them off for ACP as
-    /// well. At most a week
+    /// How long the TUI stays up for background tasks once its input ends.
+    /// Each result that comes back in time wakes the model for another turn.
+    /// Tasks still running after this are stopped. Unset: waits 600 when
+    /// --exit-on-done is passed, and runs background tasks off otherwise.
+    /// At most a week
     #[arg(
         long,
         value_name = "SECS",
         value_parser = value_parser!(u64).range(..=MAX_BACKGROUND_TIMEOUT_SECS),
     )]
     pub background_timeout: Option<u64>,
-
-    /// Permission prompt tool (accepted for compat, used in SDK mode)
-    #[arg(long, hide = true)]
-    pub permission_prompt_tool: Option<String>,
 
     // Accepted but ignored, so Claude Code SDK callers don't break.
     #[arg(long, hide = true)]
@@ -246,31 +187,6 @@ pub struct Cli {
 }
 
 impl Cli {
-    pub fn warn_ignored_flags(&self) {
-        let ignored = [
-            ("fallback-model", self.fallback_model.is_some()),
-            ("settings", self.settings.is_some()),
-            ("setting-sources", self.setting_sources.is_some()),
-            ("add-dir", self.add_dir.is_some()),
-            ("strict-mcp-config", self.strict_mcp_config),
-            ("include-hook-events", self.include_hook_events),
-            ("mcp-config", self.mcp_config.is_some()),
-            ("tools", self.tools.is_some()),
-            ("betas", self.betas.is_some()),
-            ("max-thinking-tokens", self.max_thinking_tokens.is_some()),
-            ("effort", self.effort.is_some()),
-            ("json-schema", self.json_schema.is_some()),
-            ("max-budget-usd", self.max_budget_usd.is_some()),
-            ("thinking", self.thinking.is_some()),
-            ("thinking-display", self.thinking_display.is_some()),
-        ];
-        for (flag, set) in &ignored {
-            if *set {
-                eprintln!("warning: --{flag} is accepted but ignored");
-            }
-        }
-    }
-
     /// `--allowed-tools` replaces the allowlist and rejects an unknown name;
     /// `--disallowed-tools` adds to the denylist and skips one.
     pub fn apply_tool_flags(&self, agent: &mut AgentConfig) -> Result<()> {
@@ -289,10 +205,6 @@ impl Cli {
         Ok(())
     }
 
-    pub fn is_sdk_mode(&self) -> bool {
-        self.print && matches!(self.input_format, InputFormat::StreamJson)
-    }
-
     pub fn host_prompt(&self) -> HostPrompt {
         HostPrompt::new(
             self.system_prompt.as_deref(),
@@ -302,25 +214,20 @@ impl Cli {
 
     fn run_path(&self) -> RunPath {
         match self.command {
-            Some(Command::Acp { .. }) => RunPath::Acp,
             Some(Command::Prompt(PromptArgs {
                 variant: PromptVariant::System,
                 tools: false,
                 ..
             })) => RunPath::SystemPromptPreview,
             Some(_) => RunPath::Other,
-            None if self.is_sdk_mode() => RunPath::Sdk,
-            None if self.print => RunPath::Print,
             None => RunPath::Tui,
         }
     }
 
     /// The one list of which run paths read which flag. Only flags whose
-    /// silent drop changes what the agent does are here. Output flags like
-    /// `--verbose` stay out, because Claude Code wrappers pass them on every
-    /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
-    /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
-    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+    /// silent drop changes what the agent does are here. Every visible flag
+    /// must pick a side (`every_visible_flag_is_placed`).
+    fn scoped_flags(&self) -> [ScopedFlag; 2] {
         let host_prompt = self.host_prompt();
         [
             ScopedFlag {
@@ -332,21 +239,6 @@ impl Cli {
                 name: "append-system-prompt",
                 set: host_prompt.appends(),
                 paths: HOST_PROMPT_PATHS,
-            },
-            ScopedFlag {
-                name: "max-turns",
-                set: self.max_turns.is_some(),
-                paths: &[RunPath::Print, RunPath::Sdk],
-            },
-            ScopedFlag {
-                name: "permission-mode",
-                set: self.permission_mode.is_some(),
-                paths: &[RunPath::Sdk],
-            },
-            ScopedFlag {
-                name: "image",
-                set: !self.images.is_empty(),
-                paths: &[RunPath::Print],
             },
         ]
     }
@@ -374,16 +266,12 @@ impl Cli {
         })
     }
 
-    /// `None` when background tasks are off. `-p` promises one answer. An SDK
-    /// client reads each result as finished work, and no turn wakes while its
-    /// stdin is open, so a turn that ends with tasks still out looks done
-    /// when it is not. Both only wait when asked to.
+    /// `None` when background tasks are off. The TUI keeps tasks up while the
+    /// session stays open, and waits 600s once its input ends.
     pub fn background_wait(&self) -> Option<Duration> {
-        let secs = self.background_timeout.unwrap_or(if self.print {
-            0
-        } else {
-            DEFAULT_BACKGROUND_TIMEOUT_SECS
-        });
+        let secs = self
+            .background_timeout
+            .unwrap_or(DEFAULT_BACKGROUND_TIMEOUT_SECS);
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 }
@@ -424,22 +312,8 @@ pub enum Command {
     },
     /// Rollback to the previous version
     Rollback,
-    /// Run as an ACP (Agent Client Protocol) server over stdio
-    Acp {
-        /// Model spec (provider/model-id)
-        #[arg(short, long)]
-        model: Option<String>,
-        /// Skip all permission prompts
-        #[arg(long)]
-        yolo: bool,
-    },
     /// Show the rendered system prompt or tool definitions
     Prompt(PromptArgs),
-    /// Data migration utilities
-    Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
-    },
     /// Manage projects that may load automatic shared project configuration
     Trust {
         #[command(subcommand)]
@@ -517,14 +391,6 @@ pub enum SessionAction {
 }
 
 #[derive(Subcommand)]
-pub enum MigrateAction {
-    /// Move ~/.maki/ to the XDG directories (maki also does this on startup)
-    Xdg,
-    /// Print a prompt that ports your old provider scripts to Lua plugins
-    Providers,
-}
-
-#[derive(Subcommand)]
 pub enum McpAction {
     /// Authenticate with an MCP server
     Auth {
@@ -589,13 +455,9 @@ mod tests {
     /// Visible flags `Cli::scoped_flags` leaves out: every run path reads them
     /// where they mean something, or they only shape output.
     const UNGUARDED_FLAGS: &[&str] = &[
-        "print",
         "model",
-        "verbose",
         "continue",
         "resume",
-        "output-format",
-        "input-format",
         "no-commands",
         "no-plugins",
         "no-jit",
@@ -606,14 +468,11 @@ mod tests {
         "disallowed-tools",
         "session-id",
         "fork-session",
-        "include-partial-messages",
         "background-timeout",
     ];
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
-    #[test_case("CodeExecution", "code_execution")]
-    #[test_case("code_execution", "code_execution"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
     }
@@ -645,13 +504,8 @@ mod tests {
         assert_eq!(Cli::try_parse_from(argv).is_ok(), accepted);
     }
 
-    #[test_case(&["-p"], None ; "print_default_is_off")]
-    #[test_case(&["-p", "--input-format", "stream-json"], None ; "sdk_default_is_off")]
-    #[test_case(&["-p", "--input-format", "stream-json", "--background-timeout", "30"], Some(30) ; "sdk_set")]
     #[test_case(&["--exit-on-done"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "tui_default")]
-    #[test_case(&["acp"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "acp_default_is_on")]
-    #[test_case(&["-p", "--background-timeout", "30"], Some(30) ; "print_set")]
-    #[test_case(&["--background-timeout", "0", "acp"], None ; "zero_turns_acp_off")]
+    #[test_case(&["--background-timeout", "30"], Some(30) ; "tui_set")]
     fn background_timeout_flag(args: &[&str], expected_secs: Option<u64>) {
         let argv = std::iter::once("maki").chain(args.iter().copied());
 
@@ -667,7 +521,7 @@ mod tests {
     fn background_timeout_past_the_cap_is_refused() {
         let too_long = (MAX_BACKGROUND_TIMEOUT_SECS + 1).to_string();
 
-        assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
+        assert!(Cli::try_parse_from(["maki", "--background-timeout", &too_long]).is_err());
     }
 
     fn parse(args: &[&str]) -> Cli {
@@ -675,19 +529,10 @@ mod tests {
     }
 
     #[test_case(&["--append-system-prompt", APPEND], None ; "tui_append")]
-    #[test_case(&["-p", "--append-system-prompt", APPEND], None ; "print_append")]
-    #[test_case(&["-p", "--input-format", "stream-json", "--system-prompt", REPLACE], None ; "sdk_replace")]
-    #[test_case(&["--append-system-prompt", APPEND, "acp"], None ; "acp_append")]
     #[test_case(&["--append-system-prompt", APPEND, "prompt"], None ; "prompt_append")]
     #[test_case(&["--system-prompt", "", "models"], None ; "empty_is_unset")]
-    #[test_case(&["-p", "--max-turns", "3"], None ; "print_max_turns")]
-    #[test_case(&["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"], None ; "claude_agent_sdk_flags")]
-    #[test_case(&["--append-system-prompt", APPEND, "models"], Some("append-system-prompt") ; "models_append")]
     #[test_case(&["--append-system-prompt", APPEND, "prompt", "research"], Some("append-system-prompt") ; "subagent_prompt_append")]
     #[test_case(&["--system-prompt", REPLACE, "prompt", "--tools"], Some("system-prompt") ; "tools_prompt_replace")]
-    #[test_case(&["--max-turns", "3"], Some("max-turns") ; "tui_max_turns")]
-    #[test_case(&["-p", "--permission-mode", "plan"], Some("permission-mode") ; "print_permission_mode")]
-    #[test_case(&["--image", "a.png"], Some("image") ; "tui_image")]
     fn run_path_flag_check(args: &[&str], rejected: Option<&'static str>) {
         let checked = parse(args).check_run_path_flags();
 
@@ -709,7 +554,7 @@ mod tests {
         for flag in &flags {
             assert!(
                 scoped.contains(flag) || UNGUARDED_FLAGS.contains(flag),
-                "--{flag}: add it to `Cli::scoped_flags` if a run path ignores it, else to UNGUARDED_FLAGS, then to the matrix in site/docs/content/cli/_index.md"
+                "--{flag}: add it to `Cli::scoped_flags` if a run path ignores it, else to UNGUARDED_FLAGS"
             );
         }
         for name in scoped.iter().chain(UNGUARDED_FLAGS) {

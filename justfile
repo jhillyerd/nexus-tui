@@ -44,18 +44,8 @@ fmt:
 check-lua:
     cd plugins && lute check $(find . -name '*.lua')
 
-pylint:
-    ruff check scripts/
-    ty check scripts/
-
-gen-docs:
-    cargo run -p maki-docgen
-
-gen-docs-check:
-    cargo run -p maki-docgen -- --check
-
 machete:
     cargo machete
 
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check machete
+ci: fmt-check lint test machete
