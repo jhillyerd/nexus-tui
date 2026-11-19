@@ -1,9 +1,11 @@
-Maki is being pruned into a nexus TUI client (see PLAN.md). The TUI
-(maki-ui, maki-highlight, maki-markdown) is the product; `maki-agent`,
-`maki-providers`, `maki-lua` are vestigial and die in phases 3-4 — do not
-grow them. Upstream contracts: `nexus/docs/plans/environments.md` (client
-protocol, tool plane) and `nexus/docs/plans/tui-pairing.md` (pairing,
-state file).
+Maki is being pruned into a nexus TUI client (see PLAN.md). Phase 3 (UI
+rewiring) has landed: `maki-ui` renders the nexus event plane and the
+binary is `nexus-tui` (pair → connect → render). `maki-ui` has NO
+`maki-agent`/`maki-providers` dependency; `maki-lua` stays for keymaps,
+input decor and config (D1) and still imports the agent crates, which are
+vestigial and die with it in phase 4 — do not grow them. Upstream
+contracts: `nexus/docs/plans/environments.md` (client protocol, tool
+plane) and `nexus/docs/plans/tui-pairing.md` (pairing, state file).
 
 ## Code guidelines
 
@@ -55,16 +57,22 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 Rust workspace. Key crates in the root dir:
 
-- maki-ui: ratatui interactive UI (elm like architecture) — the reason
-  this fork exists; gets rewired onto the nexus event plane in phase 3
+- maki-ui: ratatui interactive UI (elm like architecture) — wired onto
+  the nexus event plane in phase 3 (`src/node.rs` projects `ServerFrame`
+  into `NodeEvent`; the app renders one thread, one transcript)
 - maki-highlight, maki-markdown: the rendering pipeline, no agent coupling
-- maki-config: user config (shrinks to server/node/role/thread/theme in phase 3)
-- maki-storage: shrinks to the nexus pairing state file in phase 3
+- maki-config: user config (shrinks to theme/keybindings in phase 4)
+- maki-storage: input history + paths; the nexus credential state file
+  lives in the nexus crate
 - nexus (phase 2): WS client, frame codec, pairing exchange, the four env
   tools, reconnect loop
+- binary (`src/`): `nexus-tui` — pair/discover → connect → UI, exit codes
+  0/2/4 per tui-pairing.md
 
-Vestigial until their phase deletes them: maki-agent, maki-providers,
-maki-lua (+ plugins/), maki-pack.
+Vestigial until phase 4 deletes them: maki-agent, maki-providers (only
+maki-lua imports them now), maki-lua (+ plugins/), maki-pack.
 
-Built-in lua plugins in ./plugins load through maki-lua; agent-coupled
-ones go inert as their tool plane moves to nexus.
+Built-in lua plugins in ./plugins load through maki-lua. Keymaps, input
+decor and config load stay live; agent-coupled plugin APIs are inert
+(the UI feeds no agent events and answers session/model requests with a
+refusal).

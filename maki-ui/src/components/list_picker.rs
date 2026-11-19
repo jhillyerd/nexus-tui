@@ -21,6 +21,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+#[allow(dead_code)]
 const ERROR_LABEL: &str = "Error: ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 /// Fits a long model id next to its tier and price columns.
@@ -69,6 +70,7 @@ impl PickerItem for String {
 pub enum PickerAction<T> {
     Consumed,
     Select(T),
+    #[allow(dead_code)] // toggle rows answer plugins, not keys
     Toggle(usize, bool),
     Close,
 }
@@ -94,6 +96,7 @@ struct State<T> {
     notice: Option<&'static str>,
 }
 
+#[allow(dead_code)] // the generic picker surface; kept for lua windows
 impl<T: PickerItem> State<T> {
     fn new(items: Vec<T>) -> Self {
         let mut state = Self {
@@ -244,6 +247,7 @@ impl<T: PickerItem> State<T> {
     }
 }
 
+#[allow(dead_code)] // as above
 impl<T: PickerItem> ListPicker<T> {
     pub fn new() -> Self {
         Self {
@@ -327,6 +331,7 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
+    #[allow(dead_code)] // lua list windows may return; the API stays
     pub fn replace_items(&mut self, items: Vec<T>) {
         if let Some(s) = self.state.as_mut() {
             s.replace_items(items);
@@ -528,20 +533,8 @@ impl<T: PickerItem> ListPicker<T> {
 }
 
 impl<T: PickerItem> Overlay for ListPicker<T> {
-    fn is_prompting(&self) -> bool {
-        false
-    }
-
     fn is_open(&self) -> bool {
         self.is_open()
-    }
-
-    fn close(&mut self) {
-        self.close()
-    }
-
-    fn cadence(&self) -> Cadence {
-        self.cadence()
     }
 }
 

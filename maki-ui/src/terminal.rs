@@ -1,3 +1,9 @@
+//! Terminal setup and teardown, the frame caret, the editor bridge, and the
+//! desktop-notification plane. The notification half waits for its
+//! turn-lifecycle wiring in this client, so it stays `allow(dead_code)` until
+//! then.
+#![allow(dead_code)]
+
 use shell_words::split;
 use std::io::{Write, stdout};
 use std::panic;
@@ -539,7 +545,6 @@ fn pop_terminal_modes() {
 }
 
 fn resume(terminal: &mut ratatui::DefaultTerminal) {
-    crate::terminal_image::invalidate();
     write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
     stdout().execute(EnterAlternateScreen).ok();
     stdout().execute(EnableBracketedPaste).ok();

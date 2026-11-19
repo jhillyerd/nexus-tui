@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use maki_config::ClockFormat;
 
+#[allow(dead_code)]
 pub fn hm(format: ClockFormat) -> &'static str {
     if is_12h(format) { "%-I:%M %p" } else { "%H:%M" }
 }

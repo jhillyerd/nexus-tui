@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fastrand::Rng;
-use maki_agent::{SnapshotSpan, SpanStyle};
+use maki_lua::span_style::{SnapshotSpan, SpanStyle};
 use maki_lua::{InputMarks, TextEdit};
 
 use super::syntax::edit_since;

@@ -6,14 +6,13 @@ use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use maki_agent::{SnapshotSpan, SpanStyle};
-use mlua::{Result as LuaResult, Table, Value};
-use regex::{Captures, Regex};
-
-use super::buf::{parse_line, parse_style};
 use super::syntax::SyntaxRule;
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
+use crate::span_style::span_parse::{parse_line, parse_style};
+use crate::span_style::{SnapshotSpan, SpanStyle};
+use arc_swap::ArcSwap;
+use mlua::{Result as LuaResult, Table, Value};
+use regex::{Captures, Regex};
 
 /// A pushed mark says where it goes, while a rule's mark goes on each match.
 const PUSHED_MARK_FIELDS: &[&str] = &[

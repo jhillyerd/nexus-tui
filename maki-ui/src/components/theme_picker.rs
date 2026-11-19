@@ -1,6 +1,5 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction};
-use crate::repaint::Cadence;
 use crate::theme;
 
 use crossterm::event::KeyEvent;
@@ -44,6 +43,7 @@ impl ThemePicker {
         self.picker.is_open()
     }
 
+    #[allow(dead_code)]
     pub fn close(&mut self) {
         self.picker.close();
         self.original_theme_name = None;
@@ -96,20 +96,8 @@ impl ThemePicker {
 }
 
 impl Overlay for ThemePicker {
-    fn is_prompting(&self) -> bool {
-        false
-    }
-
     fn is_open(&self) -> bool {
         self.is_open()
-    }
-
-    fn close(&mut self) {
-        self.close()
-    }
-
-    fn cadence(&self) -> Cadence {
-        self.picker.cadence()
     }
 }
 

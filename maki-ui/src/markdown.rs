@@ -142,6 +142,7 @@ pub struct Truncated<'a> {
     pub skipped: usize,
 }
 
+#[allow(dead_code)] // plan rules drew it; notices may again
 pub(crate) fn hr_line(width: u16, style: Style) -> Line<'static> {
     Line::from(Span::styled(render::hr_text(width), style))
 }

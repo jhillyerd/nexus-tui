@@ -239,7 +239,7 @@ fn map_back<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use maki_agent::SpanStyle;
+    use maki_lua::span_style::SpanStyle;
     use maki_lua::{SyntaxInput, SyntaxRule};
     use test_case::test_case;
     use tokio::sync::oneshot;

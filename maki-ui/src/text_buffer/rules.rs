@@ -12,7 +12,7 @@ use std::iter::repeat_with;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use maki_agent::SpanStyle;
+use maki_lua::span_style::SpanStyle;
 use maki_lua::{Decoration, InputRule, PatternRule, SyntaxRule};
 
 use super::marks::Placed;

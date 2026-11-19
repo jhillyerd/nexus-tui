@@ -15,7 +15,6 @@ use maki_lua::{InputMarks, InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
-use maki_providers::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -47,14 +46,9 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "refactor a module",
     "remove dead code",
 ];
-const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
-const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
-const BACKGROUND_WAIT_PREFIX: &str = "Waiting on ";
-const BACKGROUND_WAIT_ONE: &str = " background task...";
-const BACKGROUND_WAIT_MANY: &str = " background tasks...";
 
 /// What opens the command palette at the start of [`sent_text`].
 pub(crate) const COMMAND_PREFIX: char = '/';
@@ -70,11 +64,6 @@ pub(crate) fn sent_text(value: &str) -> &str {
 pub enum Placeholder {
     Suggestion,
     Blank,
-    Queue,
-    SubagentQueue,
-    /// An idle agent whose moved work is still out. Without it the chat
-    /// looks done, while the results will still wake the agent.
-    Background(usize),
 }
 
 pub enum InputAction {
@@ -88,25 +77,27 @@ pub enum InputAction {
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // the structured submit surface; the box keeps it
 pub struct Submission {
     pub text: String,
-    pub images: Vec<ImageSource>,
 }
 
 /// What a chat keeps of the input while another chat has the box.
+#[allow(dead_code)] // the parked draft one chat may need again
 #[derive(Default)]
 pub struct Draft {
     pub text: String,
-    pub images: Vec<ImageSource>,
     marks: Marks,
     writers: Writers,
 }
 
 impl Draft {
+    #[allow(dead_code)]
     pub fn clear_plugin_marks(&mut self, plugin: &str) {
         self.marks.clear_plugin(plugin);
     }
 
+    #[allow(dead_code)]
     pub fn writers(&self) -> &Writers {
         &self.writers
     }
@@ -122,7 +113,6 @@ pub struct InputBox {
     scroll_y: u16,
     follow_cursor: bool,
     placeholder_hint: &'static str,
-    pending_images: Vec<ImageSource>,
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
@@ -195,6 +185,7 @@ impl InputBox {
 
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
     /// "read /tmp/x"). This adds spaces around the paste only when needed.
+    #[allow(dead_code)]
     pub fn handle_paste_with_spaces(&mut self, text: &str) -> InputAction {
         let value = self.buffer.value();
         let at = self.buffer.cursor_byte();
@@ -256,7 +247,6 @@ impl InputBox {
             scroll_y: 0,
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
-            pending_images: Vec::new(),
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
@@ -337,7 +327,7 @@ impl InputBox {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let rows = self.layout(width).total_rows() + u32::from(!self.pending_images.is_empty());
+        let rows = self.layout(width).total_rows();
         let capped = rows.min(self.max_input_lines.into()) as u16;
         capped.saturating_add(BORDER_ROWS)
     }
@@ -368,21 +358,19 @@ impl InputBox {
     /// text stays out of history.
     pub fn submit(&mut self) -> Option<Submission> {
         let text = sent_text(self.buffer.value()).to_string();
-        let images = mem::take(&mut self.pending_images);
-        if text.is_empty() && images.is_empty() {
+        if text.is_empty() {
             return None;
         }
         if !(text.starts_with(COMMAND_PREFIX) && !self.buffer.writers().is_empty()) {
             self.history.push(text.clone());
         }
         self.discard();
-        Some(Submission { text, images })
+        Some(Submission { text })
     }
 
     /// The marks go with the text, so ghost text pushed for it never turns
     /// up in the next prompt.
     pub fn discard(&mut self) {
-        self.pending_images.clear();
         self.history_index = None;
         self.draft = Prompt::default();
         self.buffer.clear();
@@ -390,16 +378,13 @@ impl InputBox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.value().trim().is_empty() && !self.has_images()
-    }
-
-    pub fn has_images(&self) -> bool {
-        !self.pending_images.is_empty()
+        self.buffer.value().trim().is_empty()
     }
 
     /// The text the user is composing. Under an untouched history recall that
     /// is the draft it covers, since the recall is still in history. An edited
     /// recall is new work and wins over the draft, as it does on submit.
+    #[allow(dead_code)]
     pub fn draft_text(&self) -> String {
         if self.is_untouched_recall() {
             self.draft.text.clone()
@@ -409,6 +394,7 @@ impl InputBox {
     }
 
     /// The plugins that wrote [`Self::draft_text`].
+    #[allow(dead_code)]
     pub fn draft_writers(&self) -> &Writers {
         if self.is_untouched_recall() {
             &self.draft.writers
@@ -425,9 +411,9 @@ impl InputBox {
 
     /// The marks go with the text they were made for, so under an untouched
     /// history recall the draft it covers is parked with its own marks.
+    #[allow(dead_code)]
     pub fn swap_draft(&mut self, draft: Draft) -> Draft {
         let parks_the_draft = self.is_untouched_recall();
-        let images = mem::replace(&mut self.pending_images, draft.images);
         let shown = self.buffer.swap_prompt(Prompt {
             text: draft.text,
             marks: draft.marks,
@@ -443,7 +429,6 @@ impl InputBox {
         } = if parks_the_draft { covered } else { shown };
         Draft {
             text,
-            images,
             marks,
             writers,
         }
@@ -478,10 +463,6 @@ impl InputBox {
             self.layout.get_mut().relayout(&self.buffer, changed);
         }
         self.langs.poll() | syntax.is_some()
-    }
-
-    pub fn attach_image(&mut self, source: ImageSource) {
-        self.pending_images.push(source);
     }
 
     /// The way a plugin writes to the input. It carries the box's own state
@@ -524,6 +505,7 @@ impl InputBox {
     /// [`Self::set_input`] for text made from what the input holds: a
     /// completed command, what `$EDITOR` changed. The plugins that wrote the
     /// text it came from still count as its writers.
+    #[allow(dead_code)] // the editor bridge restores this path
     pub fn rewrite_input(&mut self, s: &str) {
         let writers = self.buffer.writers().clone();
         self.buffer.swap_prompt(Prompt {
@@ -611,15 +593,14 @@ impl InputBox {
             }
         }
 
-        let total_vl = u16::try_from(text_rows + u32::from(!self.pending_images.is_empty()))
-            .unwrap_or(u16::MAX);
+        let total_vl = u16::try_from(text_rows).unwrap_or(u16::MAX);
         self.last_total_lines = total_vl;
         self.last_content_height = content_height.max(1);
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
         let is_empty = self.buffer.is_empty();
         let mut cursor_cell: Option<Position> = None;
-        let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
+        let styled_lines: Vec<Line> = if is_empty {
             let base = theme::current().input_placeholder;
             let (head, tail): (Cow<str>, _) = match placeholder {
                 Placeholder::Suggestion => (
@@ -629,10 +610,8 @@ impl InputBox {
                         Span::styled(ASK_SUFFIX, base),
                     ],
                 ),
-                Placeholder::Queue => (QUEUE_PLACEHOLDER.into(), Vec::new()),
-                Placeholder::SubagentQueue => (SUBAGENT_QUEUE_PLACEHOLDER.into(), Vec::new()),
+
                 Placeholder::Blank => (BLANK_PLACEHOLDER.into(), Vec::new()),
-                Placeholder::Background(count) => (background_wait(count).into(), Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];
             cursor_cell = Some(Position::new(display_width(&spans), 0));
@@ -680,20 +659,6 @@ impl InputBox {
             lines
         };
 
-        // Only the visible rows were drawn, so the label, which sits right
-        // after the text, fits only when the text ends inside the box.
-        if !self.pending_images.is_empty() && styled_lines.len() < usize::from(content_height) {
-            let n = self.pending_images.len();
-            let label = match n {
-                1 => "1 image".to_string(),
-                _ => format!("{n} images"),
-            };
-            styled_lines.push(Line::from(Span::styled(
-                label,
-                theme::current().input_placeholder,
-            )));
-        }
-
         let text = Text::from(styled_lines);
         let mut block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
@@ -726,10 +691,12 @@ impl InputBox {
         self.scroll_y
     }
 
+    #[allow(dead_code)]
     pub fn history(&self) -> &InputHistory {
         &self.history
     }
 
+    #[allow(dead_code)]
     pub fn set_history(&mut self, history: InputHistory) {
         self.history = history;
         self.history_index = None;
@@ -835,15 +802,6 @@ impl Hit {
     }
 }
 
-fn background_wait(count: usize) -> String {
-    let noun = if count == 1 {
-        BACKGROUND_WAIT_ONE
-    } else {
-        BACKGROUND_WAIT_MANY
-    };
-    format!("{BACKGROUND_WAIT_PREFIX}{count}{noun}")
-}
-
 fn random_placeholder_hint() -> &'static str {
     let idx = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -905,20 +863,25 @@ fn caret_column(spans: &[Span<'_>], caret_chars: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(dead_code)]
+    struct Rendered {
+        terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
+        cursor: Option<Position>,
+    }
+
+    fn shift(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent {
+            code,
+            modifiers: crossterm::event::KeyModifiers::SHIFT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
     use super::*;
-    use crate::app::shell::parse_shell_prefix;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
-    use crate::components::tool_display::resolve_span_style;
-    use crate::decor_worker;
-    use crate::text_buffer::test_support::{mark_ranges, text_edit};
-    use crate::text_buffer::{Decoration, INPUT_REPLACED_ERR, Reveal, RuleSet, VirtTextPos};
-    use maki_agent::types::InlineStyle;
-    use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
-    use maki_lua::{InputRule, PatternRule, SyntaxRule};
-    use maki_providers::ImageMediaType;
+    use crate::text_buffer::test_support::text_edit;
     use ratatui::layout::{Position, Rect};
-    use std::ops::Range;
-    use std::sync::Arc;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -943,7 +906,6 @@ mod tests {
         type_text(&mut input, " x ");
         let sub = input.submit().unwrap();
         assert_eq!(sub.text, "x");
-        assert!(sub.images.is_empty());
         assert_eq!(input.buffer.value(), "");
 
         type_text(&mut input, "line1");
@@ -1323,10 +1285,6 @@ mod tests {
     }
 
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
-    #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
-    #[test_case(Placeholder::SubagentQueue, SUBAGENT_QUEUE_PLACEHOLDER ; "subagent_queue_names_the_subagent")]
-    #[test_case(Placeholder::Background(1), "Waiting on 1 background task..." ; "one_background_task")]
-    #[test_case(Placeholder::Background(2), "Waiting on 2 background tasks..." ; "background_tasks")]
     fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
         let terminal = render_input_with(&mut input, 40, 4, placeholder);
@@ -1334,1081 +1292,5 @@ mod tests {
             rendered_row(&terminal, 1),
             format!("{CHEVRON}{expected}").trim_end()
         );
-    }
-
-    #[test]
-    fn suggestion_placeholder_shows_a_hint() {
-        const HINT: &str = "fix a bug";
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.placeholder_hint = HINT;
-        let terminal = render_input(&mut input, 40, 4);
-        assert_eq!(
-            rendered_row(&terminal, 1),
-            format!("{CHEVRON}{ASK_PREFIX}{HINT}{ASK_SUFFIX}")
-        );
-    }
-
-    fn test_image() -> ImageSource {
-        ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
-    }
-
-    #[test]
-    fn submit_with_images() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-
-        input.attach_image(test_image());
-        let sub = input.submit().unwrap();
-        assert!(sub.text.is_empty());
-        assert_eq!(sub.images.len(), 1);
-        assert!(input.submit().is_none(), "images cleared after submit");
-
-        type_text(&mut input, "describe this");
-        input.attach_image(test_image());
-        let sub = input.submit().unwrap();
-        assert_eq!(sub.text, "describe this");
-        assert_eq!(sub.images.len(), 1);
-    }
-
-    const IMAGE_LABEL: &str = "1 image";
-
-    #[test]
-    fn image_label_rendered() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.attach_image(test_image());
-        let h = input.height(40);
-        let terminal = render_input(&mut input, 40, h);
-        let found = (0..h).any(|row| rendered_row(&terminal, row).contains(IMAGE_LABEL));
-        assert!(found, "image label not found in rendered output");
-    }
-
-    #[test]
-    fn height_accounts_for_pending_images() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        let base_height = input.height(TEST_WIDTH);
-        input.attach_image(test_image());
-        assert_eq!(input.height(TEST_WIDTH), base_height + 1);
-    }
-
-    #[test_case("read", "src/main.rs", " src/main.rs" ; "leading_after_ascii")]
-    #[test_case("打开", "src/main.rs", " src/main.rs" ; "leading_after_unicode")]
-    #[test_case("", "src/main.rs", "src/main.rs" ; "no_leading_at_start")]
-    #[test_case("read ", "src/main.rs", "src/main.rs" ; "no_leading_after_space")]
-    #[test_case("--file=", "src/main.rs", "src/main.rs" ; "no_leading_after_equals")]
-    #[test_case("/", "src/main.rs", "src/main.rs" ; "no_leading_after_slash")]
-    #[test_case("\"", "src/main.rs", "src/main.rs" ; "no_leading_after_quote")]
-    #[test_case("'", "src/main.rs", "src/main.rs" ; "no_leading_after_squote")]
-    #[test_case("foo_", "src/main.rs", " src/main.rs" ; "leading_after_underscore")]
-    #[test_case("$(cmd)", "src/main.rs", " src/main.rs" ; "leading_after_closing_paren")]
-    #[test_case("arr[0]", "src/main.rs", " src/main.rs" ; "leading_after_closing_bracket")]
-    fn paste_with_spaces_leading(before: &str, paste: &str, expected_suffix: &str) {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, before);
-        input.handle_paste_with_spaces(paste);
-        assert_eq!(input.buffer.value(), format!("{before}{expected_suffix}"));
-    }
-
-    #[test_case("file", 0, "/tmp/foo", "/tmp/foo file" ; "trailing_before_ascii")]
-    #[test_case("を読む", 0, "/tmp/foo", "/tmp/foo を読む" ; "trailing_before_unicode")]
-    #[test_case("foobar", 3, "src/main.rs", "foo src/main.rs bar" ; "both_sides_mid_word")]
-    #[test_case("in  between", 3, "file.rs", "in file.rs between" ; "neither_side_between_spaces")]
-    #[test_case("read ''", 6, "src/main.rs", "read 'src/main.rs'" ; "neither_side_between_quotes")]
-    fn paste_with_spaces_at_cursor(before: &str, cursor_at: usize, paste: &str, expected: &str) {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, before);
-        let back = before.chars().count() - cursor_at;
-        for _ in 0..back {
-            input.buffer.move_left();
-        }
-        input.handle_paste_with_spaces(paste);
-        assert_eq!(input.buffer.value(), expected);
-    }
-
-    #[test]
-    fn paste_with_spaces_empty_line() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.handle_paste_with_spaces("file.rs");
-        assert_eq!(input.buffer.value(), "file.rs");
-    }
-
-    #[test]
-    fn paste_with_spaces_text_has_leading_space() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "read");
-        input.handle_paste_with_spaces(" file.rs");
-        assert_eq!(input.buffer.value(), "read file.rs");
-    }
-
-    #[test]
-    fn paste_with_spaces_text_has_trailing_space() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "file");
-        for _ in 0..4 {
-            input.buffer.move_left();
-        }
-        input.handle_paste_with_spaces("src/main.rs ");
-        assert_eq!(input.buffer.value(), "src/main.rs file");
-    }
-
-    #[test]
-    fn paste_with_spaces_multiline_buffer_cursor_on_second_line() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.handle_paste("first\nread");
-        input.handle_paste_with_spaces("file.rs");
-        assert_eq!(input.buffer.value(), "first\nread file.rs");
-    }
-
-    #[test]
-    fn paste_with_spaces_cursor_at_end_no_trailing() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "read");
-        input.handle_paste_with_spaces("file.rs");
-        assert_eq!(input.buffer.value(), "read file.rs");
-    }
-
-    // ew = area.width - PREFIX_WIDTH (2); with width 10, row_width is 8.
-    fn area(width: u16) -> Rect {
-        Rect::new(0, 0, width, 10)
-    }
-
-    fn single_line(text: &str) -> InputBox {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, text);
-        input
-    }
-
-    #[test_case("abc", (0, 0) => Some((0, 0)); "click in chevron prefix of first row")]
-    #[test_case("abc", (0, 1) => Some((0, 0)); "click on trailing part of prefix")]
-    #[test_case("abc", (0, 2) => Some((0, 0)); "click on first text column")]
-    #[test_case("abc", (0, 9) => Some((0, 3)); "click past end of line clamps to line end")]
-    #[test_case("abc", (1, 0) => None; "click below content returns None")]
-    fn click_position_prefix_and_clamp(
-        text: &str,
-        (row, col): (u16, u16),
-    ) -> Option<(usize, usize)> {
-        single_line(text).click_position(area(10), row, col)
-    }
-
-    #[test_case((1, 0) => Some((1, 0)); "second line col 0 is its start")]
-    #[test_case((1, 1) => Some((1, 0)); "second line prefix occupies its first two cols")]
-    #[test_case((1, 3) => Some((1, 1)); "second line text starts after the prefix")]
-    #[test_case((1, 4) => Some((1, 2)); "second line maps last column")]
-    fn click_position_second_line_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "abc");
-        input.buffer.add_line();
-        type_text(&mut input, "def");
-        input.click_position(area(10), row, col)
-    }
-
-    #[test_case((1, 0) => Some((0, 8)); "continuation row first col maps to wrapped chunk start")]
-    #[test_case((1, 1) => Some((0, 9)); "continuation row has no prefix offset")]
-    fn click_position_wrapped_line_has_no_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
-        // width 10 -> ew 8 -> "abcdefghij" wraps as [0,8) then [8,10).
-        single_line("abcdefghij").click_position(area(10), row, col)
-    }
-
-    /// The cursor sitting just past a full row is drawn on a row of its own,
-    /// whoever owns the keyboard, so a click has to count that row too or
-    /// every line below it maps one row out.
-    #[test_case((1, 2) => Some((0, 8)); "the extra cursor row is its own row")]
-    #[test_case((2, 2) => Some((1, 0)); "the next buffer line comes after it")]
-    fn click_position_cursor_extra_row((row, col): (u16, u16)) -> Option<(usize, usize)> {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "abcdefgh");
-        input.buffer.add_line();
-        type_text(&mut input, "xy");
-        input.buffer.set_cursor(0, 8);
-        input.click_position(area(10), row, col)
-    }
-
-    // Width 12 leaves 10 text columns after the 2 cell prefix, height 6 leaves
-    // 4 content rows between the borders.
-    const CURSOR_WIDTH: u16 = 12;
-    const CURSOR_HEIGHT: u16 = 6;
-    const CURSOR_EW: usize = effective_width(CURSOR_WIDTH as usize);
-
-    struct Rendered {
-        terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
-        cursor: Option<Position>,
-    }
-
-    /// The terminal draws the cursor, and an IME anchors its preedit text to
-    /// it, on the very cell reported here.
-    fn assert_cursor_at(rendered: &Rendered, expected: Option<Position>) {
-        assert_eq!(rendered.cursor, expected);
-    }
-
-    fn render_cursor(input: &mut InputBox, width: u16, height: u16) -> Rendered {
-        draw_input(input, width, height, Placeholder::Suggestion)
-    }
-
-    fn render_with_cursor_left(text: &str, left: usize) -> Rendered {
-        let mut input = single_line(text);
-        for _ in 0..left {
-            input.buffer.move_left();
-        }
-        render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
-    }
-
-    #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]
-    #[test_case("hello", 2, Position::new(5, 1) ; "ascii_in_the_middle")]
-    #[test_case("a漢b", 0, Position::new(6, 1)  ; "wide_char_advances_two_columns")]
-    #[test_case("a漢b", 1, Position::new(5, 1)  ; "after_a_wide_char")]
-    #[test_case("a漢b", 2, Position::new(3, 1)  ; "on_a_wide_char")]
-    fn terminal_cursor_tracks_the_software_cursor(text: &str, left: usize, expected: Position) {
-        assert_cursor_at(&render_with_cursor_left(text, left), Some(expected));
-    }
-
-    #[test_case(CURSOR_EW, 0, Position::new(0, 2)         ; "at_the_boundary_it_starts_the_next_row")]
-    #[test_case(CURSOR_EW + 1, 0, Position::new(1, 2)     ; "past_the_boundary_it_trails_the_text")]
-    #[test_case(CURSOR_EW + 2, 2, Position::new(0, 2)     ; "inside_the_text_at_the_boundary")]
-    #[test_case(CURSOR_EW * 2 + 2, 2, Position::new(0, 3) ; "at_a_continuation_row_boundary")]
-    fn terminal_cursor_at_wrap_boundary(chars: usize, left: usize, expected: Position) {
-        assert_cursor_at(
-            &render_with_cursor_left(&"x".repeat(chars), left),
-            Some(expected),
-        );
-    }
-
-    #[test]
-    fn terminal_cursor_on_second_buffer_line() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.handle_paste("aaa\nbb");
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH + 2, 2)));
-    }
-
-    #[test]
-    fn terminal_cursor_on_empty_input_sits_after_the_chevron() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH, 1)));
-    }
-
-    #[test]
-    fn terminal_cursor_follows_vertical_scroll() {
-        const LINES: usize = 10;
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.handle_paste(&["a"; LINES].join("\n"));
-
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert!(input.scroll_y() > 0, "input should have scrolled");
-        assert_cursor_at(
-            &rendered,
-            Some(Position::new(PREFIX_WIDTH + 1, CURSOR_HEIGHT - 2)),
-        );
-
-        input.scroll(LINES as i32);
-        assert_eq!(input.scroll_y(), 0, "should be back at the top");
-        assert_cursor_at(
-            &render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT),
-            None,
-        );
-    }
-
-    // Issue #865 in miniature. `a` plus five wide chars is 11 columns, so the
-    // last one does not fit in the 10 column row and starts a second row while
-    // leaving a hole behind. With only one content row the viewport has to
-    // scroll down to that second row, or the reversed cell and the IME with it
-    // end up off screen.
-    const CURSOR_ON_THE_EDIT: &str = "the cursor the edit moved has to be on screen";
-    const WIDE_WRAP_LINE: &str = "a漢漢漢漢漢";
-    const WIDE_WRAP_HEIGHT: u16 = 3;
-    const WIDE_WRAP_SCROLL: u16 = 1;
-    const SHOULD_FOLLOW_WIDE_WRAP: &str = "scroll should follow the cursor onto the wrapped row";
-
-    #[test_case(0, Position::new(2, 1) ; "past_the_wide_char_that_wrapped")]
-    #[test_case(1, Position::new(0, 1) ; "on_the_wide_char_that_wrapped")]
-    fn terminal_cursor_follows_a_wide_char_onto_the_next_row(left: usize, expected: Position) {
-        let mut input = single_line(WIDE_WRAP_LINE);
-        for _ in 0..left {
-            input.buffer.move_left();
-        }
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, WIDE_WRAP_HEIGHT);
-        assert_eq!(
-            input.scroll_y(),
-            WIDE_WRAP_SCROLL,
-            "{SHOULD_FOLLOW_WIDE_WRAP}"
-        );
-        assert_cursor_at(&rendered, Some(expected));
-    }
-
-    fn plugin_write(input: &mut InputBox, range: Range<usize>, text: &str) {
-        let edit = text_edit(range.start, range.end, text);
-        let version = input.buffer.version();
-        input
-            .apply_edits(version, vec![edit], None, None, None)
-            .unwrap();
-    }
-
-    /// A plugin edit lands on a recalled history entry, so the value is the
-    /// user's own text again. Left in the browse state, the next history key
-    /// would put the entry back over the edit.
-    #[test]
-    fn a_plugin_edit_leaves_history_browsing() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        submit_text(&mut input, "recalled");
-        input.history_up();
-        assert_eq!(input.buffer.value(), "recalled");
-
-        plugin_write(&mut input, 0.."recalled".len(), "written");
-        input.history_down();
-        assert_eq!(input.buffer.value(), "written");
-    }
-
-    /// A wheel scroll pins the view, so an edit has to bring the cursor back
-    /// into it the way typing does.
-    #[test]
-    fn a_plugin_edit_brings_the_view_back_to_the_cursor() {
-        const LINES: usize = 10;
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.handle_paste(&["a"; LINES].join("\n"));
-        let _ = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-
-        input.scroll(LINES as i32);
-        assert_eq!(input.scroll_y(), 0, "the wheel scrolled back to the top");
-
-        let end = input.buffer.value().len();
-        plugin_write(&mut input, end - 1..end, "b");
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert!(
-            input.scroll_y() > 0,
-            "the edit put the cursor on the last row, so the view has to follow"
-        );
-        assert!(rendered.cursor.is_some(), "{}", CURSOR_ON_THE_EDIT);
-    }
-
-    #[test_case(|input| { input.handle_key(KeyCode::Enter.into(), InputMode::Insert); } ; "backslash_continuation")]
-    #[test_case(|input| plugin_write(input, 0..1, "plugin\nwrite")                   ; "plugin_write")]
-    fn each_action_undoes_in_one_step(action: fn(&mut InputBox)) {
-        const BEFORE: &str = "a\\";
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.set_input(BEFORE);
-        input.buffer.move_to_end();
-        action(&mut input);
-
-        assert!(input.undo());
-        assert_eq!(input.buffer.value(), BEFORE);
-        assert_eq!(input.buffer.cursor_byte(), BEFORE.len());
-        assert!(!input.undo());
-    }
-
-    type Rgb = (u8, u8, u8);
-
-    const MARKS_PLUGIN: &str = "test";
-    const MARKS_NS: &str = "marks";
-    const RED: Rgb = (200, 0, 0);
-    const BLUE: Rgb = (0, 0, 200);
-
-    fn mark(bytes: Range<usize>, decoration: Decoration) -> Mark {
-        Mark {
-            start: bytes.start,
-            stop: (!bytes.is_empty()).then_some(bytes.end),
-            decoration: Arc::new(decoration),
-        }
-    }
-
-    fn virt(text: &str, pos: VirtTextPos) -> Decoration {
-        Decoration {
-            virt_text: vec![SnapshotSpan {
-                text: text.into(),
-                style: SpanStyle::Default,
-            }],
-            virt_text_pos: pos,
-            ..Decoration::default()
-        }
-    }
-
-    fn hl(style: InlineStyle) -> Decoration {
-        Decoration {
-            hl: Some(SpanStyle::Inline(style)),
-            ..Decoration::default()
-        }
-    }
-
-    fn fg(rgb: Rgb) -> InlineStyle {
-        InlineStyle {
-            fg: Some(SpanColor::Rgb(rgb)),
-            ..InlineStyle::default()
-        }
-    }
-
-    /// The caret goes to the end, so it never covers a cell a test reads.
-    fn marked(text: &str, marks: Vec<Mark>) -> InputBox {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.set_input(text);
-        input.buffer.move_to_end();
-        input
-            .set_marks(input.buffer.version(), MARKS_PLUGIN, MARKS_NS, marks)
-            .unwrap();
-        input
-    }
-
-    /// The cell {x} columns into the text of screen row {row}, past the
-    /// chevron.
-    fn text_cell(
-        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
-        x: u16,
-        row: u16,
-    ) -> ratatui::buffer::Cell {
-        let col = PREFIX_WIDTH + x;
-        terminal
-            .backend()
-            .buffer()
-            .cell((col, row))
-            .unwrap()
-            .clone()
-    }
-
-    #[test]
-    fn hl_paints_only_its_range() {
-        let bold = InlineStyle {
-            bold: true,
-            ..InlineStyle::default()
-        };
-        let mut input = marked("plain bold", vec![mark(6..10, hl(bold))]);
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        let is_bold = |x| text_cell(&terminal, x, 1).modifier.contains(Modifier::BOLD);
-        assert!(!is_bold(5));
-        assert!((6..10).all(is_bold));
-    }
-
-    #[test_case(&[RED], &[BLUE] => BLUE ; "a_later_namespace_wins")]
-    #[test_case(&[], &[RED, BLUE] => BLUE ; "the_later_mark_wins_within_a_namespace")]
-    fn composition(first: &[Rgb], second: &[Rgb]) -> Rgb {
-        let marks = |set: &[Rgb]| set.iter().map(|&rgb| mark(0..2, hl(fg(rgb)))).collect();
-        let mut input = marked("xy", marks(first));
-        input
-            .set_marks(
-                input.buffer.version(),
-                MARKS_PLUGIN,
-                "second",
-                marks(second),
-            )
-            .unwrap();
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        let drawn = text_cell(&terminal, 0, 1).fg;
-        *[RED, BLUE]
-            .iter()
-            .find(|&&rgb| resolve_span_style(&SpanStyle::Inline(fg(rgb))).fg == Some(drawn))
-            .expect("one of the two colors is drawn")
-    }
-
-    /// Ten columns of text: the virtual text pushes `h` onto a row of its own.
-    #[test]
-    fn inline_virtual_text_takes_columns_and_wraps() {
-        let mut input = marked(
-            "abcdefgh",
-            vec![mark(4..4, virt("XYZ", VirtTextPos::Inline))],
-        );
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}abcdXYZefg"));
-        assert_eq!(rendered_row(&terminal, 2), "h");
-        assert_eq!(input.height(CURSOR_WIDTH), 2 + BORDER_ROWS);
-    }
-
-    #[test]
-    fn eol_virtual_text_is_cut_rather_than_wrapped() {
-        let mut input = marked("abcdefgh", vec![mark(0..0, virt("TAIL", VirtTextPos::Eol))]);
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}abcdefgh T"));
-        assert_eq!(input.height(CURSOR_WIDTH), 1 + BORDER_ROWS);
-    }
-
-    /// Ghost text reads on from where the user types, so the caret sits on
-    /// its first cell rather than past it.
-    #[test]
-    fn the_caret_comes_before_virtual_text_at_it() {
-        let mut input = marked("ab", vec![mark(2..2, virt("cd", VirtTextPos::Inline))]);
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(
-            rendered_row(&rendered.terminal, 1),
-            format!("{CHEVRON}abcd")
-        );
-        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH + 2, 1)));
-    }
-
-    #[test_case(PREFIX_WIDTH + 2 => Some((0, 2)) ; "on_the_virtual_text")]
-    #[test_case(PREFIX_WIDTH + 4 => Some((0, 2)) ; "on_the_char_after_it")]
-    #[test_case(PREFIX_WIDTH + 5 => Some((0, 3)) ; "past_it")]
-    fn a_click_on_virtual_text_lands_on_the_char_after_it(col: u16) -> Option<(usize, usize)> {
-        let input = marked("abcd", vec![mark(2..2, virt("XY", VirtTextPos::Inline))]);
-        input.click_position(area(CURSOR_WIDTH), 0, col)
-    }
-
-    /// The same code sits on two lines and only the first is marked, so the
-    /// second shows what the text looks like without the mark.
-    #[test]
-    fn lang_colors_its_range_as_code() {
-        const CODE: &str = "fn x";
-        crate::highlight::warmup();
-        let rust = Decoration {
-            lang: Some("rust".into()),
-            ..Decoration::default()
-        };
-        let mut input = marked(&format!("{CODE}\n{CODE}"), vec![mark(0..CODE.len(), rust)]);
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_ne!(text_cell(&terminal, 0, 1).fg, text_cell(&terminal, 0, 2).fg);
-    }
-
-    #[test]
-    fn marks_follow_the_draft_to_another_chat_and_back() {
-        let mut input = marked("draft", vec![mark(0..5, hl(fg(RED)))]);
-
-        let parked = input.swap_draft(Draft::default());
-        assert!(mark_ranges(&input.buffer).is_empty());
-
-        input.swap_draft(parked);
-        assert_eq!(input.buffer.value(), "draft");
-        assert_eq!(mark_ranges(&input.buffer), vec![0..5]);
-    }
-
-    /// Two chats with empty drafts read the same, yet an edit a plugin
-    /// planned on the one left behind must not land in the one in front.
-    #[test]
-    fn a_stale_edit_is_refused_after_swapping_in_a_draft_that_reads_the_same() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        let planned = input.buffer.version();
-
-        input.swap_draft(Draft::default());
-
-        assert_ne!(input.buffer.version(), planned, "a strict edit compares it");
-        let refused = input
-            .apply_edits(planned, vec![text_edit(0, 0, DRAFT)], None, None, None)
-            .unwrap_err();
-        assert!(refused.starts_with(INPUT_REPLACED_ERR), "{refused}");
-        assert!(input.buffer.is_empty());
-    }
-
-    #[test_case(|input| { input.submit(); } ; "submit")]
-    #[test_case(InputBox::discard           ; "discard")]
-    fn ghost_text_goes_with_the_prompt(put_away: fn(&mut InputBox)) {
-        let ghost = mark(DRAFT.len()..DRAFT.len(), virt("ghost", VirtTextPos::Inline));
-        let mut input = marked(DRAFT, vec![ghost]);
-
-        put_away(&mut input);
-        type_text(&mut input, DRAFT);
-
-        assert!(mark_ranges(&input.buffer).is_empty());
-    }
-
-    #[test_case(|input| { input.history_down(); } ; "history_down")]
-    #[test_case(|input| { let parked = input.swap_draft(Draft::default()); input.swap_draft(parked); } ; "a_chat_switch_and_back")]
-    fn the_draft_keeps_its_marks_under_a_history_recall(come_back: fn(&mut InputBox)) {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        submit_text(&mut input, RECALLED);
-        type_text(&mut input, DRAFT);
-        let version = input.buffer.version();
-        let marks = vec![mark(0..DRAFT.len(), hl(fg(RED)))];
-        input
-            .set_marks(version, MARKS_PLUGIN, MARKS_NS, marks)
-            .unwrap();
-
-        input.history_up();
-        assert!(mark_ranges(&input.buffer).is_empty(), "an entry has none");
-        come_back(&mut input);
-
-        assert_eq!(input.buffer.value(), DRAFT);
-        assert_eq!(mark_ranges(&input.buffer), vec![0..DRAFT.len()]);
-    }
-
-    /// `$s:go` is drawn as the four columns of `[go]`, so the row reads
-    /// `a [go] b` and the chip takes text columns 2 to 5.
-    const CHIP_TEXT: &str = "a $s:go b";
-    const CHIP: Range<usize> = 2..7;
-    const CHIP_DRAWN: &str = "a [go] b";
-
-    fn chip(reveal: Reveal) -> InputBox {
-        let decoration = Decoration {
-            conceal: Some("[go]".into()),
-            reveal,
-            atomic: true,
-            ..Decoration::default()
-        };
-        marked(CHIP_TEXT, vec![mark(CHIP, decoration)])
-    }
-
-    #[test]
-    fn a_conceal_is_drawn_until_the_raw_text_is_asked_for() {
-        let mut input = chip(Reveal::Never);
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
-
-        input.buffer.toggle_raw();
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_TEXT}"));
-    }
-
-    #[test]
-    fn a_revealing_conceal_shows_its_text_while_the_caret_is_on_an_edge() {
-        let mut input = chip(Reveal::Cursor);
-        input.buffer.set_cursor(0, CHIP.end);
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_TEXT}"));
-
-        input.buffer.move_to_end();
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
-    }
-
-    #[test_case(2, CHIP.end, 6 ; "left_onto_its_end")]
-    #[test_case(3, CHIP.start, 2 ; "left_again_onto_its_start")]
-    fn the_caret_steps_over_a_chip(lefts: usize, byte: usize, col: u16) {
-        let mut input = chip(Reveal::Never);
-        for _ in 0..lefts {
-            input.handle_key(KeyCode::Left.into(), InputMode::Insert);
-        }
-        assert_eq!(input.buffer.cursor_byte(), byte);
-        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH + col, 1)));
-    }
-
-    #[test_case(PREFIX_WIDTH + 3 => CHIP.start ; "on_its_first_half")]
-    #[test_case(PREFIX_WIDTH + 4 => CHIP.end ; "on_its_second_half")]
-    #[test_case(PREFIX_WIDTH + 7 => CHIP_TEXT.find('b').unwrap() ; "on_the_char_after_it")]
-    fn clicking_a_chip_row(col: u16) -> usize {
-        let mut input = chip(Reveal::Never);
-        input.handle_click(area(CURSOR_WIDTH), 0, col);
-        input.buffer.cursor_byte()
-    }
-
-    /// Ghost text `XY` before the `b`: the cells copy as the text under them,
-    /// never as what is drawn.
-    #[test_case(3, 6 => " $s:go" ; "a_chip_cut_by_the_end_is_taken_whole")]
-    #[test_case(5, 9 => "$s:go " ; "ending_on_virtual_text_leaves_it_out")]
-    #[test_case(0, 11 => format!("{CHEVRON}{CHIP_TEXT}") ; "starting_on_the_prefix_takes_it")]
-    fn copying_part_of_a_chip_row_copies_the_source(start_col: u16, end_col: u16) -> String {
-        let mut input = chip(Reveal::Never);
-        let ghost = mark(8..8, virt("XY", VirtTextPos::Inline));
-        input
-            .set_marks(input.buffer.version(), MARKS_PLUGIN, "ghost", vec![ghost])
-            .unwrap();
-        let selection = ScreenSelection {
-            start_row: 1,
-            start_col,
-            end_row: 1,
-            end_col,
-        };
-        input.selected_text(Rect::new(0, 1, CURSOR_WIDTH, CURSOR_HEIGHT - 2), &selection)
-    }
-
-    fn shift(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::SHIFT)
-    }
-
-    /// Shift+Right over `a`, the space and the chip takes the chip whole. It
-    /// still draws as `[go]`, now in the selection colors over the red of the
-    /// mark, and copies as its source.
-    #[test]
-    fn a_selection_paints_over_marks_and_copies_the_source() {
-        const SELECTED: &str = "a $s:go";
-        const SELECTED_DRAWN: &str = "a [go]";
-        const RIGHTS_OVER_THE_CHIP: usize = 3;
-        // The comparison needs a selection style with explicit colors. The
-        // ambient theme comes from the user's state dir and may reverse
-        // instead, so pin one that paints.
-        const THEME: &str = "dracula";
-        theme::set(theme::load_by_name(THEME).expect(THEME));
-        let mut input = chip(Reveal::Never);
-        let red = mark(0..CHIP_TEXT.len(), hl(fg(RED)));
-        input
-            .set_marks(input.buffer.version(), MARKS_PLUGIN, "red", vec![red])
-            .unwrap();
-        input.buffer.set_cursor(0, 0);
-        for _ in 0..RIGHTS_OVER_THE_CHIP {
-            input.handle_key(shift(KeyCode::Right), InputMode::Insert);
-        }
-
-        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
-        let selected = theme::current().item_selected;
-        let is_selected = |x| {
-            let cell = text_cell(&terminal, x, 1);
-            (cell.fg, cell.bg) == (selected.fg.unwrap(), selected.bg.unwrap())
-        };
-        let selected_end = SELECTED_DRAWN.len() as u16;
-        assert!((0..selected_end).all(is_selected));
-        assert!(!is_selected(selected_end));
-        assert_eq!(input.take_selected_text().as_deref(), Some(SELECTED));
-        assert_eq!(input.buffer.selection(), None);
-    }
-
-    /// Up on the first line has nothing to move over, so Shift+Up must not
-    /// fall through to the history and swap out the text being selected.
-    #[test]
-    fn shift_selects_before_history_and_esc_drops_it_first() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        submit_text(&mut input, RECALLED);
-        type_text(&mut input, DRAFT);
-        input.handle_key(shift(KeyCode::Up), InputMode::Insert);
-        input.handle_key(shift(KeyCode::Home), InputMode::Normal);
-        assert_eq!(input.buffer.value(), DRAFT);
-        assert_eq!(input.buffer.selection(), Some(0..DRAFT.len()));
-
-        let esc = KeyCode::Esc.into();
-        assert!(matches!(
-            input.handle_key(esc, InputMode::Insert),
-            InputAction::None
-        ));
-        assert_eq!(input.buffer.selection(), None);
-        assert!(matches!(
-            input.handle_key(esc, InputMode::Insert),
-            InputAction::Passthrough(_)
-        ));
-    }
-
-    const SHELL_WIDTH: u16 = 30;
-
-    /// The `!` used to be painted by hand, and the two core rules took over.
-    /// So the old look is rebuilt here from `parse_shell_prefix` and a bash
-    /// mark, and every cell has to match it.
-    #[test_case("!ls -la"       ; "bang")]
-    #[test_case("!  ls"         ; "bang_with_extra_spaces")]
-    #[test_case("!!x=1 && ls"   ; "double_bang")]
-    #[test_case("!!!ls"         ; "triple_bang")]
-    #[test_case("!"             ; "lone_bang")]
-    #[test_case("!!"            ; "lone_double_bang")]
-    #[test_case("!! "           ; "double_bang_and_space")]
-    #[test_case("!\nls"         ; "bang_then_command_on_the_next_line")]
-    #[test_case("ls\n!ls"       ; "bang_on_a_later_line")]
-    fn a_shell_prompt_draws_like_parse_shell_prefix_reads_it(text: &str) {
-        crate::highlight::warmup();
-        let first_line = text.split('\n').next().unwrap();
-        let prefix = parse_shell_prefix(first_line).map_or(0, |parsed| parsed.prefix_len);
-        let bash = Decoration {
-            lang: Some("bash".into()),
-            ..Decoration::default()
-        };
-        let command = (prefix > 0).then(|| mark(prefix..first_line.len(), bash));
-        let expected = render_input(
-            &mut marked(text, command.into_iter().collect()),
-            SHELL_WIDTH,
-            CURSOR_HEIGHT,
-        );
-        let mut shell = marked(text, Vec::new());
-        shell.buffer.set_rules(RuleSet::with_plugins(&[]));
-        let shell = render_input(&mut shell, SHELL_WIDTH, CURSOR_HEIGHT);
-
-        let prefix_cols = PREFIX_WIDTH..PREFIX_WIDTH + prefix as u16;
-        let expected = expected.backend().buffer();
-        for (i, cell) in shell.backend().buffer().content.iter().enumerate() {
-            let (col, row) = expected.pos_of(i);
-            let mut want = expected.content[i].clone();
-            if row == 1 && prefix_cols.contains(&col) {
-                want.set_style(theme::current().shell_prefix);
-            }
-            assert_eq!(cell, &want, "cell ({col}, {row})");
-        }
-    }
-
-    fn chip_rule(conceal: &str) -> Arc<RuleSet> {
-        let mark = Decoration {
-            conceal: Some(conceal.into()),
-            atomic: true,
-            ..Decoration::default()
-        };
-        RuleSet::with_plugins(&[InputRule::Pattern(
-            PatternRule::new(r"\$s:(\w+)", mark).unwrap(),
-        )])
-    }
-
-    /// The half typed chip is drawn first, so its line is matched and kept
-    /// before the chip exists. A stale cache would never show the chip.
-    #[test]
-    fn a_rule_chip_appears_once_typed_and_deletes_whole() {
-        let mut input = ruled(chip_rule("[$1]"));
-        let drawn_row = |input: &mut InputBox| {
-            rendered_row(&render_input(input, CURSOR_WIDTH, CURSOR_HEIGHT), 1)
-        };
-        let (head, tail) = CHIP_TEXT.split_at(CHIP.start + 2);
-        type_text(&mut input, head);
-        assert_eq!(drawn_row(&mut input), format!("{CHEVRON}{head}"));
-
-        type_text(&mut input, tail);
-        assert_eq!(drawn_row(&mut input), format!("{CHEVRON}{CHIP_DRAWN}"));
-
-        input.buffer.set_cursor(0, CHIP.end);
-        input.handle_key(KeyCode::Backspace.into(), InputMode::Insert);
-        assert_eq!(input.buffer.value(), "a  b");
-    }
-
-    /// Each line is two rows raw and one as a chip. Nothing is ever drawn, so
-    /// the totals only add up if the layout matches lines on its own. The
-    /// paste on top shifts every cached line down by one, which must not mix
-    /// up whose marks are whose.
-    #[test]
-    fn rule_chips_count_rows_on_lines_never_drawn() {
-        const LINES: u32 = 30;
-        let line = format!("$s:{}", "w".repeat(CURSOR_EW - 2));
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.set_input(&vec![line.as_str(); LINES as usize].join("\n"));
-        input.buffer.set_cursor(0, 0);
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 * LINES);
-
-        input.buffer.set_rules(chip_rule("$1"));
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
-
-        input.handle_paste(&format!("{line}\n"));
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES + 1);
-    }
-
-    const PREVIEW_BLOCK: &str = r#"
-        (fenced_code_block
-          (info_string (language) @injection.language)
-          (code_fence_content) @injection.content)
-        (fenced_code_block_delimiter) @hidden
-    "#;
-    const PREVIEW_INLINE: &str = "(strong_emphasis (emphasis_delimiter) @hidden) @strong";
-
-    /// Bold without its stars. The block query only puts the markdown
-    /// grammar in the rule, and that is what runs the inline one under it.
-    fn preview_rules() -> Arc<RuleSet> {
-        let hidden = Decoration {
-            conceal: Some(String::new()),
-            reveal: Reveal::Cursor,
-            ..Decoration::default()
-        };
-        let strong = hl(InlineStyle {
-            bold: true,
-            ..InlineStyle::default()
-        });
-        let rule = SyntaxRule::new(
-            "markdown",
-            vec![
-                ("markdown".into(), PREVIEW_BLOCK.into()),
-                ("markdown_inline".into(), PREVIEW_INLINE.into()),
-            ],
-            vec![("hidden".into(), hidden), ("strong".into(), strong)],
-        )
-        .unwrap();
-        RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))])
-    }
-
-    fn ruled(rules: Arc<RuleSet>) -> InputBox {
-        decor_worker::manual();
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.buffer.set_rules(rules);
-        input
-    }
-
-    /// Runs the worker until it has nothing left, taking each reply in like
-    /// the event loop's ticks would.
-    fn settle(input: &mut InputBox) {
-        input.poll_decor();
-        while decor_worker::run_queued() > 0 {
-            input.poll_decor();
-        }
-    }
-
-    /// The worker has not seen the edits yet. A `z` typed inside the bold,
-    /// right after its stars, and one typed inside the code grow those marks
-    /// like placed ones grow, so neither flashes plain and no star comes
-    /// back. A backtick typed inside a fence lands inside what it conceals,
-    /// the one place the raw text shows until the worker is back.
-    #[test]
-    fn a_stale_result_grows_with_what_is_typed_inside_its_marks() {
-        const DOC: &str = "**a** x\n```rust\nlet y\n```\n";
-        const WIDTH: u16 = 30;
-        const HEIGHT: u16 = 8;
-        const FIRST_ROW: u16 = 1;
-        const CODE_ROW: u16 = 3;
-        const SETTLED: [&str; 4] = ["a x", "rust", "let y", ""];
-        const STALE: [&str; 4] = ["za x", "````rust", "let zy", "````"];
-        const EDITED: [&str; 4] = ["za x", "rust", "let zy", ""];
-        let draw = |input: &mut InputBox| {
-            let terminal = render_input(input, WIDTH, HEIGHT);
-            let rows: Vec<String> = (FIRST_ROW..FIRST_ROW + SETTLED.len() as u16)
-                .map(|row| {
-                    let text = rendered_row(&terminal, row);
-                    text.chars().skip(PREFIX_WIDTH.into()).collect()
-                })
-                .collect();
-            (terminal, rows)
-        };
-        let insert = |start, text| text_edit(start, start, text);
-        crate::highlight::warmup();
-        let mut input = ruled(preview_rules());
-        input.set_input(DOC);
-        let x = DOC.find('x').unwrap();
-        input.buffer.set_cursor(0, x);
-        settle(&mut input);
-        let (terminal, rows) = draw(&mut input);
-        assert_eq!(rows, SETTLED);
-        let code = text_cell(&terminal, 0, CODE_ROW).style();
-        assert_ne!(code, text_cell(&terminal, 2, FIRST_ROW).style());
-
-        let fences = DOC.match_indices("```").map(|(at, _)| insert(at + 1, "`"));
-        let mut edits = vec![insert(2, "z"), insert(DOC.find('y').unwrap(), "z")];
-        edits.extend(fences);
-        edits.sort_by_key(|edit| edit.start);
-        let cursor = Some(x + "z".len());
-        input
-            .apply_edits(input.buffer.version(), edits, cursor, None, None)
-            .unwrap();
-        let (terminal, rows) = draw(&mut input);
-        assert_eq!(rows, STALE);
-        let bold = text_cell(&terminal, 0, FIRST_ROW).modifier;
-        assert!(bold.contains(Modifier::BOLD));
-        assert_eq!(text_cell(&terminal, 0, CODE_ROW).style(), code);
-
-        settle(&mut input);
-        assert_eq!(draw(&mut input).1, EDITED);
-    }
-
-    /// Opening a fence turns every line under it into code, so their stars
-    /// come back and each one wraps onto a second row. Those lines are far
-    /// from the edit and never drawn, so only the result can tell the layout
-    /// to count them again.
-    #[test]
-    fn a_result_recounts_lines_far_from_the_edit() {
-        const LINES: u32 = 20;
-        let mut input = ruled(preview_rules());
-        let bold = format!("**{}**", "w".repeat(CURSOR_EW - 2));
-        let text = format!("top\n{}", vec![bold.as_str(); LINES as usize].join("\n"));
-        input.set_input(&text);
-        input.buffer.set_cursor(0, 0);
-        settle(&mut input);
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 1 + LINES);
-
-        let fence = text_edit("top\n".len(), "top\n".len(), "```\n");
-        input
-            .apply_edits(input.buffer.version(), vec![fence], None, None, None)
-            .unwrap();
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + LINES);
-
-        settle(&mut input);
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + 2 * LINES);
-    }
-
-    /// The block draws a badge wide enough to wrap the line it starts on.
-    /// Typing inside the atomic block drops it before the worker is back,
-    /// lines away from the edit, so that line has to be counted again.
-    #[test]
-    fn a_stale_mark_dropped_lines_away_recounts_them() {
-        const DOC: &str = "```\na\nb\n```";
-        const LINES: u32 = 4;
-        let badge = Decoration {
-            atomic: true,
-            ..virt(&"b".repeat(CURSOR_EW), VirtTextPos::Inline)
-        };
-        let rule = SyntaxRule::new(
-            "markdown",
-            vec![("markdown".into(), "(fenced_code_block) @badge".into())],
-            vec![("badge".into(), badge)],
-        )
-        .unwrap();
-        let mut input = ruled(RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))]));
-        input.set_input(DOC);
-        input.buffer.set_cursor(0, 0);
-        settle(&mut input);
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES + 1);
-
-        let b = DOC.find('b').unwrap();
-        let edit = text_edit(b, b, "z");
-        input
-            .apply_edits(input.buffer.version(), vec![edit], None, None, None)
-            .unwrap();
-        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
-    }
-
-    const ABOVE_CODE: &str = "top\n";
-    const BLOCK_COMMENT_START: &str = "/*\nx\n";
-    const BLOCK_COMMENT_END: &str = "*/";
-    /// Past what a frame colors by itself, so the range goes to the worker.
-    const LONG_FILLER: usize = 3000;
-
-    /// A line of text, then a block comment marked as rust, made {filler}
-    /// bytes longer.
-    fn commented(filler: usize) -> InputBox {
-        crate::highlight::warmup();
-        decor_worker::manual();
-        let code = format!(
-            "{BLOCK_COMMENT_START}{}{BLOCK_COMMENT_END}",
-            "y\n".repeat(filler / 2)
-        );
-        let rust = Decoration {
-            lang: Some("rust".into()),
-            ..Decoration::default()
-        };
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        input.set_input(&format!("{ABOVE_CODE}{code}"));
-        let range = ABOVE_CODE.len()..ABOVE_CODE.len() + code.len();
-        input
-            .set_marks(
-                input.buffer.version(),
-                MARKS_PLUGIN,
-                MARKS_NS,
-                vec![mark(range, rust)],
-            )
-            .unwrap();
-        input.buffer.set_cursor(0, 0);
-        input
-    }
-
-    /// Types at the top, or inside the comment under the line of `x`.
-    fn type_in_commented(input: &mut InputBox, inside: bool) {
-        let at = if inside {
-            ABOVE_CODE.len() + BLOCK_COMMENT_START.len()
-        } else {
-            0
-        };
-        let edit = text_edit(at, at, "z");
-        input
-            .apply_edits(input.buffer.version(), vec![edit], None, None, None)
-            .unwrap();
-    }
-
-    /// Whether `x` looks like the `*` of the line that opens its comment.
-    /// Colored on its own, `x` would look like a plain identifier.
-    fn colored_whole(input: &mut InputBox) -> bool {
-        let terminal = render_input(input, CURSOR_WIDTH, CURSOR_HEIGHT);
-        text_cell(&terminal, 1, 2).style() == text_cell(&terminal, 0, 3).style()
-    }
-
-    #[test]
-    fn a_short_lang_range_is_colored_whole_in_the_frame() {
-        let mut input = commented(0);
-        assert!(colored_whole(&mut input));
-        assert_eq!(decor_worker::run_queued(), 0);
-    }
-
-    /// Until the worker is back, each line is colored on its own, so the
-    /// code never flashes plain. Once colored, a frame reads none of the
-    /// range's text again until an edit lands inside it.
-    #[test_case(false ; "an_edit_above_it_moves_its_colors")]
-    #[test_case(true  ; "an_edit_inside_it_colors_it_again")]
-    fn a_long_range_is_colored_again_only_when_an_edit_touches_it(inside: bool) {
-        let mut input = commented(LONG_FILLER);
-        assert!(!colored_whole(&mut input));
-        assert_eq!(decor_worker::run_queued(), 1);
-        assert!(input.poll_decor());
-        assert!(colored_whole(&mut input));
-        decor::take_bytes_read();
-
-        type_in_commented(&mut input, inside);
-        assert_eq!(colored_whole(&mut input), !inside);
-        assert_eq!(decor::take_bytes_read() > 0, inside);
-        assert_eq!(decor_worker::run_queued(), usize::from(inside));
-    }
-
-    /// Here the edit lands while the worker is still coloring. Its colors
-    /// move along with an edit above the range. An edit inside makes them
-    /// wrong, so they are thrown away and the range is colored again. Either
-    /// way the result asks for a frame, or nothing would hand the range to
-    /// the worker again until some other redraw.
-    #[test_case(false ; "an_edit_above_it_moves_them")]
-    #[test_case(true  ; "an_edit_inside_it_drops_them")]
-    fn colors_from_the_worker_land_on_the_text_now(inside: bool) {
-        let mut input = commented(LONG_FILLER);
-        assert!(!colored_whole(&mut input));
-        type_in_commented(&mut input, inside);
-        assert!(!colored_whole(&mut input));
-        assert_eq!(decor_worker::run_queued(), 1);
-        assert!(input.poll_decor());
-        assert_eq!(colored_whole(&mut input), !inside);
-
-        assert_eq!(decor_worker::run_queued(), usize::from(inside));
-        input.poll_decor();
-        assert!(colored_whole(&mut input));
     }
 }

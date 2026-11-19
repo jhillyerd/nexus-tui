@@ -295,6 +295,7 @@ impl SelectionState {
 
     /// Edge scroll advances on a timer while a drag rests against the edge of
     /// the viewport, with no further mouse events to wake the loop.
+    #[allow(dead_code)] // edge-scroll cadence returns with drag edge cases
     pub fn cadence(&self) -> Cadence {
         Cadence::when(self.is_edge_scrolling(), Cadence::SMOOTH)
     }

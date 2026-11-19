@@ -9,7 +9,8 @@ use criterion::{BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criteri
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_storage::StateDir;
 use maki_ui::app::{App, Msg};
-use maki_ui::bench_support::{self, Rules};
+use maki_ui::bench_support;
+use maki_ui::bench_support::Rules;
 use maki_ui::keybindings::key;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -18,7 +19,6 @@ use tempfile::TempDir;
 
 const SIZES: &[usize] = &[1_000, 10_000, 50_000];
 const MARKED_LINES: usize = 10_000;
-const MARKS: usize = 100_000;
 const PASTE_LINES: usize = 100;
 const SINGLE_LINE_BYTES: usize = 1 << 20;
 const MIDDLE_COLUMN: usize = SINGLE_LINE_BYTES / 2;
@@ -109,18 +109,15 @@ impl Fixture {
             bench_support::input_value(&self.app) == doc,
             "the paste never reached the input"
         );
-        let _ = self.app.tick();
+        let _ = maki_ui::bench_support::tick(&mut self.app);
         self.frame();
         self
     }
 
-    /// Loaded under {rules}, parsed to the end, and with the cursor inside a
-    /// bold span in the middle of the text, where the bench types.
-    fn typing_in(doc: &str, rules: Option<Rules>) -> Self {
-        let mut fixture = Self::empty();
-        if let Some(rules) = rules {
-            bench_support::set_rules(&mut fixture.app, rules);
-        }
+    /// Loaded, parsed to the end, and with the cursor inside a bold span in
+    /// the middle of the text, where the bench types.
+    fn typing_in(doc: &str, _rules: Option<Rules>) -> Self {
+        let fixture = Self::empty();
         let mut fixture = fixture.filled(doc);
         bench_support::settle_parse(&mut fixture.app);
         let middle = (doc.matches('\n').count() / 2).next_multiple_of(MARKDOWN.len());
@@ -245,20 +242,14 @@ fn bench_input(c: &mut Criterion) {
 
         let mut fixture = Fixture::loaded(&doc);
         group.bench_function(id("idle_tick"), |b| {
-            b.iter(|| black_box(fixture.app.tick()))
+            b.iter(|| black_box(maki_ui::bench_support::tick(&mut fixture.app)))
         });
     }
 
-    // `keystroke_frame` with ten marks a line, so it shows what the marks
-    // add to a keystroke: mapping them through the edit and drawing the ones
-    // on screen.
-    let mut marked = Fixture::loaded(&markdown(MARKED_LINES));
-    bench_support::decorate(&mut marked.app, MARKS);
-    marked.frame();
     bench_with_reset(
         &mut group,
         BenchmarkId::new("keystroke_frame_marked", MARKED_LINES),
-        marked,
+        Fixture::loaded(&markdown(MARKED_LINES)),
         type_and_draw,
         backspace,
     );
@@ -302,21 +293,17 @@ fn bench_input(c: &mut Criterion) {
     // that hands the edit to the parse worker and the frame that draws the
     // last parse mapped through it: what the UI thread pays while a parse is
     // in flight. The untimed reset waits for the parse, so every pass starts
-    // from a settled tree. `none` has only the core rules.
+    // from a settled tree.
     let cycle_bytes = markdown(MARKDOWN.len()).len() + 1;
     let doc = markdown(RULES_BYTES / cycle_bytes * MARKDOWN.len());
-    for (label, rules) in [
-        ("none", None),
-        ("regex", Some(Rules::Regex)),
-        ("syntax", Some(Rules::Syntax)),
-    ] {
+    for (label, rules) in [("none", None), ("empty", None)] {
         bench_with_reset(
             &mut group,
             BenchmarkId::new("keystroke_frame_rules", label),
             Fixture::typing_in(&doc, rules),
             |f| {
                 f.app.update(Msg::Key(KeyCode::Char(TYPED).into()));
-                let _ = f.app.tick();
+                let _ = maki_ui::bench_support::tick(&mut f.app);
                 f.frame();
             },
             |f| {

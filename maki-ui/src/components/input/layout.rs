@@ -21,7 +21,6 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-use maki_agent::SnapshotSpan;
 use unicode_width::UnicodeWidthChar;
 
 use crate::text_buffer::TextBuffer;
@@ -332,7 +331,7 @@ fn text_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
-fn virt_width(spans: &[SnapshotSpan]) -> usize {
+fn virt_width(spans: &[maki_lua::span_style::SnapshotSpan]) -> usize {
     spans.iter().map(|span| text_width(&span.text)).sum()
 }
 
@@ -375,7 +374,7 @@ impl Shape {
         let mut virts: Vec<(usize, usize)> = buffer
             .inline_virts(window)
             .filter(|mark| mark.bytes.start >= bytes.start)
-            .map(|mark| (mark.bytes.start, virt_width(&mark.decoration.virt_text)))
+            .map(|mark| (mark.bytes.start, virt_width(&mark.decoration.virt_text[..])))
             .collect();
         virts.sort_by_key(|&(at, _)| at);
         virts.dedup_by(|next, kept| {
@@ -560,7 +559,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use maki_agent::{SnapshotSpan, SpanStyle};
+    use maki_lua::span_style::{SnapshotSpan, SpanStyle};
     use maki_lua::{InputRule, PatternRule, SyntaxRule};
     use test_case::test_case;
 

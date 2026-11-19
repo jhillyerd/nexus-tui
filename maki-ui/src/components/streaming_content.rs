@@ -152,6 +152,7 @@ impl StreamingContent {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // kept for the draw path the live tail may take again
     pub fn cached_lines(&self) -> &[Line<'static>] {
         &self.cache.lines
     }

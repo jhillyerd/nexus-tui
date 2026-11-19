@@ -15,6 +15,7 @@ mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
+pub mod span_style;
 
 pub use api::action::ActionInfo;
 pub use api::agent::{MCP_HINT, UNDECLARED_REACH, UNPAID_REACH_ERR};

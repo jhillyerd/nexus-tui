@@ -344,6 +344,19 @@ impl PluginHost {
         Self::start(registry, Interaction::Tty, true)
     }
 
+    /// Boot the host for a client that owns no agent tools: the registry is
+    /// empty and the agent-coupled plugin APIs answer nothing. The UI-facing
+    /// surface (keymaps, input decor, config load) works as usual.
+    pub fn start_standalone(interaction: Interaction, jit: bool) -> Result<Self, PluginError> {
+        Self::start(Arc::new(ToolRegistry::new()), interaction, jit)
+    }
+
+    /// [`Self::new`] for a client that owns no agent tools; see
+    /// [`Self::start_standalone`].
+    pub fn new_standalone() -> Result<Self, PluginError> {
+        Self::new(Arc::new(ToolRegistry::new()))
+    }
+
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.

@@ -1,22 +1,14 @@
 use crate::render_worker::RenderWorker;
-use crate::repaint::Dirty;
-use crate::terminal_image::InlineImage;
 use crate::theme;
 use crate::wrap;
-use maki_providers::ImageSource;
-use std::sync::Arc;
 
 use super::super::code_view::SectionFlags;
-use super::super::tool_display::{ElapsedSpan, HighlightRequest, ToolLines};
+use super::super::tool_display::{HighlightRequest, ToolLines};
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
-use std::mem;
 use std::ops::Range;
-use std::time::Duration;
 
 pub(crate) const GUTTER_COLS: u16 = 2;
-const INST_SUFFIX: &str = "__inst";
-const ELAPSED_STEP: Duration = Duration::from_secs(1);
 
 /// On a pane no wider than the gutter the body would get no room, so there
 /// the gutter steps aside. Everything that wraps, draws, copies or clicks asks
@@ -29,18 +21,6 @@ pub(crate) fn body_width(width: u16) -> u16 {
     width - gutter_cols(width)
 }
 
-pub fn is_instruction_segment(id: &str) -> bool {
-    id.ends_with(INST_SUFFIX)
-}
-
-pub fn instruction_id(parent_id: &str) -> String {
-    format!("{parent_id}{INST_SUFFIX}")
-}
-
-pub fn instruction_parent(id: &str) -> Option<&str> {
-    id.strip_suffix(INST_SUFFIX)
-}
-
 #[derive(Clone, Copy, Default)]
 struct CachedHeight {
     at_width: u16,
@@ -49,7 +29,6 @@ struct CachedHeight {
 
 #[derive(Default, PartialEq, Eq)]
 struct HighlightKey {
-    has_output: bool,
     theme_gen: u64,
 }
 
@@ -57,9 +36,8 @@ impl HighlightKey {
     /// The generation is read here rather than passed in: a theme only swaps
     /// from `update`, never mid-`view`, and a missed call site would silently
     /// splice old-palette lines back in.
-    fn from_request(hl: Option<&HighlightRequest>) -> Self {
+    fn from_request(_hl: Option<&HighlightRequest>) -> Self {
         Self {
-            has_output: hl.is_some_and(|h| h.output.is_some()),
             theme_gen: theme::generation(),
         }
     }
@@ -68,7 +46,6 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
-    pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
     /// Drawn on the first row only, left of the body. The height cache does
     /// not see it, so set it before `set_lines`.
@@ -86,9 +63,6 @@ pub(super) struct Segment {
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
     highlight_key: HighlightKey,
-    pub spinner_lines: Vec<(usize, usize)>,
-    elapsed: Option<ElapsedSpan>,
-    snapshot_base: Option<usize>,
     /// The lines were built for another width or theme, so code blocks and
     /// tables are still wrapped to the old width and spans carry the old
     /// palette. Only the content ages, never the height, so a segment the
@@ -139,36 +113,7 @@ impl Segment {
     /// and the copy path all read this one number, so none of them can
     /// disagree on how tall a segment is.
     pub fn height(&self, width: u16) -> u16 {
-        self.images
-            .iter()
-            .fold(self.text_height(width), |height, image| {
-                height.saturating_add(image.height())
-            })
-    }
-
-    pub fn set_images(
-        &mut self,
-        sources: impl Iterator<Item = (ImageSource, Option<&'static str>)>,
-    ) {
-        let mut previous = mem::take(&mut self.images).into_iter();
-        self.images = sources
-            .map(|(source, fallback)| {
-                previous
-                    .next()
-                    .filter(|image| Arc::ptr_eq(&image.source().data, &source.data))
-                    .unwrap_or_else(|| InlineImage::new(source, fallback))
-            })
-            .collect();
-    }
-
-    pub fn poll_images(&mut self) -> Dirty {
-        Dirty::any(self.images.iter_mut().map(InlineImage::poll))
-    }
-
-    pub fn release_images(&mut self) {
-        for image in &mut self.images {
-            image.release();
-        }
+        self.text_height(width)
     }
 
     pub fn gutter_cols(&self, width: u16) -> u16 {
@@ -194,6 +139,7 @@ impl Segment {
     }
 
     /// Maps a display row (after wrapping) back to the source line index.
+    #[allow(dead_code)] // the copy path's row mapping, restored with lua windows
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
         self.rows_from(rel_row, width).line()
     }
@@ -210,17 +156,6 @@ impl Segment {
         walk
     }
 
-    /// Maps a source line to a 1-based row in the tool's live buffer, or 0
-    /// for lines outside it (header etc.). The Lua click-row contract is
-    /// computed here and nowhere else, from the base recorded when the
-    /// buffer snapshot was laid out.
-    pub fn buf_row(&self, source_line: usize) -> usize {
-        match self.snapshot_base {
-            Some(base) if source_line >= base => source_line - base + 1,
-            _ => 0,
-        }
-    }
-
     fn invalidate_height(&self) {
         self.cached_height.set(None);
     }
@@ -229,41 +164,6 @@ impl Segment {
         if self.gutter_spins {
             self.gutter = Some(span.clone());
         }
-        for &(line_idx, span_idx) in &self.spinner_lines {
-            if let Some(line) = self.lines.get_mut(line_idx)
-                && line.spans.len() > span_idx
-            {
-                line.spans[span_idx] = span.clone();
-            }
-        }
-    }
-
-    /// How long until the elapsed time shown here goes stale: zero once it
-    /// has, else the rest of the current second.
-    pub fn elapsed_due(&self) -> Option<Duration> {
-        let elapsed = self.elapsed.as_ref()?;
-        let since = elapsed.since.elapsed();
-        if since.as_secs() != elapsed.shown_secs {
-            return Some(Duration::ZERO);
-        }
-        Some(ELAPSED_STEP.saturating_sub(Duration::from_nanos(u64::from(since.subsec_nanos()))))
-    }
-
-    /// Rewrites the elapsed time once per second. The text can change width,
-    /// so the cached height goes with it.
-    pub fn update_elapsed(&mut self) {
-        let Some(elapsed) = &mut self.elapsed else {
-            return;
-        };
-        let secs = elapsed.since.elapsed().as_secs();
-        if secs == elapsed.shown_secs {
-            return;
-        }
-        elapsed.shown_secs = secs;
-        if let Some(header) = self.lines.first_mut() {
-            elapsed.refit(header, secs);
-        }
-        self.invalidate_height();
     }
 
     fn reuse_highlight(
@@ -288,11 +188,8 @@ impl Segment {
         self.pending_highlight = tl.send_highlight(worker);
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
-        self.spinner_lines = tl.spinner_lines;
         self.gutter = Some(tl.gutter);
         self.gutter_spins = tl.gutter_spins;
-        self.elapsed = tl.elapsed;
-        self.snapshot_base = tl.snapshot_base;
         self.truncation = tl.truncation;
         self.set_lines(tl.lines);
     }
@@ -313,9 +210,6 @@ impl Segment {
             self.set_lines(tl.lines);
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
-            self.spinner_lines = tl.spinner_lines;
-            self.elapsed = tl.elapsed;
-            self.snapshot_base = tl.snapshot_base;
         } else {
             self.apply_highlight(tl, worker);
         }
@@ -330,29 +224,9 @@ impl Segment {
             let new_end = start + lines.len();
             self.lines.splice(start..end, lines);
             self.highlight_range = Some((start, new_end));
-            self.shift_after(end, new_end as isize - end as isize);
             self.invalidate_height();
         }
         self.pending_highlight = None;
-    }
-
-    /// Keeps recorded line positions (spinners, buffer base) in step when
-    /// a splice changes the number of lines before them.
-    fn shift_after(&mut self, from: usize, delta: isize) {
-        if delta == 0 {
-            return;
-        }
-        let shift = |v: &mut usize| {
-            if *v >= from {
-                *v = v.saturating_add_signed(delta);
-            }
-        };
-        for (line, _) in &mut self.spinner_lines {
-            shift(line);
-        }
-        if let Some(base) = &mut self.snapshot_base {
-            shift(base);
-        }
     }
 }
 
@@ -369,6 +243,7 @@ pub struct RowWalk<'a> {
 
 impl<'a> RowWalk<'a> {
     /// The source line the cursor sits on, or `None` past the last row.
+    #[allow(dead_code)]
     pub fn line(&self) -> Option<usize> {
         (self.next_line < self.lines.len()).then_some(self.next_line)
     }
@@ -433,18 +308,6 @@ impl SegmentCache {
         self.segments.truncate(len);
     }
 
-    /// Books the spacer and instruction slots a tool fills in later, when its
-    /// output finally arrives. Splicing them in at that point would shift
-    /// every segment after them, and plenty of things hold a segment index by
-    /// then: the scroll position, the search highlight, the scroll a search
-    /// restores, the anchors of a live selection. Empty segments take no rows,
-    /// so a pair nobody fills stays invisible.
-    pub fn reserve_instructions(&mut self, tool_id: &str) {
-        self.segments.push(Segment::default());
-        self.segments
-            .push(Segment::with_tool(instruction_id(tool_id)));
-    }
-
     pub fn needs_rebuild(&self, msg_len: usize) -> bool {
         self.msg_count != msg_len
     }
@@ -498,65 +361,25 @@ impl SegmentCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tool_display::append_right_info;
     use super::*;
-    use std::time::{Duration, Instant};
-    use test_case::test_case;
+    use crate::components::ToolInput;
+    use crate::components::code_view::RenderLimits;
+    use std::sync::Arc;
     use unicode_width::UnicodeWidthStr;
 
     const OTHER_THEME: &str = "dracula";
     const WIDTH: u16 = 20;
 
-    fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
-        Segment {
-            lines: (0..line_count)
-                .map(|i| Line::raw(format!("l{i}")))
-                .collect(),
-            snapshot_base: base,
-            ..Segment::default()
-        }
-    }
-
-    #[test_case(0, 0 ; "header_maps_to_zero")]
-    #[test_case(1, 1 ; "first_snapshot_line_is_row_one")]
-    #[test_case(4, 4 ; "later_line_offsets_from_base")]
-    fn buf_row_maps_source_lines_through_snapshot_base(source_line: usize, expected: usize) {
-        let seg = seg_with_base(5, Some(1));
-        assert_eq!(seg.buf_row(source_line), expected);
-    }
-
-    #[test]
-    fn buf_row_is_zero_without_snapshot() {
-        let seg = seg_with_base(3, None);
-        assert_eq!(seg.buf_row(2), 0);
-    }
-
-    #[test]
-    fn buf_row_tracks_base_when_lines_precede_snapshot() {
-        let seg = seg_with_base(6, Some(3));
-        assert_eq!(seg.buf_row(2), 0, "pre-snapshot lines map outside the buf");
-        assert_eq!(seg.buf_row(3), 1);
-        assert_eq!(seg.buf_row(5), 3);
-    }
-
     #[test]
     fn reuse_highlight_keys_on_theme_not_width() {
-        use crate::components::code_view::RenderLimits;
-        use maki_agent::ToolOutput;
-        use std::sync::Arc;
-
-        let output = Arc::new(ToolOutput::ReadCode {
-            path: "f.rs".into(),
-            start_line: 1,
-            lines: vec!["fn main() {}".into()],
-            total_lines: 1,
-            instructions: None,
+        let input = Arc::new(ToolInput::Code {
+            language: "sh".into(),
+            code: "echo hi".into(),
         });
         let key = || {
             HighlightKey::from_request(Some(&HighlightRequest {
                 range: (1, 3),
-                input: None,
-                output: Some(Arc::clone(&output)),
+                input: Some(Arc::clone(&input)),
                 limits: RenderLimits {
                     script: 0,
                     output: 0,
@@ -589,106 +412,13 @@ mod tests {
         );
     }
 
-    fn ticking_since(ago: Duration, shown_secs: u64) -> Segment {
-        Segment {
-            elapsed: Some(ElapsedSpan {
-                span: 0,
-                since: Instant::now().checked_sub(ago).unwrap(),
-                shown_secs,
-                width: 0,
-            }),
-            ..Segment::default()
-        }
-    }
-
-    /// A moved row's clock changes once a second, so it is due at the next
-    /// second boundary, or at once when the text already lags.
-    #[test]
-    fn elapsed_due_waits_for_the_next_second_only() {
-        const SHOWN_SECS: u64 = 3;
-        const INTO_SECOND: Duration = Duration::from_millis(250);
-        let fresh = ticking_since(Duration::from_secs(SHOWN_SECS) + INTO_SECOND, SHOWN_SECS);
-        assert!(fresh.elapsed_due().unwrap() <= ELAPSED_STEP - INTO_SECOND);
-
-        let stale = ticking_since(Duration::from_secs(SHOWN_SECS + 2), SHOWN_SECS);
-        assert_eq!(stale.elapsed_due(), Some(Duration::ZERO));
-
-        assert_eq!(Segment::default().elapsed_due(), None);
-    }
-
-    const USAGE: &str = "10.6k↑ 148↓ $0.009";
-    const TIMESTAMP: &str = "12:41:53 AM";
-    const GROWN: Duration = Duration::from_secs(94);
-    const GROWN_MINUTES: &str = "1m";
-
-    /// A header laid out with {usage} and the timestamp at "0s", {slack}
-    /// columns to spare, whose clock now reads [`GROWN`].
-    fn ticking_header(usage: Option<&str>, slack: usize) -> (Segment, u16) {
-        let mut header = Line::from(vec![
-            Span::raw("↗ bash> Sleep 120s then echo"),
-            Span::raw(ElapsedSpan::text(0)),
-        ]);
-        let usage_width = usage.map_or(0, |usage| usage.width() + 2);
-        let width = (header.width() + 1 + usage_width + TIMESTAMP.width() + 1 + slack) as u16;
-        append_right_info(&mut header, None, usage, Some(TIMESTAMP), width);
-        let seg = Segment {
-            lines: vec![header],
-            elapsed: Some(ElapsedSpan {
-                span: 1,
-                since: Instant::now().checked_sub(GROWN).unwrap(),
-                shown_secs: 0,
-                width,
-            }),
-            ..Segment::default()
-        };
-        (seg, width)
-    }
-
-    #[test_case(Some(USAGE), 20, true,  true  ; "all_kept_when_growth_fits")]
-    #[test_case(Some(USAGE), 0,  false, true  ; "usage_dropped_when_growth_does_not_fit")]
-    #[test_case(None,        0,  false, false ; "all_dropped_when_nothing_fits")]
-    fn update_elapsed_never_overflows_the_right_info(
-        usage: Option<&str>,
-        slack: usize,
-        expect_usage: bool,
-        expect_timestamp: bool,
-    ) {
-        let (mut seg, width) = ticking_header(usage, slack);
-        seg.update_elapsed();
-
-        let header = &seg.lines[0];
-        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(GROWN_MINUTES), "{text:?}");
-        assert!(header.width() <= width as usize, "wrapped: {text:?}");
-        assert_eq!(text.contains(USAGE), expect_usage);
-        assert_eq!(text.contains(TIMESTAMP), expect_timestamp);
-    }
-    #[test_case(4, 6 ; "splice_grows")]
-    #[test_case(1, 3 ; "splice_shrinks")]
-    fn highlight_splice_shifts_spinners_and_base(replacement_lines: usize, expected_base: usize) {
-        let mut seg = seg_with_base(8, Some(4));
-        seg.highlight_range = Some((1, 3));
-        seg.spinner_lines = vec![(0, 0), (5, 1)];
-        seg.apply_highlight_result((0..replacement_lines).map(|_| Line::raw("hl")).collect());
-        let delta = expected_base as isize - 4;
-        assert_eq!(seg.snapshot_base, Some(expected_base));
-        assert_eq!(
-            seg.spinner_lines,
-            vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
-            "positions before the splice stay, after it shift by the delta"
-        );
-    }
-
     fn tool_lines(gutter: Span<'static>, gutter_spins: bool) -> ToolLines {
         ToolLines {
             lines: vec![Line::raw("header")],
             highlight: None,
-            spinner_lines: vec![],
             gutter,
             gutter_spins,
-            snapshot_base: None,
             truncation: SectionFlags::default(),
-            elapsed: None,
         }
     }
 
@@ -701,7 +431,7 @@ mod tests {
         seg.update_spinners(&frame);
         assert_eq!(seg.gutter.as_ref(), Some(&frame));
 
-        let dot = Span::styled("●", theme::current().tool_success);
+        let dot = Span::styled("\u{25cf}", theme::current().tool_success);
         seg.update_with_reuse(tool_lines(dot.clone(), false), &worker);
         seg.update_spinners(&frame);
         assert_eq!(seg.gutter, Some(dot), "finished dot must not animate");
@@ -709,7 +439,7 @@ mod tests {
 
     fn gutter_seg(lines: Vec<Line<'static>>) -> Segment {
         Segment {
-            gutter: Some(Span::raw("● ")),
+            gutter: Some(Span::raw("\u{25cf} ")),
             ..Segment::with_lines(lines, None)
         }
     }
@@ -733,10 +463,13 @@ mod tests {
 
     #[test]
     fn rows_from_uses_body_width() {
-        let body = usize::from(WIDTH - GUTTER_COLS);
-        let seg = gutter_seg(vec![Line::raw("a".repeat(body + 1)), Line::raw("b")]);
-        assert_eq!(seg.source_line_at(0, WIDTH), Some(0));
-        assert_eq!(seg.source_line_at(1, WIDTH), Some(0));
-        assert_eq!(seg.source_line_at(2, WIDTH), Some(1));
+        let long = "x".repeat(2 * usize::from(WIDTH));
+        let seg = gutter_seg(vec![Line::raw(long), Line::raw("tail")]);
+        let mut walk = seg.rows_from(0, WIDTH);
+        let covered: u16 = walk
+            .next_chunk(u16::MAX)
+            .map_or(0, |(_, rows)| rows.end - rows.start);
+        assert_eq!(covered, seg.height(WIDTH));
+        let _ = UnicodeWidthStr::width("");
     }
 }

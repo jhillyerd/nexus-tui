@@ -7,7 +7,6 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use maki_config::DEFAULT_THINKING_LINES;
-use maki_ui::bench_support::LiveMessage;
 use maki_ui::text_to_lines;
 use ratatui::style::Style;
 
@@ -103,7 +102,7 @@ fn long_quote() -> String {
 }
 
 /// Appends `text` a few bytes at a time and draws after each append.
-fn stream(text: &str, mut live: LiveMessage, draw: fn(&mut LiveMessage) -> usize) -> usize {
+fn stream(text: &str, buf: &mut String, draw: fn(&str) -> usize) -> usize {
     let mut drawn = 0;
     let mut sent = 0;
     while sent < text.len() {
@@ -111,19 +110,28 @@ fn stream(text: &str, mut live: LiveMessage, draw: fn(&mut LiveMessage) -> usize
         while !text.is_char_boundary(end) {
             end += 1;
         }
-        live.push(&text[sent..end]);
-        drawn += draw(&mut live);
+        buf.push_str(&text[sent..end]);
+        drawn += draw(buf);
         sent = end;
     }
     drawn
 }
 
-fn draw_reply(live: &mut LiveMessage) -> usize {
-    live.render(WIDTH)
+fn draw_reply(text: &str) -> usize {
+    maki_ui::text_to_lines(
+        text,
+        PREFIX,
+        Style::default(),
+        Style::default(),
+        WIDTH,
+        None,
+    )
+    .len()
 }
 
-fn draw_thinking(live: &mut LiveMessage) -> usize {
-    live.render_tail(DEFAULT_THINKING_LINES, WIDTH)
+fn draw_thinking(text: &str) -> usize {
+    let lines = maki_ui::text_to_lines(text, "", Style::default(), Style::default(), WIDTH, None);
+    lines.len().saturating_sub(DEFAULT_THINKING_LINES)
 }
 
 fn bench_streaming(c: &mut Criterion) {
@@ -145,10 +153,10 @@ fn bench_streaming(c: &mut Criterion) {
         ("long_quote", &quote),
     ] {
         g.bench_function(format!("text_{name}"), |b| {
-            b.iter(|| stream(black_box(text), LiveMessage::text(), draw_reply))
+            b.iter(|| stream(black_box(text), &mut String::new(), draw_reply))
         });
         g.bench_function(format!("thinking_{name}"), |b| {
-            b.iter(|| stream(black_box(text), LiveMessage::thinking(), draw_thinking))
+            b.iter(|| stream(black_box(text), &mut String::new(), draw_thinking))
         });
     }
     g.finish();

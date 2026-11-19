@@ -68,6 +68,7 @@ impl SearchModal {
         self.saved_scroll = Some((scroll, auto_scroll));
     }
 
+    #[allow(dead_code)] // Close lands through Esc on the keyboard path
     pub fn close(&mut self) {
         self.reset();
     }
@@ -85,7 +86,7 @@ impl SearchModal {
         self.open
     }
 
-    pub fn handle_paste(&mut self, text: &str) {
+    pub(crate) fn handle_paste(&mut self, text: &str) {
         self.search.insert_text(text);
     }
 
@@ -273,16 +274,8 @@ impl SearchModal {
 }
 
 impl Overlay for SearchModal {
-    fn is_prompting(&self) -> bool {
-        false
-    }
-
     fn is_open(&self) -> bool {
         self.is_open()
-    }
-
-    fn close(&mut self) {
-        self.close()
     }
 }
 

@@ -10,19 +10,19 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::ops::Range;
 
-use maki_agent::SpanStyle;
 use maki_highlight::Highlighter;
+use maki_lua::span_style::SpanStyle;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::oneshot::{self, Receiver};
 
 use super::layout::Row;
-use crate::components::tool_display::resolve_span_style;
 use crate::decor_worker;
 use crate::highlight;
 use crate::text_buffer::{Change, Concealed, Placed, TextBuffer, VirtTextPos};
 use crate::theme;
+use crate::theme::resolve_span_style;
 
 /// Longer text is colored on the worker, since coloring it here would hold
 /// up the frame.
@@ -473,6 +473,7 @@ fn count_read(text: &str) {
 /// last call. Jobs run on the test thread under [`decor_worker::manual`], so
 /// theirs count.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn take_bytes_read() -> usize {
     BYTES_READ.take()
 }
@@ -543,8 +544,7 @@ fn mark_style(style: &SpanStyle) -> Style {
 mod tests {
     use std::sync::Arc;
 
-    use maki_agent::types::InlineStyle;
-    use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
+    use maki_lua::span_style::{InlineStyle, SnapshotSpan, SpanColor, SpanStyle};
     use maki_lua::{InputRule, PatternRule, SyntaxRule};
     use test_case::test_case;
 
