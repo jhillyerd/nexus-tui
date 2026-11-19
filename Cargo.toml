@@ -54,6 +54,7 @@ members = [
   "maki-providers",
   "maki-storage",
   "maki-ui",
+  "nexus",
 ]
 resolver = "3"
 
@@ -123,6 +124,7 @@ semver = "1"
 toml = "1"
 toml_edit = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "io-std", "signal", "fs"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 arc-swap = "1"
 bitflags = "2"
 bytes = "1"
