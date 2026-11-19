@@ -419,8 +419,7 @@ fn build_bash(command_line: &str, workspace: &Workspace) -> std::io::Result<Comm
         .current_dir(workspace.dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     Ok(command)
 }
 
