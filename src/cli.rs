@@ -3,10 +3,18 @@
 //! precedence (env wins over the grant's pin).
 
 use clap::Parser;
+use nexus::pair::sanitize_node_name;
 
-/// Default node name, used when neither `NEXUS_NODE` nor a stored
-/// credential names the host.
-const DEFAULT_NODE: &str = "workspace-tui";
+#[cfg(unix)]
+use rustix::system::uname;
+
+/// Last-resort host label when neither the kernel nor the environment
+/// names this machine.
+const FALLBACK_HOST: &str = "localhost";
+
+/// Last-resort user when the environment names no one.
+#[cfg(not(unix))]
+const FALLBACK_USER: &str = "user";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,7 +50,7 @@ pub struct Boot {
 impl Cli {
     pub fn boot(&self) -> Boot {
         Boot {
-            node: std::env::var("NEXUS_NODE").unwrap_or_else(|_| DEFAULT_NODE.to_owned()),
+            node: std::env::var("NEXUS_NODE").unwrap_or_else(|_| default_node()),
             role: nexus::client::Role::parse(
                 &std::env::var("NEXUS_ROLE")
                     .unwrap_or_else(|_| self.role.clone().unwrap_or_else(|| "env".to_owned())),
@@ -57,11 +65,49 @@ impl Cli {
     }
 }
 
+/// The default node identity: `<user>-<host>`, lowercased and folded
+/// onto the server's charset (an `@` cannot ride the wire, so
+/// `james@nixos` pairs as `james-nixos`).
+fn default_node() -> String {
+    sanitize_node_name(&format!("{}-{}", default_user(), default_host()).to_lowercase())
+}
+
+#[cfg(unix)]
+fn default_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| rustix::process::getuid().as_raw().to_string())
+}
+
+#[cfg(not(unix))]
+fn default_user() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| FALLBACK_USER.to_owned())
+}
+
+/// The short hostname: the kernel's nodename, cut at the first dot.
+#[cfg(unix)]
+fn default_host() -> String {
+    let uts = uname();
+    let nodename = uts.nodename().to_string_lossy();
+    let label = nodename.split('.').next().unwrap_or_default();
+    if label.is_empty() {
+        FALLBACK_HOST.to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+#[cfg(not(unix))]
+fn default_host() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| FALLBACK_HOST.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, default_node};
+    use nexus::pair::validate_node_name;
 
     const PAIR_URL: &str = "http://host:8080/pair/code";
 
@@ -76,5 +122,16 @@ mod tests {
     fn role_defaults_to_unset() {
         let cli = Cli::try_parse_from(["nexus-tui", PAIR_URL]).expect("args parse");
         assert_eq!(cli.role, None);
+    }
+
+    #[test]
+    fn default_node_pairs_from_this_machine() {
+        let node = default_node();
+        assert!(!node.is_empty());
+        assert_eq!(
+            validate_node_name(&node),
+            Ok(()),
+            "derived default must pass the server's rule"
+        );
     }
 }
