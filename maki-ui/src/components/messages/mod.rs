@@ -412,10 +412,6 @@ impl MessagesPanel {
         self.highlight_segment = idx;
     }
 
-    pub fn half_page(&self) -> i32 {
-        self.viewport_height as i32 / 2
-    }
-
     pub fn page(&self) -> i32 {
         self.viewport_height.max(1) as i32
     }

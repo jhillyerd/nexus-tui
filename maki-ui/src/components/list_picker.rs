@@ -390,14 +390,6 @@ impl<T: PickerItem> ListPicker<T> {
             s.update_search_and_clamp();
             return PickerAction::Consumed;
         }
-        if key::SCROLL_HALF_UP.matches(key) {
-            s.page_up();
-            return PickerAction::Consumed;
-        }
-        if key::SCROLL_HALF_DOWN.matches(key) {
-            s.page_down();
-            return PickerAction::Consumed;
-        }
         if is_ctrl(&key) {
             return PickerAction::Consumed;
         }
@@ -966,20 +958,6 @@ mod tests {
         for _ in 0..5 {
             p.handle_key(key(KeyCode::PageUp));
         }
-        assert_eq!(ready_state(&p).selected, 0);
-    }
-
-    #[test]
-    fn ctrl_d_and_ctrl_u_page_like_page_keys() {
-        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
-        let mut p = ListPicker::new();
-        p.open(items, " Test ");
-        ready_state_mut(&mut p).viewport_height = 10;
-
-        p.handle_key(key::SCROLL_HALF_DOWN.to_key_event());
-        assert_eq!(ready_state(&p).selected, 10);
-
-        p.handle_key(key::SCROLL_HALF_UP.to_key_event());
         assert_eq!(ready_state(&p).selected, 0);
     }
 

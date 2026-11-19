@@ -53,8 +53,6 @@ pub mod key {
     pub const SESSIONS: Bind = ctrl_bind!("P");
     pub const TASKS: Bind = ctrl_bind!("X");
     pub const BACKGROUND: Bind = ctrl_bind!("B");
-    pub const SCROLL_HALF_UP: Bind = ctrl_bind!("U");
-    pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!("D");
     pub const SCROLL_PAGE_UP: Bind = Bind {
         code: KeyCode::PageUp,
         modifiers: KeyModifiers::NONE,
@@ -85,6 +83,7 @@ pub mod key {
     pub const SUSPEND: Bind = ctrl_bind!("Z");
     pub const DELETE: Bind = ctrl_bind!("D");
     pub const KILL_LINE: Bind = ctrl_bind!("K");
+    pub const KILL_LINE_START: Bind = ctrl_bind!("U");
     pub const LINE_START: Bind = ctrl_bind!("A");
     pub const LINE_END: Bind = ctrl_bind!("E");
     pub const EDIT_INPUT: Bind = Bind {
@@ -302,15 +301,16 @@ pub const KEYBINDS: &[Keybind] = &[
     )
     .on(Platform::MacOnly),
     single(key::KILL_LINE.label, "Delete to end of line", Ctx::Editing).on(Platform::MacOnly),
+    single(key::KILL_LINE_START.label, "Delete to start of line", Ctx::Editing),
+    single(
+        key::DELETE.label,
+        "Delete character at cursor, or exit when empty",
+        Ctx::Editing,
+    ),
     single(key::LINE_START.label, "Jump to start of line", Ctx::Editing),
     kb(
         KeyLabel::Alt("Home", "End"),
         "Jump to start/end of line",
-        Ctx::Editing,
-    ),
-    kb(
-        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        "Scroll half page up / down",
         Ctx::Editing,
     ),
     kb(
@@ -355,11 +355,6 @@ pub const KEYBINDS: &[Keybind] = &[
     kb(
         KeyLabel::Alt("PageUp", "PageDown"),
         "Scroll page up / down",
-        Ctx::Picker,
-    ),
-    kb(
-        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        "Scroll half page up / down",
         Ctx::Picker,
     ),
     single(

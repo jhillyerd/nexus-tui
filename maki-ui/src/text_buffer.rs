@@ -1684,6 +1684,8 @@ impl TextBuffer {
             KeyCode::Backspace | KeyCode::Char('w') if ctrl => self.remove_word_before_cursor(),
             KeyCode::Delete if ctrl => self.delete_word_after_cursor(),
             KeyCode::Char('k') if ctrl => self.kill_to_end_of_line(),
+            KeyCode::Char('u') if ctrl => self.kill_to_start_of_line(),
+            KeyCode::Char('d') if ctrl => self.delete_char(),
             KeyCode::Backspace if alt => self.remove_word_before_cursor(),
             KeyCode::Delete | KeyCode::Char('d') if alt => self.delete_word_after_cursor(),
             _ if ctrl || alt => return EditResult::Ignored,
@@ -2046,6 +2048,8 @@ mod tests {
     #[test_case(plain(KeyCode::F(1)),            EditResult::Ignored ; "plain_ignored")]
     #[test_case(ctrl(KeyCode::Char('e')),        EditResult::Moved   ; "ctrl_e_moved")]
     #[test_case(ctrl(KeyCode::Char('k')),        EditResult::Changed ; "ctrl_changed")]
+    #[test_case(ctrl(KeyCode::Char('u')),        EditResult::Changed ; "ctrl_u_changed")]
+    #[test_case(ctrl(KeyCode::Char('d')),        EditResult::Changed ; "ctrl_d_changed")]
     #[test_case(ctrl(KeyCode::Char('a')),        EditResult::Moved   ; "ctrl_moved")]
     #[test_case(ctrl(KeyCode::Char('z')),        EditResult::Ignored ; "ctrl_ignored")]
     #[test_case(alt(KeyCode::Backspace),         EditResult::Changed ; "alt_changed")]
@@ -2068,6 +2072,32 @@ mod tests {
         buf.raw_x = 1;
         buf.kill_to_start_of_line();
         assert_eq!(buf.value(), "hello world");
+        assert_eq!(buf.x(), 0);
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_start_of_line() {
+        let mut buf = TextBuffer::new("one two".into());
+        buf.raw_x = 4;
+        buf.handle_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(buf.value(), "two");
+        assert_eq!(buf.x(), 0);
+    }
+
+    #[test]
+    fn ctrl_d_deletes_the_char_at_the_cursor() {
+        let mut buf = TextBuffer::new("abc".into());
+        buf.raw_x = 1;
+        buf.handle_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(buf.value(), "ac");
+        assert_eq!(buf.x(), 1);
+    }
+
+    #[test]
+    fn ctrl_d_on_an_empty_line_keeps_it_empty() {
+        let mut buf = TextBuffer::new(String::new());
+        buf.handle_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(buf.value(), "");
         assert_eq!(buf.x(), 0);
     }
 
