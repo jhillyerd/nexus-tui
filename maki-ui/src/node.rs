@@ -49,8 +49,10 @@ pub enum NodeEvent {
     Token { text: String },
     /// A streaming reasoning delta.
     ReasoningDelta { text: String },
-    /// A streaming tool-call fragment. The first fragment naming the
-    /// tool opens its chip; later ones only accumulate server-side.
+    /// A streaming tool-call fragment. The first fragment carrying an id
+    /// and a name opens its chip; later ones only accumulate server-side.
+    /// Fragments without an id project to nothing — the assembled
+    /// [`NodeEvent::ToolCall`] opens the chip.
     ToolCallDelta { id: String, name: Option<String> },
     /// An assembled tool call: the chip's header. `arguments` is
     /// JSON-encoded as a string on the wire; display-only here.
@@ -112,14 +114,15 @@ impl NodeEvent {
             ServerFrame::TurnStopped { chars, at: _ } => NodeEvent::TurnStopped { chars },
             ServerFrame::TurnFailed { reason, at: _ } => NodeEvent::TurnFailed { reason },
             ServerFrame::ToolCallDelta {
-                index,
+                index: _,
                 id,
                 name,
                 fragment: _,
-            } => NodeEvent::ToolCallDelta {
-                id: id.unwrap_or_else(|| index.to_string()),
-                name,
-            },
+            } => {
+                // An id-less delta can never rendezvous with the assembled
+                // `tool_call`'s chip; skip it — the assembled frame opens it.
+                NodeEvent::ToolCallDelta { id: id?, name }
+            }
             ServerFrame::ToolCall {
                 id,
                 name,
@@ -208,5 +211,41 @@ impl NodeHandle {
     /// [`Termination::Shutdown`] (exit 0).
     pub fn shutdown(&self) {
         self.client.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CALL_ID: &str = "call_1";
+    const TOOL_NAME: &str = "bash";
+
+    #[test]
+    fn id_less_tool_call_delta_projects_to_nothing() {
+        let frame = ServerFrame::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: Some(TOOL_NAME.to_owned()),
+            fragment: String::new(),
+        };
+        assert_eq!(NodeEvent::project(frame), None);
+    }
+
+    #[test]
+    fn tool_call_delta_keeps_the_wire_id() {
+        let frame = ServerFrame::ToolCallDelta {
+            index: 0,
+            id: Some(CALL_ID.to_owned()),
+            name: Some(TOOL_NAME.to_owned()),
+            fragment: String::new(),
+        };
+        assert_eq!(
+            NodeEvent::project(frame),
+            Some(NodeEvent::ToolCallDelta {
+                id: CALL_ID.to_owned(),
+                name: Some(TOOL_NAME.to_owned()),
+            })
+        );
     }
 }

@@ -281,19 +281,22 @@ pub enum Action {
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
+/// Why the UI run ends. [`ExitRequest::Code`] carries the nexus
+/// contract's exit code (4 credential rejected, 2 connect failure);
+/// user quits and clean shutdowns are [`ExitRequest::Success`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExitRequest {
     #[default]
     None,
     Success,
-    Error,
+    Code(i32),
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
             Self::None | Self::Success => 0,
-            Self::Error => 1,
+            Self::Code(code) => *code,
         }
     }
 }

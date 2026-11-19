@@ -83,9 +83,12 @@ impl App {
         }
     }
 
-    /// The connection loop ended; the process exits with its code.
+    /// The connection loop ended; the process exits with the contract's
+    /// code (`Termination::exit_code`): 4 credential rejected, 2 other
+    /// connect failures, 0 clean.
     fn terminate(&mut self, termination: Termination) {
         self.link = Link::Down;
+        let exit_code = termination.exit_code();
         match termination {
             Termination::Shutdown => {
                 self.exit_request = ExitRequest::Success;
@@ -94,14 +97,31 @@ impl App {
                 self.status = Status::error("credential rejected — pair again".to_owned());
                 self.alert_modal
                     .open("credential rejected — pair again".to_owned());
-                self.exit_request = ExitRequest::Error;
+                self.exit_request = ExitRequest::Code(exit_code);
                 self.pending_actions.push(Action::ManualExit);
             }
             Termination::ConnectFailed(detail) => {
                 self.status = Status::error(detail.clone());
-                self.exit_request = ExitRequest::Error;
+                self.exit_request = ExitRequest::Code(exit_code);
                 self.pending_actions.push(Action::ManualExit);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+    use crate::app::tests::app;
+
+    #[test_case(Termination::Shutdown, 0; "shutdown_exits_clean")]
+    #[test_case(Termination::CredentialRejected, 4; "credential_rejected_exits_four")]
+    #[test_case(Termination::ConnectFailed("refused".to_owned()), 2; "connect_failed_exits_two")]
+    fn termination_maps_the_exit_code_contract(termination: Termination, expected: i32) {
+        let mut app = app();
+        app.handle_node_event(NodeEvent::Terminated(termination));
+        assert_eq!(app.exit_request.code(), expected);
     }
 }

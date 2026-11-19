@@ -505,7 +505,7 @@ impl InputBox {
     /// [`Self::set_input`] for text made from what the input holds: a
     /// completed command, what `$EDITOR` changed. The plugins that wrote the
     /// text it came from still count as its writers.
-#[allow(dead_code)] // the editor bridge restores this path
+    #[allow(dead_code)] // the editor bridge restores this path
     pub fn rewrite_input(&mut self, s: &str) {
         let writers = self.buffer.writers().clone();
         self.buffer.swap_prompt(Prompt {

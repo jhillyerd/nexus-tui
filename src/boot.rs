@@ -6,32 +6,23 @@ use nexus::client::NodeConfig;
 use nexus::pair;
 use nexus::state::{self, Credential};
 
-use crate::Args;
+use crate::cli::{Boot, Cli};
 
 /// The UI run's outcome: the process exit code.
 const EXIT_CLEAN: u8 = 0;
 const EXIT_CONNECT_FAILED: u8 = 2;
 const EXIT_CREDENTIAL_REJECTED: u8 = 4;
 
-/// Default node name when neither the env nor the state file names the host.
-const DEFAULT_NODE: &str = "workspace-tui";
+pub async fn run(cli: &Cli) -> Result<u8, eyre::Report> {
+    let Boot {
+        node,
+        role,
+        thread: thread_override,
+        server: server_filter,
+        pair_url,
+    } = cli.boot();
 
-pub async fn run(args: Args) -> Result<u8, eyre::Report> {
-    let pair_url = std::env::var("NEXUS_PAIR_URL")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .or(args.pair_url);
-    let node = std::env::var("NEXUS_NODE").unwrap_or_else(|_| DEFAULT_NODE.to_owned());
-    let role = nexus::client::Role::parse(
-        &std::env::var("NEXUS_ROLE")
-            .ok()
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| "env".to_owned()),
-    );
-    let thread_override = std::env::var("NEXUS_THREAD").ok().filter(|t| !t.is_empty());
-    let server_filter = std::env::var("NEXUS_URL").ok().filter(|u| !u.is_empty());
-
-    if args.reset {
+    if cli.reset {
         let removed = state::reset(&state::state_root(), &node);
         for path in &removed {
             println!("removed {}", path.display());
@@ -42,8 +33,12 @@ pub async fn run(args: Args) -> Result<u8, eyre::Report> {
     }
 
     let root = state::state_root();
-    let credential = match state::discover(&root, &node, server_filter.as_deref(), thread_override.as_deref())
-    {
+    let credential = match state::discover(
+        &root,
+        &node,
+        server_filter.as_deref(),
+        thread_override.as_deref(),
+    ) {
         state::Discovery::Found { credential, .. } => credential,
         state::Discovery::Ambiguous(matches) => {
             eprintln!("several stored credentials for {node}; disambiguate:");
@@ -95,7 +90,11 @@ async fn pair_new(
 
 /// Connect and run the UI. A 401 on a live join turns into a re-pair when
 /// a pairing URL is held (the launcher's contract), else exit 4.
-async fn run_ui(credential: Credential, role: nexus::client::Role, pair_url: Option<String>) -> Result<u8, eyre::Report> {
+async fn run_ui(
+    credential: Credential,
+    role: nexus::client::Role,
+    pair_url: Option<String>,
+) -> Result<u8, eyre::Report> {
     let config = NodeConfig {
         server: credential.server.clone(),
         node: credential.node.clone(),
@@ -146,8 +145,7 @@ async fn run_ui(credential: Credential, role: nexus::client::Role, pair_url: Opt
                 eprintln!("credential rejected — re-pairing");
                 let parsed = pair::parse_pair_url(url)?;
                 let node_name = credential.node.clone();
-                let paired =
-                    pair::exchange(&parsed.base, &parsed.code, &node_name, None).await?;
+                let paired = pair::exchange(&parsed.base, &parsed.code, &node_name, None).await?;
                 let fresh = Credential {
                     server: parsed.base,
                     node: paired.name,

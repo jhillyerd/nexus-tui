@@ -9,7 +9,11 @@ use clap::Parser;
 const DEFAULT_NODE: &str = "workspace-tui";
 
 #[derive(Parser, Debug)]
-#[command(name = "nexus-tui", about = "A nexus TUI node: pair, connect, render the thread.", version)]
+#[command(
+    name = "nexus-tui",
+    about = "A nexus TUI node: pair, connect, render the thread.",
+    version
+)]
 pub struct Cli {
     /// A pairing URL (`http://host:port/pair/<code>`). Bare relaunches
     /// use the stored credential instead.
@@ -40,9 +44,8 @@ impl Cli {
         Boot {
             node: std::env::var("NEXUS_NODE").unwrap_or_else(|_| DEFAULT_NODE.to_owned()),
             role: nexus::client::Role::parse(
-                &std::env::var("NEXUS_ROLE").unwrap_or_else(|_| {
-                    self.role.clone().unwrap_or_else(|| "env".to_owned())
-                }),
+                &std::env::var("NEXUS_ROLE")
+                    .unwrap_or_else(|_| self.role.clone().unwrap_or_else(|| "env".to_owned())),
             ),
             thread: std::env::var("NEXUS_THREAD").ok().filter(|t| !t.is_empty()),
             server: std::env::var("NEXUS_URL").ok().filter(|t| !t.is_empty()),
@@ -51,5 +54,27 @@ impl Cli {
                 .filter(|t| !t.is_empty())
                 .or_else(|| self.pair_url.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    const PAIR_URL: &str = "http://host:8080/pair/code";
+
+    #[test]
+    fn role_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["nexus-tui", PAIR_URL, "--role", "viewer"]).expect("args parse");
+        assert_eq!(cli.role.as_deref(), Some("viewer"));
+    }
+
+    #[test]
+    fn role_defaults_to_unset() {
+        let cli = Cli::try_parse_from(["nexus-tui", PAIR_URL]).expect("args parse");
+        assert_eq!(cli.role, None);
     }
 }

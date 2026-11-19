@@ -337,7 +337,6 @@ impl App {
         !self.any_overlay_open() && self.input_box.height(area.width) > 2
     }
 
-
     pub(crate) fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
@@ -929,8 +928,8 @@ mod tests {
     use crate::node::NodeHandle;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use maki_storage::id::MakiId;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     const TRANSCRIPT_LINES: usize = 200;
 
@@ -943,7 +942,7 @@ mod tests {
         }
     }
 
-    fn app() -> App {
+    pub(super) fn app() -> App {
         let scratch = tempfile::tempdir().expect("scratch dir");
         let storage = maki_storage::StateDir::from_path(scratch.path().to_path_buf());
         App::new(
@@ -967,15 +966,13 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.handle_node_event(NodeEvent::User {
-            text,
-            author: None,
-        });
+        app.handle_node_event(NodeEvent::User { text, author: None });
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        terminal.draw(|frame| {
-            app.view(frame);
-        })
-        .unwrap();
+        terminal
+            .draw(|frame| {
+                app.view(frame);
+            })
+            .unwrap();
         app
     }
 
@@ -1021,5 +1018,4 @@ mod tests {
         app.update(Msg::Key(g));
         assert!(app.chat.auto_scroll());
     }
-
 }
