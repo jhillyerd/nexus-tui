@@ -83,6 +83,7 @@ pub mod key {
     pub const SUSPEND: Bind = ctrl_bind!("Z");
     pub const DELETE: Bind = ctrl_bind!("D");
     pub const KILL_LINE: Bind = ctrl_bind!("K");
+    pub const KILL_LINE_START: Bind = ctrl_bind!("U");
     pub const LINE_START: Bind = ctrl_bind!("A");
     pub const LINE_END: Bind = ctrl_bind!("E");
     pub const EDIT_INPUT: Bind = Bind {
@@ -300,6 +301,12 @@ pub const KEYBINDS: &[Keybind] = &[
     )
     .on(Platform::MacOnly),
     single(key::KILL_LINE.label, "Delete to end of line", Ctx::Editing).on(Platform::MacOnly),
+    single(key::KILL_LINE_START.label, "Delete to start of line", Ctx::Editing),
+    single(
+        key::DELETE.label,
+        "Delete character at cursor, or exit when empty",
+        Ctx::Editing,
+    ),
     single(key::LINE_START.label, "Jump to start of line", Ctx::Editing),
     kb(
         KeyLabel::Alt("Home", "End"),

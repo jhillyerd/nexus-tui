@@ -617,6 +617,11 @@ impl App {
             crate::components::command::CommandAction::Passthrough => {}
             action => return self.palette_actions(action, sight, turn),
         }
+        // Readline EOF: Ctrl+D exits only on an empty line, the box
+        // otherwise deletes the character at the cursor.
+        if key::DELETE.matches(key_event) && self.input_box.is_empty() {
+            return self.quit();
+        }
         match self.input_box.handle_key(key_event, self.sync_input_mode()) {
             InputAction::Submit => return self.handle_submit(),
             InputAction::Changed => self.input_fired_this_frame = true,
@@ -990,6 +995,28 @@ mod tests {
         app.input_box.set_input("draft");
         app.update(Msg::Key(bare_key(KeyCode::PageUp)));
         assert_eq!(app.input_box.buffer.value(), "draft");
+    }
+
+    fn ctrl_d() -> Msg {
+        Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn ctrl_d_quits_on_an_empty_line() {
+        let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        let mut app = app_with_tall_transcript(area);
+        app.update(ctrl_d());
+        assert_eq!(app.exit_request, ExitRequest::Success);
+    }
+
+    #[test]
+    fn ctrl_d_with_text_deletes_instead_of_quitting() {
+        let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        let mut app = app_with_tall_transcript(area);
+        app.input_box.set_input("draft");
+        app.update(ctrl_d());
+        assert_eq!(app.exit_request, ExitRequest::None);
+        assert_eq!(app.input_box.buffer.value(), "raft");
     }
 
     #[test]
