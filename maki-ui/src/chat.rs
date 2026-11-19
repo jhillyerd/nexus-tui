@@ -151,10 +151,6 @@ impl Chat {
         self.messages_panel.scroll_to_row(doc_row);
     }
 
-    pub fn half_page(&self) -> i32 {
-        self.messages_panel.half_page()
-    }
-
     pub fn page(&self) -> i32 {
         self.messages_panel.page()
     }

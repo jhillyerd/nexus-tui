@@ -53,8 +53,6 @@ pub mod key {
     pub const SESSIONS: Bind = ctrl_bind!("P");
     pub const TASKS: Bind = ctrl_bind!("X");
     pub const BACKGROUND: Bind = ctrl_bind!("B");
-    pub const SCROLL_HALF_UP: Bind = ctrl_bind!("U");
-    pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!("D");
     pub const SCROLL_PAGE_UP: Bind = Bind {
         code: KeyCode::PageUp,
         modifiers: KeyModifiers::NONE,
@@ -309,11 +307,6 @@ pub const KEYBINDS: &[Keybind] = &[
         Ctx::Editing,
     ),
     kb(
-        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        "Scroll half page up / down",
-        Ctx::Editing,
-    ),
-    kb(
         KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
         "Scroll page up / down",
         Ctx::Editing,
@@ -355,11 +348,6 @@ pub const KEYBINDS: &[Keybind] = &[
     kb(
         KeyLabel::Alt("PageUp", "PageDown"),
         "Scroll page up / down",
-        Ctx::Picker,
-    ),
-    kb(
-        KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        "Scroll half page up / down",
         Ctx::Picker,
     ),
     single(

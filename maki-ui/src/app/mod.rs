@@ -375,16 +375,6 @@ impl App {
         if key::HELP.matches(key_event) {
             return Some(self.run_builtin(maki_lua::BuiltinAction::Help));
         }
-        if key::SCROLL_HALF_UP.matches(key_event) {
-            let half = self.chat.half_page();
-            self.chat.scroll(half);
-            return Some(vec![]);
-        }
-        if key::SCROLL_HALF_DOWN.matches(key_event) {
-            let half = self.chat.half_page();
-            self.chat.scroll(-half);
-            return Some(vec![]);
-        }
         if key::SCROLL_TOP.matches(key_event) {
             self.chat.scroll_to_top();
             return Some(vec![]);
