@@ -967,7 +967,7 @@ mod tests {
 
     fn hl(name: &str) -> Decoration {
         Decoration {
-            hl: Some(maki_agent::SpanStyle::Named(name.into())),
+            hl: Some(crate::span_style::SpanStyle::Named(name.into())),
             ..Decoration::default()
         }
     }
@@ -1123,7 +1123,7 @@ mod tests {
                         conceal: Some(_), ..
                     } => "hidden".into(),
                     Decoration {
-                        hl: Some(maki_agent::SpanStyle::Named(name)),
+                        hl: Some(crate::span_style::SpanStyle::Named(name)),
                         ..
                     } => name.clone(),
                     other => format!("{other:?}"),

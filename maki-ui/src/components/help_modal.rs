@@ -338,16 +338,8 @@ impl HelpModal {
 }
 
 impl Overlay for HelpModal {
-    fn is_prompting(&self) -> bool {
-        self.is_open()
-    }
-
     fn is_open(&self) -> bool {
         self.is_open()
-    }
-
-    fn close(&mut self) {
-        self.close()
     }
 }
 
@@ -356,9 +348,7 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
-    use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
-    use std::sync::Arc;
     use test_case::test_case;
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
@@ -391,7 +381,7 @@ maki.keymap.set("i", "<C-t>", function() end, { desc = "Pong" })
     /// answers it in `"n"`.
     #[test]
     fn plugin_lines_name_who_answers_each_key_and_every_action() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let host = PluginHost::new_standalone().unwrap();
         host.load_source("helper", HELPER_PLUGIN).unwrap();
         host.load_source("later", LATER_PLUGIN).unwrap();
 

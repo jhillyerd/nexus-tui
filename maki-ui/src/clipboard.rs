@@ -3,7 +3,7 @@ use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
-pub(crate) enum CopyResult {
+pub enum CopyResult {
     Copied,
     Noop,
 }
@@ -12,7 +12,7 @@ pub(crate) enum CopyResult {
 /// one, and on Wayland only when the compositor offers it. Blocks until the
 /// app owning the selection answers, so never call it on the UI thread.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_primary_selection() -> Option<String> {
+pub fn read_primary_selection() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     let text = clipboard
         .get()
@@ -23,22 +23,22 @@ pub(crate) fn read_primary_selection() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn read_primary_selection() -> Option<String> {
+pub fn read_primary_selection() -> Option<String> {
     None
 }
 
 /// Blocks, so never call it on the UI thread.
-pub(crate) fn read_text() -> Option<String> {
+pub fn read_text() -> Option<String> {
     let text = Clipboard::new().ok()?.get_text().ok()?;
     (!text.is_empty()).then_some(text)
 }
 
-pub(crate) struct ClipboardState {
+pub struct ClipboardState {
     native: Option<Clipboard>,
 }
 
 impl ClipboardState {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             native: Clipboard::new().ok(),
         }
@@ -47,11 +47,13 @@ impl ClipboardState {
     /// Copies through the terminal alone, so a test never writes to the
     /// desktop's clipboard.
     #[cfg(test)]
+    #[cfg(test)]
+    #[allow(dead_code)] // test-only constructor kept out of the cfg(test) gate
     pub(crate) fn terminal_only() -> Self {
         Self { native: None }
     }
 
-    pub(crate) fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {
+    pub fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {
         Self::copy_text_impl(text, |t| self.copy_native(t), terminal::copy_to_clipboard)
     }
 

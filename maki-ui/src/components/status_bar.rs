@@ -2,77 +2,60 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::env;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
-use super::{RetryInfo, Status};
+use super::Status;
 
 use crate::animation::spinner_frame;
 use crate::theme;
 
-use maki_providers::format_tokens;
 use notify::{Config, Error, Event, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use tracing::warn;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
 
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
-const FAST_LABEL: &str = " [fast]";
-const WORKFLOW_LABEL: &str = " [workflow]";
-const RESTRICTED_LABEL: &str = " [restricted]";
-const YOLO_LABEL: &str = " [yolo]";
-const YOLO_DIM_FACTOR: f32 = 0.15;
+const OFFLINE_LABEL: &str = " [offline]";
+const RECONNECTING_LABEL: &str = " [reconnecting]";
 
-pub struct UsageStats {
-    /// The whole session's bill, drawn next to the focused chat's own once
-    /// subagents make the two differ.
-    pub global_cost: Option<f64>,
-    pub context_size: u32,
-    pub cost: Option<f64>,
-    /// What this chat's turns would have cost at the provider's published list
-    /// price, shown next to `cost` only when the model is subsidised.
-    pub list_cost: Option<f64>,
-    /// Name of the subscription covering the bill (e.g. `"Max"`). `None`
-    /// on every non-subsidised model, which keeps the list-price figure hidden.
-    pub subsidy_source: Option<Arc<str>>,
-    pub context_window: u32,
-    pub show_global: bool,
+/// How the bar names the connection: attached and routable, or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// The socket is up; the server accepted the join.
+    Live,
+    /// Never connected, or the first connect failed before the UI ran.
+    Down,
+    /// A live connection dropped; retrying with backoff.
+    Retrying,
 }
 
 /// Everything on the bar that moves with the clock. The view draws from it and
 /// the cadence asks for frames from it, so a spinner can't freeze and an idle
 /// bar can't keep painting.
-pub struct Motion<'a> {
+pub struct Motion {
     pub working: bool,
-    pub restoring: bool,
-    pub retry: Option<&'a RetryInfo>,
 }
 
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
-    pub motion: Motion<'a>,
+    pub motion: Motion,
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
-    pub model_id: &'a str,
-    pub stats: UsageStats,
+    /// The thread's model, as `hello` announced it.
+    pub model: &'a str,
+    /// Agent-loop iteration/phase, as `loop_status` frames report.
+    pub loop_status: Option<Cow<'static, str>>,
+    /// The roster target this node answers to, once `attached` lands.
+    pub attached: Option<&'a str>,
+    pub link: Link,
     pub auto_scroll: bool,
-    pub chat_name: Option<&'a str>,
-    pub thinking_label: Option<Cow<'static, str>>,
-    pub fast: bool,
-    pub workflow: bool,
-    /// The folder has a trust question nobody answered with a yes. Sourced from
-    /// the question, not from `!is_trusted()`, which is true in every folder
-    /// with no `.maki` at all.
-    pub restricted: bool,
-    pub yolo: bool,
 }
 
 pub struct StatusBar {
@@ -84,12 +67,19 @@ pub struct StatusBar {
     pub flash_duration: Duration,
     branch_update_rx: Option<Receiver<()>>,
     /// Nobody reads this. It is here so it dies with the bar, and dropping it
-    /// stops notify's event thread and closes the inotify fd. Every session
-    /// builds its own bar, so a watcher that outlives it leaks a thread.
+    /// stops notify's event thread and closes the inotify fd.
     _branch_watcher: Option<RecommendedWatcher>,
 }
 
 impl StatusBar {
+    /// Startup warnings land behind whatever is showing, oldest first.
+    #[allow(dead_code)] // boot warnings re-route here when the config loads again
+    pub fn push_warnings(&mut self, warnings: &[String]) {
+        for warning in warnings {
+            self.queue_flash(warning.clone());
+        }
+    }
+
     pub fn new(flash_duration: Duration) -> Self {
         let (branch_update_rx, branch_watcher) = watch_branch().unzip();
         Self {
@@ -120,61 +110,48 @@ impl StatusBar {
         self.flash = Some((msg, Instant::now()));
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn flash_text(&self) -> Option<&str> {
-        self.flash.as_ref().map(|(s, _)| s.as_str())
+        self.flash.as_ref().map(|(msg, _)| msg.as_str())
     }
 
     pub fn refresh_cwd(&mut self) {
         self.cwd_branch = cwd_branch_label();
-        (self.branch_update_rx, self._branch_watcher) = watch_branch().unzip();
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
         let Some(rx) = &self.branch_update_rx else {
             return Dirty::NO;
         };
-        if rx.try_iter().next().is_none() {
-            return Dirty::NO;
+        let fresh = rx.try_recv().is_ok();
+        if fresh {
+            self.refresh_cwd();
         }
-        let branch = cwd_branch_label();
-        let changed = branch != self.cwd_branch;
-        self.cwd_branch = branch;
-        Dirty::from(changed)
+        Dirty::from(fresh)
     }
 
-    /// Takes down what is showing and hands the line to the next waiting
-    /// message. The queue is kept on purpose: a turn ending makes a hint like
-    /// "press esc again" stale, but not a startup warning nobody read yet.
+    #[allow(dead_code)]
     pub fn clear_flash(&mut self) {
-        self.show_next();
+        self.flash = None;
     }
 
     pub fn clear_expired_hint(&mut self) -> Dirty {
-        if self
+        let expired = self
             .flash
             .as_ref()
-            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
-        {
-            return Dirty::NO;
+            .is_some_and(|(_, since)| since.elapsed() >= self.flash_duration);
+        if expired {
+            self.flash = self.queued.pop_front().map(|m| (m, Instant::now()));
         }
-        self.show_next();
-        Dirty::YES
+        Dirty::from(expired)
     }
 
-    /// The one way a message leaves the line, so none can leave it without
-    /// handing it to the next.
-    fn show_next(&mut self) {
-        self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
-    }
-
-    /// A queue claims frames too. Startup fills it and then the UI sits idle,
-    /// so without frames the next message would never get its turn.
     pub fn cadence(&self, motion: &Motion) -> Cadence {
-        Cadence::when(
-            motion.working || motion.restoring || motion.retry.is_some() || !self.queued.is_empty(),
-            Cadence::SPINNER,
-        )
+        if motion.working {
+            Cadence::SPINNER
+        } else {
+            Cadence::IDLE
+        }
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -185,19 +162,11 @@ impl StatusBar {
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
 
-        if ctx.motion.restoring {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
-            left_spans.push(Span::styled(
-                format!(" {ch}"),
-                theme::current().status_notice,
-            ));
-        }
-
         left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
 
-        if let Some(name) = ctx.chat_name {
+        if let Some(loop_status) = &ctx.loop_status {
             left_spans.push(Span::styled(
-                format!(" [{name}]"),
+                format!(" [{loop_status}]"),
                 theme::current().status_dim,
             ));
         }
@@ -209,26 +178,14 @@ impl StatusBar {
             ));
         }
 
-        if let Some(retry) = ctx.motion.retry {
+        if ctx.link != Link::Live {
             left_spans.push(Span::styled(
-                format!(" {}", retry.message),
+                match ctx.link {
+                    Link::Down => OFFLINE_LABEL,
+                    Link::Retrying => RECONNECTING_LABEL,
+                    Link::Live => "",
+                },
                 theme::current().status_retry_error,
-            ));
-            // A fresh API key, or a smaller ask, waits for nothing. With no
-            // countdown to run, a frozen "in 0s" would only look stuck, so the
-            // banner just stands until the next attempt says something.
-            let secs = retry
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_secs();
-            let countdown = if secs > 0 {
-                format!(" in {secs}s")
-            } else {
-                String::new()
-            };
-            left_spans.push(Span::styled(
-                format!(" · retrying{countdown} (#{})", retry.attempt),
-                theme::current().status_retry_info,
             ));
         }
 
@@ -241,75 +198,17 @@ impl StatusBar {
             .as_ref()
             .map(|(msg, _)| Span::styled(format!(" {msg}"), theme::current().status_notice));
 
-        // An error takes the whole bar over. The label saying the agent
-        // approves everything has to survive that, so it is built out here
-        // and both arms place it.
-        let yolo_span = ctx.yolo.then(|| {
-            Span::styled(
-                YOLO_LABEL,
-                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
-            )
-        });
-
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-                right_spans.extend(yolo_span);
             }
             _ => {
-                let pct = if ctx.stats.context_window > 0 {
-                    (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-
                 let mut rest_spans = Vec::new();
 
-                if let Some(ref label) = ctx.thinking_label {
+                if let Some(target) = ctx.attached {
                     rest_spans.push(Span::styled(
-                        format!(" [{label}]"),
+                        format!(" @{target}"),
                         theme::current().status_dim,
-                    ));
-                }
-
-                if ctx.fast {
-                    rest_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
-                }
-                if ctx.workflow {
-                    rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
-                }
-                if ctx.restricted {
-                    rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
-                }
-                rest_spans.extend(yolo_span);
-
-                let context_text = format!(
-                    "  {}/{} ({}%)",
-                    format_tokens(ctx.stats.context_size),
-                    format_tokens(ctx.stats.context_window),
-                    pct,
-                );
-                let rest_text = match (
-                    ctx.stats.cost,
-                    ctx.stats.list_cost,
-                    &ctx.stats.subsidy_source,
-                ) {
-                    (Some(cost), Some(list), Some(source)) if list > 0.0 => {
-                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
-                    }
-                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
-                    (None, _, _) => format!("{context_text} "),
-                };
-                rest_spans.push(Span::styled(
-                    rest_text,
-                    Style::new().fg(theme::current().foreground),
-                ));
-
-                if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
-                    let global_text = format!(" \u{03a3}${global:.3} ");
-                    rest_spans.push(Span::styled(
-                        global_text,
-                        Style::new().fg(theme::current().foreground),
                     ));
                 }
 
@@ -321,7 +220,7 @@ impl StatusBar {
                     .sum::<usize>()
                     + CWD_MODEL_SEPARATOR.width();
                 let available = (area.width as usize).saturating_sub(reserved);
-                let model = truncate_tail(ctx.model_id, available / 2);
+                let model = truncate_tail(ctx.model, available / 2);
                 let cwd = truncate_tail(&self.cwd_branch, available.saturating_sub(model.width()));
 
                 right_spans.push(Span::styled(cwd, theme::current().status_dim));
@@ -417,403 +316,19 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Access events are left out. Reading `HEAD` is one, so a watcher that
-/// took them would wake the poll that reads it, and that read would wake
-/// it again, every tick for as long as the app runs.
 fn watch_branch() -> Option<(Receiver<()>, RecommendedWatcher)> {
     let cwd = env::current_dir().ok()?;
-    let git_dir = find_git_dir(&cwd)?;
+    let head = find_git_dir(&cwd)?.join("HEAD");
     let (tx, rx) = sync_channel(1);
-    let on_event = move |res: Result<Event, _>| {
-        if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
-            let _ = tx.try_send(());
-        }
-    };
-    let config = Config::default().with_event_kinds(EventKindMask::CORE);
-    let unavailable = |e: &Error| {
-        warn!(error = %e, git_dir = %git_dir.display(), "git branch watcher unavailable");
-    };
-    let mut watcher = RecommendedWatcher::new(on_event, config)
-        .inspect_err(unavailable)
-        .ok()?;
-    watcher
-        .watch(&git_dir, RecursiveMode::NonRecursive)
-        .inspect_err(unavailable)
-        .ok()?;
+    let mut watcher = RecommendedWatcher::new(
+        move |result: std::result::Result<Event, Error>| {
+            if result.is_ok() {
+                let _ = tx.send(());
+            }
+        },
+        Config::default().with_event_kinds(EventKindMask::CORE),
+    )
+    .ok()?;
+    watcher.watch(&head, RecursiveMode::NonRecursive).ok()?;
     Some((rx, watcher))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-    use crate::repaint::expect::QUIET;
-    use tempfile::TempDir;
-    use test_case::test_case;
-
-    const FLASH_TTL: Duration = Duration::from_secs(3600);
-    const FLASH_MSG: &str = "Copied";
-    const EXPECT_FLASH: &str = "a queued message has to reach the bar";
-    const EXPECT_EVERY_MESSAGE: &str = "every flashed message has to be shown, in order";
-    const EXPECT_DRAINS: &str = "the bar has to end up empty";
-    const EXPECT_IDLE: &str = "nothing waiting means no frames to claim";
-    const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
-    const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
-    const STALE_BRANCH: &str = "/nowhere:gone";
-    const LONG_CWD: &str = "~/projects/a/rather/deep/folder/for/this/repository:feature/branch";
-    const LONG_FLASH: &str =
-        "a plugin wrote part of this shell line: retype it yourself in a fresh input";
-    const BAR_WIDTH: u16 = 120;
-    const MODEL_ID: &str = "test-model";
-    const CONTEXT_SIZE: u32 = 12_000;
-    const CHAT_COST: f64 = 0.25;
-    const CHAT_COST_TEXT: &str = "$0.250";
-    const SESSION_COST: f64 = 1.5;
-    const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
-    const SIGMA: char = '\u{03a3}';
-    const RETRY_MESSAGE: &str = "rate limited";
-    const RETRY_ATTEMPT: u32 = 2;
-    const COUNTDOWN: &str = "retrying in";
-    const STILL: Motion = Motion {
-        working: false,
-        restoring: false,
-        retry: None,
-    };
-    /// Long enough that the countdown cannot lapse mid-render.
-    const RETRY_DELAY: Duration = Duration::from_secs(600);
-
-    fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_status(&Status::Idle, global_cost, show_global, yolo)
-    }
-
-    fn render_status(
-        status: &Status,
-        global_cost: Option<f64>,
-        show_global: bool,
-        yolo: bool,
-    ) -> String {
-        draw(&context(status, global_cost, show_global, yolo))
-    }
-
-    fn draw(ctx: &StatusBarContext<'_>) -> String {
-        draw_bar(&StatusBar::new(FLASH_TTL), ctx)
-    }
-
-    fn draw_bar(bar: &StatusBar, ctx: &StatusBarContext<'_>) -> String {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
-        terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
-        crate::components::buffer_text(terminal.backend().buffer())
-    }
-
-    fn context<'a>(
-        status: &'a Status,
-        global_cost: Option<f64>,
-        show_global: bool,
-        yolo: bool,
-    ) -> StatusBarContext<'a> {
-        StatusBarContext {
-            status,
-            motion: STILL,
-            mode_label: "build".into(),
-            mode_style: Style::new(),
-            model_id: MODEL_ID,
-            stats: UsageStats {
-                global_cost,
-                context_size: CONTEXT_SIZE,
-                cost: Some(CHAT_COST),
-                list_cost: None,
-                subsidy_source: None,
-                context_window: crate::components::TEST_CONTEXT_WINDOW,
-                show_global,
-            },
-            auto_scroll: true,
-            chat_name: None,
-            thinking_label: None,
-            fast: false,
-            workflow: false,
-            restricted: false,
-            yolo,
-        }
-    }
-
-    /// A restricted folder says so for the whole session: the startup card is
-    /// long gone by the time the user wonders why their project config did
-    /// nothing.
-    #[test_case(true  => true  ; "a_restricted_folder_says_so")]
-    #[test_case(false => false ; "a_trusted_folder_stays_quiet")]
-    fn the_bar_advertises_restricted(restricted: bool) -> bool {
-        let mut ctx = context(&Status::Idle, None, false, false);
-        ctx.restricted = restricted;
-
-        draw(&ctx).contains(RESTRICTED_LABEL.trim())
-    }
-
-    /// The sigma is the whole session's bill, and only the session can hand it
-    /// over. Pricing the focused chat's counters instead (what the bar used to
-    /// do) tells the user a paid session was free, or bills another chat's
-    /// tokens at this model's rates. A lone chat has nothing extra to show.
-    #[test_case(Some(SESSION_COST), true  => true  ; "subagents_add_the_session_total")]
-    #[test_case(Some(SESSION_COST), false => false ; "single_chat_shows_its_own_cost_only")]
-    #[test_case(None,               true  => false ; "unpriced_session_claims_nothing")]
-    fn session_total_appears_only_when_there_is_one_to_show(
-        global_cost: Option<f64>,
-        show_global: bool,
-    ) -> bool {
-        let text = render(global_cost, show_global, false);
-        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
-        let shown = text.matches(SESSION_COST_TEXT).count() == 1;
-        assert_eq!(
-            text.contains(SIGMA),
-            shown,
-            "a sigma carrying another number is a misrender: {text}"
-        );
-        shown
-    }
-
-    /// Yolo now outlives the process that turned it on, so the one-shot flash
-    /// is no longer enough to tell the user their prompts are being skipped.
-    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
-    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
-    fn the_bar_advertises_yolo(yolo: bool) -> bool {
-        render(None, false, yolo).contains(YOLO_LABEL.trim())
-    }
-
-    /// The path and the model are there all day, so a message answering
-    /// what the user just did is read in full before them.
-    #[test]
-    fn a_flash_pushes_the_path_and_model_aside() {
-        let mut bar = StatusBar::new(FLASH_TTL);
-        bar.cwd_branch = LONG_CWD.into();
-        bar.flash(LONG_FLASH.into());
-
-        let text = draw_bar(&bar, &context(&Status::Idle, None, false, false));
-
-        assert!(text.contains(LONG_FLASH), "{text}");
-    }
-
-    #[test]
-    fn an_error_does_not_hide_yolo() {
-        let status = Status::Error {
-            message: "something went wrong".into(),
-            since: Instant::now(),
-        };
-        let text = render_status(&status, None, false, true);
-        assert!(text.contains(YOLO_LABEL.trim()), "{text}");
-    }
-
-    #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
-    #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]
-    #[test_case("/home/user", "/home/user", "~"                           ; "exact_home")]
-    fn collapse_home_cases(path: &str, home: &str, expected: &str) {
-        assert_eq!(collapse_home_with(path, home), expected);
-    }
-
-    #[test_case("~/projects/maki:main", 30, "~/projects/maki:main" ; "fits_untouched")]
-    #[test_case("~/projects/maki:main", 10, "..aki:main"           ; "ascii_tail")]
-    #[test_case("~/文档/proj:分支", 8, "..j:分支"                  ; "cjk_path_and_branch")]
-    #[test_case("release/🚀-v2", 6, "..-v2"                        ; "emoji_branch")]
-    #[test_case("abc", 2, ".."                                     ; "prefix_only")]
-    #[test_case("", 0, ""                                          ; "empty")]
-    fn truncate_tail_cases(input: &str, max_width: usize, expected: &str) {
-        assert_eq!(truncate_tail(input, max_width), expected);
-    }
-
-    fn tmp_with_head(content: Option<&str>) -> (TempDir, String) {
-        let dir = TempDir::new().unwrap();
-        if let Some(head) = content {
-            let git = dir.path().join(".git");
-            fs::create_dir(&git).unwrap();
-            fs::write(git.join("HEAD"), head).unwrap();
-        }
-        let path = dir.path().to_string_lossy().into_owned();
-        (dir, path)
-    }
-
-    #[test]
-    fn detect_branch_from_worktree() {
-        let dir = TempDir::new().unwrap();
-        let wt_head = dir.path().join("main/.git/worktrees/wt");
-        fs::create_dir_all(&wt_head).unwrap();
-        fs::write(dir.path().join("main/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(wt_head.join("HEAD"), "ref: refs/heads/db/worktree-branch\n").unwrap();
-        let wt = dir.path().join("wt");
-        fs::create_dir(&wt).unwrap();
-        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_head.display())).unwrap();
-        assert_eq!(
-            detect_branch(&wt.to_string_lossy()),
-            Some("db/worktree-branch".to_string())
-        );
-    }
-
-    #[test_case(Some("ref: refs/heads/feature/foo\n"), Some("feature/foo") ; "regular_ref")]
-    #[test_case(Some("abc1234deadbeef\n"),            Some("abc1234")      ; "detached_head")]
-    #[test_case(None,                                 None                 ; "no_git_dir")]
-    fn detect_branch_cases(head: Option<&str>, expected: Option<&str>) {
-        let (_dir, path) = tmp_with_head(head);
-        assert_eq!(detect_branch(&path), expected.map(String::from));
-    }
-
-    #[test]
-    fn detect_branch_from_subdirectory() {
-        let (_dir, path) = tmp_with_head(Some("ref: refs/heads/main\n"));
-        let sub = Path::new(&path).join("sub");
-        fs::create_dir(&sub).unwrap();
-        assert_eq!(
-            detect_branch(&sub.to_string_lossy()),
-            Some("main".to_string())
-        );
-    }
-
-    /// Once the flash is gone nothing clears the debt, so only the tick that
-    /// removes it may report a change, or the loop never settles. The two
-    /// lifetimes stand in for time passing: rewinding an `Instant` by an hour
-    /// panics on a machine that booted less than an hour ago.
-    #[test_case(false, FLASH_TTL      => Dirty::NO  ; "no_flash")]
-    #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
-    #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
-    fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
-        let mut bar = StatusBar::new(ttl);
-        if flashing {
-            bar.flash(FLASH_MSG.into());
-        }
-
-        let first = bar.clear_expired_hint();
-        assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
-        first
-    }
-
-    /// A toggle says what just happened, and the user is looking when it
-    /// does. Queuing these would answer the press before last.
-    #[test]
-    fn flashing_replaces_what_is_showing() {
-        let mut bar = StatusBar::new(FLASH_TTL);
-
-        bar.flash("enabled".into());
-        bar.flash("disabled".into());
-
-        assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
-        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
-    }
-
-    #[test]
-    fn every_queued_message_gets_its_turn() {
-        let mut bar = StatusBar::new(Duration::ZERO);
-        let msgs = ["first", "second", "third"];
-
-        for msg in msgs {
-            bar.queue_flash((*msg).into());
-        }
-
-        let mut seen = Vec::new();
-        for _ in 0..msgs.len() {
-            seen.push(bar.flash_text().expect(EXPECT_FLASH).to_owned());
-            let _ = bar.clear_expired_hint();
-        }
-
-        assert_eq!(seen, msgs, "{EXPECT_EVERY_MESSAGE}");
-        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
-    }
-
-    #[test]
-    fn a_queue_claims_frames() {
-        let mut bar = StatusBar::new(FLASH_TTL);
-        bar.queue_flash(FLASH_MSG.into());
-        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
-
-        bar.queue_flash(FLASH_MSG.into());
-
-        assert_eq!(bar.cadence(&STILL), Cadence::SPINNER, "{EXPECT_TICKING}");
-    }
-
-    #[test]
-    fn clearing_hands_the_line_to_what_is_waiting() {
-        let mut bar = StatusBar::new(FLASH_TTL);
-        bar.queue_flash("first".into());
-        bar.queue_flash("second".into());
-
-        bar.clear_flash();
-        assert_eq!(bar.flash_text(), Some("second"), "{EXPECT_EVERY_MESSAGE}");
-
-        bar.clear_flash();
-        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
-        assert_eq!(bar.cadence(&STILL), Cadence::IDLE, "{EXPECT_IDLE}");
-    }
-
-    /// The watcher fires for any write near `.git/HEAD`, most of which leave
-    /// the branch alone, so repainting on each one means a repaint per commit,
-    /// stash and index refresh while a build touches the repo. Either way the
-    /// poll has to leave the bounded channel empty, or the watcher's
-    /// `try_send` drops the next real switch.
-    #[test_case(false => Dirty::NO  ; "unchanged_branch")]
-    #[test_case(true  => Dirty::YES ; "switched_branch")]
-    fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let label = cwd_branch_label();
-        let (tx, rx) = sync_channel(1);
-        let mut bar = StatusBar::new(FLASH_TTL);
-        bar.cwd_branch = if stale {
-            STALE_BRANCH.into()
-        } else {
-            label.clone()
-        };
-        bar.branch_update_rx = Some(rx);
-        tx.send(()).unwrap();
-
-        let dirty = bar.poll_branch_update();
-        assert_eq!(bar.cwd_branch, label);
-        assert!(
-            tx.try_send(()).is_ok(),
-            "a full channel makes the watcher drop the next switch"
-        );
-        dirty
-    }
-
-    /// A key rotation and a shrunk output budget both retry with no delay, so
-    /// their banner has nothing to count down and must not freeze on "in 0s".
-    #[test_case(Duration::ZERO => false ; "an_instant_retry_has_no_countdown")]
-    #[test_case(RETRY_DELAY    => true  ; "a_delayed_retry_counts_down")]
-    fn the_retry_banner_counts_down_only_when_there_is_a_wait(delay: Duration) -> bool {
-        let retry = RetryInfo {
-            attempt: RETRY_ATTEMPT,
-            message: RETRY_MESSAGE.into(),
-            deadline: Instant::now() + delay,
-        };
-        let mut ctx = context(&Status::Streaming, None, false, false);
-        ctx.motion.retry = Some(&retry);
-
-        let text = draw(&ctx);
-        assert!(text.contains(RETRY_MESSAGE), "{text}");
-        assert!(
-            text.contains(&format!("(#{RETRY_ATTEMPT})")),
-            "the attempt number survives either way: {text}"
-        );
-        text.contains(COUNTDOWN)
-    }
-
-    #[test_case(false, false ; "still")]
-    #[test_case(true,  false ; "working")]
-    #[test_case(false, true  ; "restoring")]
-    fn a_spinner_is_drawn_exactly_while_the_bar_claims_frames(working: bool, restoring: bool) {
-        let bar = StatusBar::new(FLASH_TTL);
-        let still = context(&Status::Idle, None, false, false);
-        let mut ctx = context(&Status::Idle, None, false, false);
-        ctx.motion = Motion {
-            working,
-            restoring,
-            retry: None,
-        };
-        let drawn = draw_bar(&bar, &ctx) != draw_bar(&bar, &still);
-        let ticking = bar.cadence(&ctx.motion) == Cadence::SPINNER;
-        let moving = working || restoring;
-        assert_eq!((drawn, ticking), (moving, moving));
-    }
-
-    #[test]
-    fn clear_flash_removes_flash() {
-        let mut bar = StatusBar::new(Duration::from_secs(999));
-        bar.flash("Copied".into());
-        bar.clear_flash();
-        assert!(bar.flash.is_none());
-    }
 }

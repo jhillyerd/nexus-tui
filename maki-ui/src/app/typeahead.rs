@@ -82,7 +82,13 @@ impl InputAt {
 /// out, and whatever can start a key handler or put text in needs one. So
 /// input that arrives later, like a middle-click paste read in the
 /// background, cannot get ahead of the keys still waiting.
-pub(super) struct Turn(());
+pub(crate) struct Turn;
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self
+    }
+}
 
 pub(super) struct Hold {
     ticket: u64,
@@ -129,22 +135,17 @@ pub(super) struct Typeahead {
 }
 
 impl Typeahead {
-    pub fn holding(&self) -> bool {
-        self.hold.is_some()
-    }
-
     /// Keys only start a handler once the keys before them have gone, and the
     /// keys that skip the wait can never be bound, so only a free
     /// [`Typeahead`] takes a hold.
     pub fn hold(&mut self, hold: Hold) {
-        debug_assert!(self.hold.is_none(), "only a free typeahead takes a hold");
         self.hold = Some(hold);
     }
 
     /// Keeps {msg} while a handler runs or keys before it still wait.
     pub fn defer(&mut self, msg: Msg) -> Option<(Msg, Sight, Turn)> {
         if (self.hold.is_none() && self.queue.is_empty()) || !waits(&msg) {
-            return Some((msg, Sight::default(), Turn(())));
+            return Some((msg, Sight::default(), Turn));
         }
         self.queue.push_back((msg, Sight::default()));
         None
@@ -273,31 +274,6 @@ impl Typeahead {
         false
     }
 
-    /// Takes over another tab's hold and queue, so its keys still wait for
-    /// the same handler, now at {focus} on the input there, {input}. The press
-    /// stays behind: a fallback would land in a tab the user never pressed it
-    /// in. Keys a hold carried over were typed blind to the new tab.
-    pub fn adopt(&mut self, from: Self, focus: KeyboardFocus, input: InputAt) {
-        debug_assert!(
-            self.hold.is_none() && self.queue.is_empty(),
-            "only the focused tab holds keys"
-        );
-        let blind = from.hold.is_some();
-        self.queue
-            .extend(from.queue.into_iter().map(|(msg, mut sight)| {
-                sight.blind |= blind;
-                (msg, sight)
-            }));
-        if let Some(hold) = from.hold {
-            self.hold = Some(Hold {
-                focus,
-                pressed: None,
-                input,
-                ..hold
-            });
-        }
-    }
-
     /// The next message to replay. Stops as soon as a replayed key starts a
     /// handler of its own, and the rest wait for that one.
     pub fn next(&mut self) -> Option<(Msg, Sight, Turn)> {
@@ -305,7 +281,7 @@ impl Typeahead {
             return None;
         }
         let (msg, sight) = self.queue.pop_front()?;
-        Some((msg, sight, Turn(())))
+        Some((msg, sight, Turn))
     }
 }
 
@@ -322,7 +298,7 @@ fn waits(msg: &Msg) -> bool {
             mouse.kind,
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
         ),
-        Msg::Scroll { .. } | Msg::Agent(_) => false,
+        Msg::Scroll { .. } | Msg::Node(_) => false,
     }
 }
 

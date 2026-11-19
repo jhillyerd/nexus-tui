@@ -1,7 +1,11 @@
+use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot::error::TryRecvError;
 
-use crate::clipboard::{self, CopyResult};
-use crate::components::messages::ClickOutcome;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::Receiver;
+
+use crate::clipboard;
 use crate::components::scrollbar::Thumbs;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
@@ -10,16 +14,49 @@ use crate::selection::{
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::components::input::InputAction;
-use crate::image;
 use crate::repaint::Dirty;
 
-use super::image_paste::{spawn_read, take_ready};
-use super::{App, InputWriter, MAIN_CHAT, Msg};
+use super::{App, Msg};
+
+/// Reads {read} off the UI thread; the answer comes back through
+/// [`App::poll_mouse_paste`].
+pub(super) fn spawn_read<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Receiver<T> {
+    let (tx, rx) = oneshot::channel();
+    thread::spawn(move || {
+        let _ = tx.send(read());
+    });
+    rx
+}
+
+/// A reader that died without an answer goes too, or a paste gated on the
+/// list being empty would stay off for the rest of the session.
+pub(super) fn take_ready<T>(receivers: &mut Vec<Receiver<T>>) -> Option<T> {
+    let mut ready = None;
+    receivers.retain_mut(|rx| {
+        if ready.is_some() {
+            return true;
+        }
+        match rx.try_recv() {
+            Ok(value) => {
+                ready = Some(value);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Closed) => false,
+        }
+    });
+    ready
+}
+
+/// The bar's motion: the spinner while a turn is live.
+pub(crate) fn status_motion(working: bool) -> crate::components::status_bar::Motion {
+    crate::components::status_bar::Motion { working }
+}
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
-pub(super) const FLASH_COPIED: &str = "Copied selection";
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
@@ -38,7 +75,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
-                    if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
+                    if self.any_overlay_open() && zone.zone != SelectionZone::Overlay {
                         return;
                     }
                     // Move the cursor to the click position in the input area.
@@ -74,56 +111,13 @@ impl App {
         }
     }
 
-    /// A moved row whose task tab was deleted, or never restored, has no task
-    /// to open, so it takes the click any row would.
     fn click_messages(&mut self, row: u16, col: u16) {
         let area = self.msg_area();
-        let chat = self.active_chat;
-        let outcome = self.chats[chat].handle_click(row, col, area);
-        let outcome = match outcome {
-            ClickOutcome::OpenTask(id) if self.chat_of_task(&id).is_err() => {
-                self.chats[chat].toggle_click(row, area)
-            }
-            outcome => outcome,
-        };
-        self.handle_click_outcome(outcome);
+        let _ = self.chat.handle_click(row, col, area);
     }
 
-    pub(super) fn handle_click_outcome(&mut self, outcome: ClickOutcome) {
-        match outcome {
-            ClickOutcome::OpenTask(id) => {
-                if let Err(e) = self.focus_task(&id) {
-                    self.flash(e);
-                }
-            }
-            ClickOutcome::MoveCall(id) => {
-                self.move_to_background(Some(&id));
-            }
-            ClickOutcome::Handled | ClickOutcome::None => {}
-        }
-    }
-
-    /// What the chat input does with a paste no one else took: a line that is
-    /// an image path attaches the image, otherwise the text goes in.
-    pub(super) fn builtin_paste(&mut self, text: &str) {
-        // A finished tab has no input box, so the paste goes to the main
-        // chat, the way typed keys do.
-        if !self.chat_accepts_input() {
-            self.last_esc = None;
-            self.set_active_chat(MAIN_CHAT);
-        }
-        let mut any_image = false;
-        for line in text.lines() {
-            if let Some((path, media_type)) = image::try_parse_image_path(line) {
-                self.start_file_image_paste(path, media_type);
-                any_image = true;
-            }
-        }
-        if !any_image && let InputAction::Changed = self.input_box.handle_paste(text) {
-            self.input_changed(InputWriter::Anyone);
-        }
-    }
-
+    /// What the chat input does with a paste no one else took: the text goes
+    /// in. Images are a dead plane until the protocol grows them.
     /// The text is read in the background, so it comes back as a paste typed
     /// now and waits behind any keys still held, like one from the terminal.
     pub fn poll_mouse_paste(&mut self) -> Dirty {
@@ -143,10 +137,19 @@ impl App {
             Some(SelectionState::Dragging { ref sel, .. }) => Some(sel.zone),
             _ => None,
         };
-        match self.scroll_at(column, row, delta) {
-            Some(zone) if drag_zone == Some(zone) => self.drag_selection_to(row, column),
-            _ => self.clear_selection_unless_pending_copy(),
+        match self.selection_state {
+            Some(SelectionState::Dragging { ref sel, .. })
+                if self
+                    .zone_at(row, column)
+                    .is_some_and(|z| z.zone == sel.zone) =>
+            {
+                self.drag_selection_to(row, column);
+            }
+            Some(SelectionState::PendingCopy { .. }) => {}
+            _ => self.selection_state = None,
         }
+        let _ = drag_zone;
+        self.scroll_at(column, row, delta);
     }
 
     fn handle_drag(&mut self, row: u16, col: u16) {
@@ -259,23 +262,22 @@ impl App {
         &mut self,
         buf: &mut ratatui::buffer::Buffer,
         sel: &Selection,
-        render_chat: usize,
         thumbs: &Thumbs,
     ) {
         let text = match sel.zone {
             SelectionZone::Messages => {
                 let msg_area = self.msg_area();
-                self.chats[render_chat].extract_selection_text(sel, msg_area)
+                self.chat.extract_selection_text(sel, msg_area)
             }
             SelectionZone::Input => {
-                let Some(screen_sel) = self.screen_selection(sel, render_chat) else {
+                let Some(screen_sel) = self.screen_selection(sel) else {
                     self.selection_state = None;
                     return;
                 };
                 self.input_box.selected_text(sel.area, &screen_sel)
             }
             SelectionZone::Overlay => {
-                let Some(screen_sel) = self.screen_selection(sel, render_chat) else {
+                let Some(screen_sel) = self.screen_selection(sel) else {
                     self.selection_state = None;
                     return;
                 };
@@ -291,14 +293,6 @@ impl App {
         self.selection_state = None;
     }
 
-    pub(super) fn copy(&mut self, text: &str) {
-        match self.clipboard.copy_text(text) {
-            Ok(CopyResult::Noop) => {}
-            Ok(CopyResult::Copied) => self.status_bar.flash(FLASH_COPIED.into()),
-            Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
-        }
-    }
-
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
         self.zones.zone_at(row, col)
     }
@@ -310,7 +304,7 @@ impl App {
         let rel = selection::row_in_area(row, area);
         let col = selection::clamp_col(col, area);
         match zone {
-            SelectionZone::Messages => self.chats[self.active_chat].doc_pos_at(rel, col),
+            SelectionZone::Messages => self.chat.doc_pos_at(rel, col),
             SelectionZone::Input => {
                 DocPos::flat(self.input_box.scroll_y().saturating_add(rel), col)
             }
@@ -318,9 +312,9 @@ impl App {
         }
     }
 
-    pub(super) fn screen_selection(&self, sel: &Selection, chat: usize) -> Option<ScreenSelection> {
+    pub(super) fn screen_selection(&self, sel: &Selection) -> Option<ScreenSelection> {
         match sel.zone {
-            SelectionZone::Messages => sel.to_screen(|pos| self.chats[chat].project_row(pos)),
+            SelectionZone::Messages => sel.to_screen(|pos| self.chat.project_row(pos)),
             SelectionZone::Input => {
                 sel.to_screen(|pos| RowPos::flat(pos, sel.area, self.input_box.scroll_y()))
             }
@@ -330,7 +324,7 @@ impl App {
 
     pub(super) fn scroll_zone(&mut self, zone: SelectionZone, delta: i32) {
         match zone {
-            SelectionZone::Messages => self.chats[self.active_chat].scroll(delta),
+            SelectionZone::Messages => self.chat.scroll(delta),
             SelectionZone::Input => self.input_box.scroll(delta),
             SelectionZone::Overlay => {}
         }

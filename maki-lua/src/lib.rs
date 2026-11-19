@@ -1,4 +1,5 @@
 pub mod agent_autocmd;
+pub mod span_style;
 mod api;
 mod background;
 pub mod chunks;

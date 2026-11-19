@@ -27,6 +27,7 @@ thread_local! {
     static RECORDING: RefCell<Option<Thumbs>> = const { RefCell::new(None) };
 }
 
+#[allow(dead_code)] // the setting is lua-fed; kept for the config surface
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }

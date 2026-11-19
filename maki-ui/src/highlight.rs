@@ -6,6 +6,7 @@ use ratatui::text::Span;
 
 pub use maki_highlight::TAB_SPACES;
 
+#[allow(dead_code)] // called from benches and cold paths
 pub(crate) fn warmup() {
     refresh_syntax_theme();
     maki_highlight::warmup();

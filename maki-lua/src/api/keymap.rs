@@ -339,6 +339,24 @@ impl KeymapReader {
         self.mode.cursor.load().as_deref().cloned()
     }
 
+    /// The buffer-free half of [`Self::dispatch`]: global bindings only.
+    /// Buffer-bound keymaps belong to windows showing one, which a client
+    /// without windows never has.
+    pub fn dispatch_global(
+        &self,
+        key: Key,
+        mode: InputMode,
+        run: impl FnOnce(KeybindTicket) -> bool,
+    ) -> bool {
+        let snapshot = self.snapshot.load();
+        let ticket = snapshot
+            .entries
+            .iter()
+            .find(|e| e.is_for(key, mode, None))
+            .and_then(|entry| KeybindTicket::claim(entry, key));
+        ticket.is_some_and(run)
+    }
+
     /// Hands {key} to the binding on it in {mode} and reports whether it was
     /// taken. With {buffer}, only the bindings set for that buffer are asked,
     /// which the host does for each window showing one before it asks the

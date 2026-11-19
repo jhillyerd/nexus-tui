@@ -27,6 +27,7 @@ impl InputReader {
 
     /// The next event, or `None` once terminal input ends or fails. Never
     /// ready while paused.
+    #[allow(dead_code)] // the async half returns when plugin windows do
     pub(crate) async fn next(&mut self) -> Option<Event> {
         let Some(stream) = self.stream.as_mut() else {
             return pending().await;

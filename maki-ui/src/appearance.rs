@@ -35,6 +35,7 @@ pub(crate) fn init(theme: Option<&ThemePair>) {
 }
 
 /// `None` when startup did not ask.
+#[allow(dead_code)]
 pub(crate) fn background() -> Option<Background> {
     BACKGROUND.get().copied().flatten()
 }

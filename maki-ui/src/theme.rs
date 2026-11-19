@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
-use maki_agent::SpanColor;
 use maki_highlight::SegmentColor;
+use maki_lua::span_style::SpanColor;
 use maki_storage::StateDir;
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
@@ -460,13 +460,18 @@ pub struct Theme {
     pub heading: Style,
     pub list_marker: Style,
     pub horizontal_rule: Style,
+    #[allow(dead_code)]
     pub plan_rule: Style,
     pub table_border: Style,
     pub diff_old: Style,
     pub diff_new: Style,
+    #[allow(dead_code)] // diffs ride the flattened text for now
     pub diff_old_sign: Style,
+    #[allow(dead_code)]
     pub diff_new_sign: Style,
+    #[allow(dead_code)]
     pub diff_old_emphasis: Style,
+    #[allow(dead_code)]
     pub diff_new_emphasis: Style,
     pub diff_line_nr: Style,
     pub diff_old_line_nr: Style,
@@ -490,14 +495,19 @@ pub struct Theme {
     pub keybind_desc: Style,
     pub keybind_section: Style,
     pub mode_build: Color,
+    #[allow(dead_code)]
     pub mode_plan: Color,
     pub mode_bash: Color,
+    #[allow(dead_code)]
     pub queue: Style,
+    #[allow(dead_code)]
     pub plan_path: Style,
     pub status_notice: Style,
     pub status_retry_error: Style,
+    #[allow(dead_code)]
     pub status_retry_info: Style,
     pub input_placeholder: Style,
+    #[allow(dead_code)]
     pub queue_delete: Style,
     pub timestamp: Style,
     pub spinner: Style,
@@ -505,6 +515,7 @@ pub struct Theme {
     pub index_line_nr: Style,
     pub index_keyword: Style,
     pub shell_prefix: Style,
+    #[allow(dead_code)]
     pub progress_bar: Style,
     pub scrollbar_thumb: Style,
 
@@ -617,6 +628,50 @@ pub(crate) fn segment_color_from_span(c: SpanColor) -> SegmentColor {
 /// enclosing style still shows through, which [`Color::Reset`] would override.
 pub(crate) fn segment_slot(c: SegmentColor) -> Option<Color> {
     (c != SegmentColor::Default).then(|| to_color(c))
+}
+
+/// A plugin span's style, resolved against the current theme. Named styles
+/// come from the theme table; inline styles carry their own colors.
+pub(crate) fn resolve_span_style(style: &maki_lua::span_style::SpanStyle) -> Style {
+    use maki_lua::span_style::SpanStyle;
+    match style {
+        SpanStyle::Default => Style::default(),
+        SpanStyle::Named(name) => style_by_name(name),
+        SpanStyle::Inline(inline) => {
+            let mut s = Style::default();
+            if let Some(fg) = inline
+                .fg
+                .and_then(|c| segment_slot(segment_color_from_span(c)))
+            {
+                s = s.fg(fg);
+            }
+            if let Some(bg) = inline
+                .bg
+                .and_then(|c| segment_slot(segment_color_from_span(c)))
+            {
+                s = s.bg(bg);
+            }
+            if inline.bold {
+                s = s.bold();
+            }
+            if inline.italic {
+                s = s.italic();
+            }
+            if inline.underline {
+                s = s.underlined();
+            }
+            if inline.dim {
+                s = s.dim();
+            }
+            if inline.strikethrough {
+                s = s.crossed_out();
+            }
+            if inline.reversed {
+                s = s.reversed();
+            }
+            s
+        }
+    }
 }
 
 pub(crate) fn segment_style(c: SegmentColor) -> Style {

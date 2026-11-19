@@ -197,6 +197,22 @@ pub fn spawn(config: NodeConfig) -> (NodeClient, mpsc::UnboundedReceiver<ClientE
     (client, events_rx)
 }
 
+/// The channels without a loop behind them, for benches and tests. Sends
+/// land in a channel nobody drains; the event stream closes at once.
+pub fn spawn_detached() -> (NodeClient, mpsc::UnboundedReceiver<ClientEvent>) {
+    let (commands, commands_rx) = mpsc::unbounded_channel();
+    let (events, events_rx) = mpsc::unbounded_channel();
+    let _ = &events;
+    drop(commands_rx);
+    (
+        NodeClient {
+            shutdown: CancellationToken::new(),
+            commands,
+        },
+        events_rx,
+    )
+}
+
 /// The connection loop: connect → serve → (drop → backoff → connect)*,
 /// until the first connect fails, the credential is rejected, or the
 /// shutdown token fires.

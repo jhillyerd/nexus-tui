@@ -1,58 +1,45 @@
-mod cli;
-mod cmd;
-mod project_trust;
-mod resume;
-mod setup;
-mod update;
+//! `nexus-tui`: pair or load the stored credential, connect, run the UI,
+//! exit with the contract's code (0 clean, 2 connect failure, 4 credential
+//! rejected).
+
+mod boot;
+
+use std::process::ExitCode;
 
 use clap::Parser;
 
-use cli::Cli;
+/// The exit-code contract (tui-pairing.md): 4 on WS 401, 2 on other
+/// connect failures, 0 clean.
+const EXIT_CONNECT_FAILED: u8 = 2;
 
-/// What Rust's own panic path exits with.
-const PANIC_EXIT_CODE: i32 = 101;
+#[derive(Parser, Debug)]
+#[command(
+    name = "nexus-tui",
+    about = "A nexus TUI node: pair, connect, render the thread.",
+    version
+)]
+pub struct Args {
+    /// A pairing URL (`http://host:port/pair/<code>`). Bare relaunches use
+    /// the stored credential instead.
+    pub pair_url: Option<String>,
 
-/// A blocking task still parked on stdin would hold up the runtime's drop,
-/// so every way out of `main` exits the process instead: the normal path
-/// below, and a panic through this guard.
-struct ExitOnPanic;
-
-impl Drop for ExitOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            std::process::exit(PANIC_EXIT_CODE);
-        }
-    }
+    /// Forget every stored credential under the node name.
+    #[arg(long)]
+    pub reset: bool,
 }
 
-#[tokio::main]
-async fn main() {
-    color_eyre::install().ok();
-    let _exit = ExitOnPanic;
-    let result = cmd::dispatch(Cli::parse()).await;
-    let code = match result {
-        Ok(()) => 0,
-        Err(e) => {
-            print_error(&e);
-            1
+fn main() -> ExitCode {
+    let args = Args::parse();
+    let _ = color_eyre::install();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(boot::run(args)) {
+        Ok(code) => ExitCode::from(code),
+        Err(report) => {
+            eprintln!("{report}");
+            ExitCode::from(EXIT_CONNECT_FAILED)
         }
-    };
-    std::process::exit(code)
-}
-
-fn print_error(e: &color_eyre::Report) {
-    const RED: &str = "\x1b[31m";
-    const BOLD_RED: &str = "\x1b[1;31m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
-
-    eprintln!();
-    eprintln!("{BOLD_RED}✖ {e}{RESET}");
-    let causes: Vec<_> = e.chain().skip(1).collect();
-    let last = causes.len().saturating_sub(1);
-    for (i, cause) in causes.iter().enumerate() {
-        let branch = if i == last { "└─" } else { "├─" };
-        eprintln!("{DIM}{branch}{RESET} {RED}{cause}{RESET}");
     }
-    eprintln!();
 }

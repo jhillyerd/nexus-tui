@@ -67,16 +67,8 @@ impl AlertModal {
 }
 
 impl Overlay for AlertModal {
-    fn is_prompting(&self) -> bool {
-        self.is_open()
-    }
-
     fn is_open(&self) -> bool {
         self.is_open()
-    }
-
-    fn close(&mut self) {
-        self.close()
     }
 }
 

@@ -14,9 +14,41 @@ use std::cell::RefCell;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
-use maki_agent::UiWaker;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+/// Wakes the UI loop so a change made on another thread is painted now, not
+/// on the loop's next timed poll.
+#[derive(Clone, Default)]
+pub struct UiWaker(Arc<Notify>);
+
+impl UiWaker {
+    pub fn wake(&self) {
+        self.0.notify_one();
+    }
+
+    /// Resolves once a wake came in that the loop has not taken yet.
+    #[allow(dead_code)]
+    pub async fn woken(&self) {
+        self.0.notified().await;
+    }
+
+    /// Takes a pending wake without waiting for one.
+    #[allow(dead_code)]
+    pub fn take_wake(&self) -> bool {
+        use std::task::Context as TaskContext;
+        use std::task::Poll;
+        let mut notified = Box::pin(self.woken());
+        matches!(
+            notified
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(std::task::Waker::noop())),
+            Poll::Ready(())
+        )
+    }
+}
 use maki_highlight::pool::{Job, job_thread};
 
 const PARSE_THREAD: &str = "input-parse";
@@ -34,6 +66,7 @@ thread_local! {
 }
 
 /// Ready once a job has finished since the loop last looked.
+#[allow(dead_code)] // the loop re-wires these when plugin windows return
 pub fn wakes() -> &'static UiWaker {
     &WAKER
 }

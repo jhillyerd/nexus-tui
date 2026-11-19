@@ -19,8 +19,10 @@ use crate::components::input::sent_text;
 use crate::highlight::TAB_SPACES;
 
 #[cfg(test)]
+pub use self::marks::Decoration;
+#[cfg(test)]
 pub use self::marks::Reveal;
-pub use self::marks::{Concealed, Decoration, Mark, Marks, Placed, VirtTextPos};
+pub use self::marks::{Concealed, Mark, Marks, Placed, VirtTextPos};
 use self::rules::RuleMarks;
 pub use self::rules::RuleSet;
 use self::syntax::{SyntaxMarks, edit_since};
