@@ -367,12 +367,11 @@ async fn bash_local(
 /// Fold the non-unix stderr drain into the output, bounded at [`REAP`].
 #[cfg(not(unix))]
 async fn collect_stderr(output: &mut Output, task: Option<tokio::task::JoinHandle<Vec<u8>>>) {
-    if let Some(task) = task {
-        if let Ok(drained) = tokio::time::timeout(REAP, task).await {
-            if let Ok(drained) = drained {
-                output.absorb(&drained);
-            }
-        }
+    if let Some(task) = task
+        && let Ok(drained) = tokio::time::timeout(REAP, task).await
+        && let Ok(drained) = drained
+    {
+        output.absorb(&drained);
     }
 }
 
