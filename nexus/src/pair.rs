@@ -97,10 +97,7 @@ pub fn validate_node_name(name: &str) -> Result<(), String> {
         "" => Err("target name must not be empty".to_owned()),
         "workspace" => Err("target name 'workspace' is reserved".to_owned()),
         _ => {
-            if name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-            {
+            if name.chars().all(is_name_char) {
                 Ok(())
             } else {
                 Err(format!(
@@ -109,6 +106,20 @@ pub fn validate_node_name(name: &str) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Fold a name onto the server's charset: every character outside
+/// `^[a-zA-Z0-9_-]+$` becomes `-`. The counterpart to
+/// [`validate_node_name`] for derived defaults, which never collide
+/// with the reserved word.
+pub fn sanitize_node_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if is_name_char(c) { c } else { '-' })
+        .collect()
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
 }
 
 /// The exchange request body; `thread` rides only when overridden.
@@ -252,6 +263,14 @@ mod tests {
             validate_node_name("proxmox 2"),
             Err("target name must match ^[a-zA-Z0-9_-]+$ (got \"proxmox 2\")".to_owned())
         );
+    }
+
+    #[test]
+    fn sanitize_folds_onto_the_server_charset() {
+        assert_eq!(sanitize_node_name("james@nixos"), "james-nixos");
+        assert_eq!(sanitize_node_name("JAMES.NixOS"), "JAMES-NixOS");
+        assert_eq!(sanitize_node_name("proxmox-2"), "proxmox-2");
+        assert!(validate_node_name(&sanitize_node_name("a b@c.d")).is_ok());
     }
 
     /// Drive the exchange against a hand-rolled loopback responder:
