@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
-maki-otel = { workspace = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }

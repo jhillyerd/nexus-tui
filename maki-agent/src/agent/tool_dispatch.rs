@@ -49,22 +49,8 @@ const SEARCH_QUERY_FIELD: &str = "query";
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_MCP: &str = "mcp";
-const SOURCE_UNKNOWN: &str = "unknown";
-const BASH_TOOL: &str = "bash";
-const BASH_COMMAND_FIELD: &str = "command";
-const GIT_COMMIT: &str = "git commit";
-const GH_PR_CREATE: &str = "gh pr create";
 
 const ERROR_CANCELLED: &str = "cancelled";
-const ERROR_TIMEOUT: &str = "timeout";
-const ERROR_DENIED: &str = "permission_denied";
-const ERROR_NOT_FOUND: &str = "not_found";
-const ERROR_INVALID_INPUT: &str = "invalid_input";
-const ERROR_OTHER: &str = "error";
-
-/// A telemetry counter is not worth an unbounded diff; past this,
-/// `similar` returns a coarser but still valid one.
-const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The longest window a chain gets. An input chain ends sooner when its call
 /// does. Generous, because a layer may shell out before it decides, but a
@@ -162,7 +148,6 @@ pub async fn run(
         }
     };
 
-    let source = maki_otel::enabled().then(|| resolved.route.source());
     let started = Instant::now();
     let Ran { mut done, moved } = run_inner(
         resolved,
@@ -175,17 +160,11 @@ pub async fn run(
     )
     .await;
     let took = started.elapsed();
-    let output = OutputPipeline {
-        hook,
-        ctx,
-        origin,
-        tool: name,
-        source,
-    };
+    let output = OutputPipeline { hook, ctx, origin };
     match moved {
-        None => output.apply(&mut done, &input, Filtered::Final(took)).await,
+        None => output.apply(&mut done, &input, Filtered::Final).await,
         Some(moved) => {
-            let tail = output.detach(&done, &input, started);
+            let tail = output.detach(&done, &input);
             tail.publish(&mut done, moved).await;
         }
     }
@@ -245,8 +224,6 @@ struct OutputPipeline<'a> {
     hook: Option<Hook<'a>>,
     ctx: &'a ToolContext,
     origin: CallOrigin,
-    tool: &'a str,
-    source: Option<Cow<'static, str>>,
 }
 
 #[derive(Clone, Copy)]
@@ -254,8 +231,8 @@ enum Filtered {
     /// Tells a layer the call moved and its result comes later. It can still
     /// carry the call's own output, like the last lines of a command.
     Receipt,
-    /// What the call ended with, the only one telemetry reports.
-    Final(Duration),
+    /// What the call ended with.
+    Final,
 }
 
 impl OutputPipeline<'_> {
@@ -267,16 +244,13 @@ impl OutputPipeline<'_> {
         if self.origin.is_model() {
             attach_call_instructions(self.ctx, done);
         }
-        if let (Some(source), Filtered::Final(took)) = (&self.source, filtered) {
-            report(done, self.tool, source, input, took);
-        }
     }
 
     /// The call's own cancel belongs to its turn: a stop fires it before the
     /// final reply exists, which would end the output chain unheard and let
     /// the raw text through. So a moved call's outputs answer to their
     /// [window](Hook::window) alone.
-    fn detach(self, receipt: &ToolDoneEvent, input: &Value, started: Instant) -> MovedPipeline {
+    fn detach(self, receipt: &ToolDoneEvent, input: &Value) -> MovedPipeline {
         MovedPipeline {
             layer: self.hook.map(|hook| hook.layer),
             ctx: ToolContext {
@@ -284,11 +258,9 @@ impl OutputPipeline<'_> {
                 ..self.ctx.clone()
             },
             origin: self.origin,
-            source: self.source,
             id: receipt.id.clone(),
             tool: Arc::clone(&receipt.tool),
             input: input.clone(),
-            started,
         }
     }
 }
@@ -300,11 +272,9 @@ struct MovedPipeline {
     layer: Option<HookLayer>,
     ctx: ToolContext,
     origin: CallOrigin,
-    source: Option<Cow<'static, str>>,
     id: String,
     tool: Arc<str>,
     input: Value,
-    started: Instant,
 }
 
 impl MovedPipeline {
@@ -316,8 +286,6 @@ impl MovedPipeline {
                 .map(|layer| layer.bind(&self.ctx, &self.tool)),
             ctx: &self.ctx,
             origin: self.origin,
-            tool: &self.tool,
-            source: self.source.clone(),
         }
     }
 
@@ -351,9 +319,8 @@ impl MovedPipeline {
             return;
         };
         let mut done = ran(self.id.clone(), Arc::clone(&self.tool), result).done;
-        let took = self.started.elapsed();
         self.output()
-            .apply(&mut done, &self.input, Filtered::Final(took))
+            .apply(&mut done, &self.input, Filtered::Final)
             .await;
         landing.land(Some(done));
     }
@@ -628,18 +595,6 @@ enum Route<'a> {
 }
 
 impl Route<'_> {
-    /// Registry tools report the plugin behind them, because "native" alone
-    /// tells whoever reads the metric nothing.
-    fn source(&self) -> Cow<'static, str> {
-        match self {
-            Self::Native(entry) => entry.source.as_log_field(),
-            Self::Local(_) => Cow::Borrowed(SOURCE_LOCAL),
-            Self::Mcp(..) => Cow::Borrowed(SOURCE_MCP),
-            Self::ToolSearch(_) => Cow::Borrowed(TOOL_SEARCH_TOOL_NAME),
-            Self::Unknown => Cow::Borrowed(SOURCE_UNKNOWN),
-        }
-    }
-
     /// What hooking this call would lend. Every route answers here, so a new
     /// one cannot reach a hook without naming its price. Only a declared
     /// capability, or an explicit declaration that the tool reaches nothing,
@@ -1427,78 +1382,6 @@ pub(super) async fn process_tool_calls(
     Ok(moved)
 }
 
-/// Low-cardinality buckets, because a raw error message would give the
-/// collector a new attribute value on every call.
-fn classify_error(text: &str) -> &'static str {
-    let text = text.to_ascii_lowercase();
-    if text.contains("cancel") {
-        ERROR_CANCELLED
-    } else if text.contains("timed out") || text.contains("timeout") {
-        ERROR_TIMEOUT
-    } else if text.contains("permission denied") || text.contains("not allowed") {
-        ERROR_DENIED
-    } else if text.contains("no such file") || text.contains("not found") {
-        ERROR_NOT_FOUND
-    } else if text.contains("invalid") || text.contains("expected") {
-        ERROR_INVALID_INPUT
-    } else {
-        ERROR_OTHER
-    }
-}
-
-fn changed_lines(before: &str, after: &str) -> (u64, u64) {
-    let mut added = 0;
-    let mut removed = 0;
-    let diff = similar::TextDiff::configure()
-        .timeout(DIFF_TIMEOUT)
-        .diff_lines(before, after);
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Insert => added += 1,
-            similar::ChangeTag::Delete => removed += 1,
-            similar::ChangeTag::Equal => {}
-        }
-    }
-    (added, removed)
-}
-
-/// The same heuristic Claude Code uses: look at what the shell was asked to
-/// do, not at what it printed.
-fn git_activity(name: &str, input: &Value) {
-    if name != BASH_TOOL {
-        return;
-    }
-    let Some(command) = input.get(BASH_COMMAND_FIELD).and_then(Value::as_str) else {
-        return;
-    };
-    if command.contains(GIT_COMMIT) {
-        maki_otel::emit::commit_created();
-    }
-    if command.contains(GH_PR_CREATE) {
-        maki_otel::emit::pull_request_created();
-    }
-}
-
-fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: Duration) {
-    let error_text = done.is_error.then(|| done.output.as_text());
-    let tool_input = maki_otel::logs_tool_details().then(|| input.to_string());
-    maki_otel::emit::tool_result(&maki_otel::emit::ToolResult {
-        tool_name: name,
-        tool_source: source,
-        success: !done.is_error,
-        duration: took,
-        error_type: error_text.as_deref().map(classify_error),
-        tool_input: tool_input.as_deref(),
-    });
-    if let ToolOutput::Diff { before, after, .. } = done.output.as_ref() {
-        let (added, removed) = changed_lines(before, after);
-        maki_otel::emit::lines_of_code(added, removed);
-    }
-    if !done.is_error {
-        git_activity(name, input);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::iter;
@@ -1574,7 +1457,6 @@ mod tests {
     const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
     const HOOK_DIFF_SUMMARY: &str = "1 file changed";
     const HOOK_ESCAPED_PATH: &str = "/tmp/not-the-plan.md";
-    const TEST_PLUGIN_SOURCE: &str = "lua:test";
     const START_PROBE_NAME: &str = "start_probe";
     /// Allowed by the shared stub permissions; nothing is ever written here.
     const TEST_ROOT: &str = "/tmp";
@@ -3113,14 +2995,6 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_source_names_the_plugin_for_registry_tools() {
-        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
-        ctx.registry = registry_with(&[PROBE_WIRE]);
-        assert_eq!(resolve(&ctx, PROBE_WIRE).route.source(), TEST_PLUGIN_SOURCE);
-        assert_eq!(resolve(&ctx, OTHER_WIRE).route.source(), SOURCE_MCP);
-    }
-
-    #[test]
     fn resolve_prefers_local_over_registry_and_registry_over_mcp() {
         let mcp = stub_mcp(&[PROBE_QUALIFIED]);
         let mut ctx = with_mcp(local_ctx(PROBE_WIRE, |_| Ok(String::new())), &mcp);
@@ -3686,32 +3560,6 @@ mod tests {
         .await;
 
         assert!(views[0].cancelled_while_running);
-    }
-}
-
-#[cfg(test)]
-mod telemetry_tests {
-    use test_case::test_case;
-
-    use super::*;
-
-    const BEFORE: &str = "a\nb\nc\n";
-    const AFTER: &str = "a\nB\nc\nd\n";
-
-    #[test_case("operation was cancelled", ERROR_CANCELLED; "cancelled")]
-    #[test_case("command timed out after 120s", ERROR_TIMEOUT; "timed_out")]
-    #[test_case("permission denied: bash", ERROR_DENIED; "denied")]
-    #[test_case("no such file or directory", ERROR_NOT_FOUND; "missing_file")]
-    #[test_case("invalid input: expected a string", ERROR_INVALID_INPUT; "invalid")]
-    #[test_case("boom", ERROR_OTHER; "fallback")]
-    fn errors_bucket_into_low_cardinality_types(text: &str, expected: &str) {
-        assert_eq!(classify_error(text), expected);
-    }
-
-    #[test]
-    fn diffs_count_added_and_removed_lines() {
-        assert_eq!(changed_lines(BEFORE, AFTER), (2, 1));
-        assert_eq!(changed_lines(BEFORE, BEFORE), (0, 0));
     }
 }
 

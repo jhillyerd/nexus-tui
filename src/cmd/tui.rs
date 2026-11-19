@@ -18,7 +18,6 @@ use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::Cli;
-use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
 
@@ -101,9 +100,6 @@ fn load_config(
         config.permissions.yolo = true;
     }
     cli.apply_tool_flags(&mut config.agent)?;
-    // A turn cap would cut an interactive session short, so
-    // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
-    config.agent.max_turns = cli.max_turns;
     config.validate()?;
     Ok(config)
 }
@@ -185,11 +181,10 @@ async fn build_stack(
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
         }
-        (Err(_), None) if !cli.print => {
+        (Err(_), None) => {
             let placeholder = Model::from_spec(FALLBACK_MODEL_SPEC).expect("fallback model");
             (placeholder, true)
         }
-        (Err(e), None) => return Err(e),
     };
 
     Ok((
@@ -281,21 +276,13 @@ async fn rebuild(
     Ok((stack, warnings, pack_report))
 }
 
-pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
+pub async fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    // Only the interactive UI can answer an install confirmation or a trust
-    // prompt. The other modes refuse the install with its reason and skip
-    // untrusted project config with a warning, terminal or not.
-    let headless = cli.print || cli.is_sdk_mode();
-    let interaction = if headless {
-        Interaction::None
-    } else {
-        Interaction::Tty
-    };
+    let interaction = Interaction::Tty;
     // `--trust` answers the question up front, so it holds wherever Maki runs.
     // Without it the store is the only source of an answer this early.
     let mode = if cli.trust {
@@ -314,14 +301,11 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     };
     let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None).await?;
 
-    // The card owns the terminal, so it is drawn before logging, telemetry and
-    // the panic hook claim it, and while the process is still single-threaded.
-    // Every mode settles the question here, so a policy grant reaches `-p` and
-    // the SDK exactly as it reaches the UI; only the card is TUI-only.
-    let can_ask = !headless && io::stdin().is_terminal() && io::stderr().is_terminal();
+    // The card owns the terminal, so it is drawn before logging and the panic
+    // hook claim it, and while the process is still single-threaded.
+    let can_ask = io::stdin().is_terminal() && io::stderr().is_terminal();
     // Declared before the early returns so a policy grant can name its pattern
-    // in the UI's first frame. A headless run returns before the UI exists and
-    // drops it; its grant is already visible through `maki trust list`.
+    // in the UI's first frame.
     let mut notice = None;
     let answer = match policy_grant(&trust.state, &stack.config.trust) {
         Some(pattern) => {
@@ -362,94 +346,11 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     }
 
     setup::init_logging(&stack.config.storage, trust.project_config.config_root());
-    setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    // Discovery runs before logging is initialized, so a package problem has
-    // no log to reach either. The TUI shows these in its first generation; a
-    // mode that never opens the UI has to report them here or a broken
-    // package fails in complete silence.
-    if cli.is_sdk_mode() || cli.print {
-        for warning in startup_warnings
-            .iter()
-            .chain(&provider_scripts::startup_warning())
-        {
-            eprintln!("warning: {warning}");
-        }
-    }
-
-    // Resolved before the modes diverge, so `--print`, the SDK and the UI
-    // cannot pick different sessions, different ids or a different cwd to look
-    // in, and all three report the same start to telemetry.
     let cwd_str = cwd.to_string_lossy().into_owned();
     let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
-    setup::report_session_start(resolved.start_type, Some(&resolved.id));
-
-    if cli.is_sdk_mode() {
-        let prompt_slots = stack
-            .plugin_host
-            .event_handle()
-            .collect_prompt_slots(Some(resolved.id.as_str()))
-            .await;
-        let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
-        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
-            cli,
-            resumed,
-            claim,
-            storage: storage.clone(),
-            model: stack.model,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            prompt_slots,
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            lua_handle: stack.plugin_host.event_handle(),
-            project_config: trust.project_config.clone(),
-        })
-        .await
-        .context("run sdk mode")?;
-        drop(stack.plugin_host);
-        teardown.join();
-        interrupt.exit_if_caught();
-        return Ok(());
-    }
-
-    if cli.print {
-        let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
-        let background_wait = cli.background_wait();
-        let host_prompt = cli.host_prompt();
-        let interrupt = crate::print::run(crate::print::PrintParams {
-            model: stack.model,
-            prompt: cli.initial_prompt,
-            image_paths: cli.images,
-            format: cli.output_format,
-            verbose: cli.verbose,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            lua_handle: stack.plugin_host.event_handle(),
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            project_config: trust.project_config.clone(),
-            host_prompt,
-            resumed,
-            claim,
-            storage: storage.clone(),
-            background_wait,
-        })
-        .await
-        .context("run print mode")?;
-        drop(stack.plugin_host);
-        teardown.join();
-        interrupt.exit_if_caught();
-        return Ok(());
-    }
 
     let mut tabs = vec![open_tab(
         resolved,
@@ -488,14 +389,7 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
-                // The scripts are read per run: plugins have just (re)loaded,
-                // and a script one of them now replaces is no longer worth a
-                // word. An alert, not a status-bar flash: both say where the
-                // user's files are, and a 1.5s flash is too short to read.
-                startup_alert: [legacy_notice.take(), provider_scripts::startup_warning()]
-                    .into_iter()
-                    .flatten()
-                    .reduce(|shown, next| format!("{shown}\n\n{next}")),
+                startup_alert: None,
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -550,7 +444,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                     "plugin host and teardown joined"
                 );
                 if code != 0 {
-                    maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
                 return Ok(());
@@ -583,7 +476,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let replacement = Resolved::fresh(&storage);
-                    setup::report_session_start(replacement.start_type, Some(&replacement.id));
                     tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
                 stack = new_stack;

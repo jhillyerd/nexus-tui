@@ -7,7 +7,6 @@ pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
 pub(crate) mod image;
-pub(crate) mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
@@ -159,14 +158,6 @@ pub(crate) fn create_maki_global(
     maki.set(
         "async",
         r#async::create_async_table(lua, Arc::clone(&plugin))?,
-    )?;
-    maki.set(
-        "interpreter",
-        interpreter::create_interpreter_table(
-            lua,
-            permissions,
-            permissions.is_allowed(Permission::FsRead),
-        )?,
     )?;
     maki.set(
         "agent",

@@ -26,7 +26,6 @@ use maki_storage::model::persist_model;
 use maki_storage::stdin;
 
 use crate::cli::{PromptArgs, PromptVariant};
-use crate::provider_scripts;
 
 const PROTOCOL_CHOICES: &str = "openai, openai-responses, anthropic or google";
 const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
@@ -62,10 +61,7 @@ async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
     let is_custom = ProvidersConfig::load().get(slug).is_some();
     if builtin.is_none() && !plugin::is_registered(slug) && !is_custom {
-        match provider_scripts::unknown_provider_hint(slug) {
-            Some(hint) => bail!(hint),
-            None => bail!("unknown provider '{slug}'"),
-        }
+        bail!("unknown provider '{slug}'");
     }
 
     // A `login` hook is the plugin's own flow and wins over asking for a key.

@@ -824,17 +824,13 @@ impl PermissionManager {
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
-        let deny = |source: &'static str,
+        let deny = |_source: &'static str,
                     reason: String,
                     guidance: Option<String>,
                     plugin: Option<Arc<str>>| {
-            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
             PermissionError::denied(&tool_string, &scope_display(), reason, guidance, plugin)
         };
-        let allowed = |source: &'static str| {
-            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
-            Ok(None)
-        };
+        let allowed = |_source: &'static str| Ok(None);
         let by_rule = || {
             if self.yolo.load(Ordering::Relaxed) {
                 DECISION_SOURCE_YOLO

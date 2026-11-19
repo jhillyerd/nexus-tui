@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fmt::{self, Display};
+use std::fmt::{self};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -8,7 +8,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 
 use maki_config::{ModelPolicy, ProviderConfig, SessionDefaults};
-use maki_providers::model::{Model, ModelError, ModelTier};
+use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
@@ -22,8 +22,6 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
-
-use crate::provider_scripts;
 
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
@@ -127,11 +125,6 @@ pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
 
 async fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
     let result = Model::from_spec_or_warm_catalog(spec).await;
-    if let Err(ModelError::UnsupportedProvider(slug)) = &result
-        && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
-    {
-        bail!(hint);
-    }
     Ok(result?)
 }
 
@@ -210,22 +203,6 @@ pub fn install_panic_log_hook() {
         );
         prev(info);
     }));
-}
-
-/// Telemetry is opt-in and must never stop maki from starting, so a bad
-/// setting is a warning in the log, not an error to the user. Call this after
-/// `init_logging` or the warning has nowhere to go.
-pub fn init_telemetry(config: &maki_config::TelemetryConfig) {
-    if let Err(error) = maki_otel::init(config) {
-        tracing::warn!(%error, "telemetry disabled");
-    }
-}
-
-/// Headless runs without a session id still count, they just stay
-/// unattributed.
-pub fn report_session_start(start_type: &'static str, session_id: Option<impl Display>) {
-    let id = session_id.map(|id| id.to_string());
-    maki_otel::emit::session_started(start_type, id.as_deref());
 }
 
 /// The writer every event goes through.

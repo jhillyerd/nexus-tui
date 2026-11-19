@@ -95,7 +95,6 @@ pub const MIN_RETRY_MAX_MS: u64 = 1;
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
-    "code_execution",
     "completion",
     "deepseek",
     "edit",
@@ -1956,8 +1955,7 @@ fn normalize_remote_url(url: &str) -> String {
 /// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
 /// `MAKI_*`) environment variable, which wins over what is set here.
 ///
-/// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
-/// "unset" is decided in one place.
+/// Fields stay optional: the meaning of "unset" is decided in one place.
 #[derive(Deserialize, Debug, Clone, ConfigSection, Merge)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]

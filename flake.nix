@@ -94,26 +94,15 @@
 
       cargoLockParsed = builtins.fromTOML (builtins.readFile ./Cargo.lock);
 
-      # Exact Cargo.lock source strings (with fragment) of all git deps
+      # Exact Cargo.lock source strings (with fragment) of all git deps.
+      # A dep bump changes the key: replace it with the new Cargo.lock source
+      # string, set the hash to "", rebuild, and paste the hash from the error.
+      # A missing key falls back to fetchGit with an eval warning; a wrong hash
+      # fails the build with the real hash printed.
       gitDepSources = lib.unique (
         builtins.filter (lib.hasPrefix "git+") (map (p: p.source or "") cargoLockParsed.package)
       );
 
-      # Fixed-output fetches for git deps: cold evals skip full-history
-      # builtins.fetchGit clones, and CI gets substitutable cache hits instead.
-      # Keys embed the dep's tag/rev and locked commit, so a dep bump changes
-      # the key itself: replace the old key with the new Cargo.lock source
-      # string, set the hash to "", rebuild, and paste the hash from the error.
-      # The `git-dep-hashes` CI check names both the key to add and the stale
-      # key to remove.
-      #
-      # Two failure modes:
-      # - Missing key (dep bumped, flake not yet updated): crane falls back
-      #   to fetchGit with an eval warning. Nothing breaks; cold evals are
-      #   just slower until the key and its hash are added.
-      # - Wrong hash for an existing key: the build fails with a hash
-      #   mismatch that prints the real hash. This is both the recovery
-      #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
         "git+https://github.com/crossterm-rs/crossterm?rev=94ed7154e35d24a2f643c61760e1eb05b8ca9e63#94ed7154e35d24a2f643c61760e1eb05b8ca9e63" =
           "sha256-r2Xsxw8+eqESsJKaax5pb/rIWshkoqi5E81Dkh8snZ8=";
@@ -121,22 +110,18 @@
           "sha256-ZszhXL+Bd0zZGOfOodvP4z6dLD3jJr3pO07riwFUC70=";
       };
 
-      missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
-
-      staleGitDepHashes = builtins.filter (k: !(builtins.elem k gitDepSources)) (
-        builtins.attrNames gitDepHashes
-      );
-
-      gitDepHashDrift =
-        lib.optionalString (missingGitDepHashes != [ ]) ''
-          missing entries (add with hash "", rebuild, paste the hash from the error):
-            ${lib.concatStringsSep "\n  " missingGitDepHashes}
-        ''
-        + lib.optionalString (staleGitDepHashes != [ ]) ''
-          stale entries (remove):
-            ${lib.concatStringsSep "\n  " staleGitDepHashes}
-        '';
+      # Fail loudly at eval when a Cargo.lock git dep has no pinned hash: the
+      # fetchGit fallback only warns, and a silent warning is how this rots.
+      assertGitDepHashes =
+        lib.foldr (
+          source: acc:
+          if builtins.hasAttr source gitDepHashes then
+            acc
+          else
+            builtins.throw "flake.nix gitDepHashes is missing an entry for ${source} (add with hash \"\", rebuild, paste the hash from the error)"
+        ) null gitDepSources;
     in
+    assert assertGitDepHashes == null;
     {
       packages = forEachSystem (_: pkgs: { default = mkMaki pkgs "release"; });
 
@@ -145,23 +130,6 @@
           # Catches what only breaks under Nix (source filter, vendoring, native
           # inputs) in a fraction of the time of the fat LTO release build.
           build = mkMaki pkgs "dev";
-          git-dep-hashes =
-            if missingGitDepHashes == [ ] && staleGitDepHashes == [ ] then
-              pkgs.runCommandLocal "git-dep-hashes" { } "touch $out"
-            else
-              builtins.throw ''
-                flake.nix gitDepHashes is out of sync with Cargo.lock git sources:
-                ${gitDepHashDrift}'';
-          fmt =
-            pkgs.runCommandLocal "check-nix-format"
-              {
-                nativeBuildInputs = [ pkgs.nixfmt ];
-                src = lib.cleanSource ./.;
-              }
-              ''
-                find "$src" -name '*.nix' -type f -exec nixfmt --check {} +
-                touch $out
-              '';
         }
       );
 
@@ -187,11 +155,8 @@
               git
               just
               pkg-config
-              python3
               ripgrep
-              ruff
               stylua
-              ty
             ];
 
             SSL_CERT_FILE = certs;
