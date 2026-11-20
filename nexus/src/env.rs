@@ -760,7 +760,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let result = serve_call(dir.path(), "bash", &bash("sleep 30"), 30_000, SHORT_CAP, &cancel).await;
+        let result = serve_call(
+            dir.path(),
+            "bash",
+            &bash("sleep 30"),
+            30_000,
+            SHORT_CAP,
+            &cancel,
+        )
+        .await;
         assert_eq!(
             result,
             Err("cancelled. partial output:\n(no output)".to_owned())
@@ -821,8 +829,14 @@ mod tests {
     #[test]
     fn resolve_joins_relative_and_passes_absolute_through() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(resolve(dir.path(), "sub/notes.txt"), dir.path().join("sub/notes.txt"));
-        assert_eq!(resolve(dir.path(), "./sub/../root.txt"), dir.path().join("./sub/../root.txt"));
+        assert_eq!(
+            resolve(dir.path(), "sub/notes.txt"),
+            dir.path().join("sub/notes.txt")
+        );
+        assert_eq!(
+            resolve(dir.path(), "./sub/../root.txt"),
+            dir.path().join("./sub/../root.txt")
+        );
         let absolute = dir.path().join("elsewhere.txt");
         assert_eq!(resolve(dir.path(), absolute.to_str().unwrap()), absolute);
     }
@@ -937,8 +951,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret.txt"), "outside").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("link.txt"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .unwrap();
         assert_eq!(
             call(
                 dir.path(),
@@ -1004,14 +1021,24 @@ mod tests {
     async fn list_dir_sorts_suffixes_directories_and_reports_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"})).await,
+            call(
+                dir.path(),
+                "list_dir",
+                serde_json::json!({"target": "workspace"})
+            )
+            .await,
             Ok("(empty)".to_owned())
         );
         fs::create_dir(dir.path().join("zeta")).unwrap();
         fs::write(dir.path().join("alpha.txt"), "").unwrap();
         fs::write(dir.path().join("mid.txt"), "").unwrap();
         assert_eq!(
-            call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"})).await,
+            call(
+                dir.path(),
+                "list_dir",
+                serde_json::json!({"target": "workspace"})
+            )
+            .await,
             Ok("alpha.txt\nmid.txt\nzeta/".to_owned())
         );
         assert_eq!(
@@ -1031,9 +1058,13 @@ mod tests {
         for i in 0..LIST_DIR_ENTRY_CAP + 3 {
             fs::write(dir.path().join(format!("f{i:04}")), "").unwrap();
         }
-        let result = call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"}))
-            .await
-            .unwrap();
+        let result = call(
+            dir.path(),
+            "list_dir",
+            serde_json::json!({"target": "workspace"}),
+        )
+        .await
+        .unwrap();
         assert!(result.contains("[... 3 more entries omitted ...]"));
         assert_eq!(result.lines().count(), LIST_DIR_ENTRY_CAP + 1);
     }
