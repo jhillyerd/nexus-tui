@@ -92,7 +92,8 @@ pub struct NodeConfig {
     pub token: String,
     pub thread: String,
     pub role: Role,
-    /// The node's LOCAL workspace root (the per-thread dir derives from it).
+    /// The node's working directory: where `bash` runs and relative
+    /// fs-tool paths resolve against (the TUI launches from here).
     pub workspace: PathBuf,
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
@@ -334,7 +335,6 @@ async fn session(
     // them all (the server answers its side through the adapter
     // monitor).
     let mut calls: HashMap<i64, CancellationToken> = HashMap::new();
-    let workspace = env::Workspace::new(config.workspace.clone(), config.thread.clone());
     let mut pings = tokio::time::interval(PING_INTERVAL);
     pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Align the first tick: intervals fire immediately at creation.
@@ -375,7 +375,7 @@ async fn session(
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
                     match protocol::decode_server_frame(&text) {
-                        Ok(frame) => on_frame(config, frame, &mut calls, &workspace, &outbound_tx, events),
+                        Ok(frame) => on_frame(config, frame, &mut calls, &outbound_tx, events),
                         // Malformed wire: skip, never fatal — the
                         // server's own policy for OUR garbage is an
                         // error frame, and it keeps the socket.
@@ -424,7 +424,6 @@ fn on_frame(
     config: &NodeConfig,
     frame: protocol::ServerFrame,
     calls: &mut HashMap<i64, CancellationToken>,
-    workspace: &env::Workspace,
     outbound_tx: &mpsc::UnboundedSender<Outbound>,
     events: &mpsc::UnboundedSender<ClientEvent>,
 ) {
@@ -434,7 +433,7 @@ fn on_frame(
             tool,
             arguments,
         } => {
-            dispatch_call(config, id, tool, arguments, calls, workspace, outbound_tx);
+            dispatch_call(config, id, tool, arguments, calls, outbound_tx);
         }
         protocol::ServerFrame::Cancelled { id } => {
             // Best-effort by contract: an already-answered or unknown
@@ -464,18 +463,17 @@ fn dispatch_call(
     tool: String,
     arguments: Value,
     calls: &mut HashMap<i64, CancellationToken>,
-    workspace: &env::Workspace,
     outbound_tx: &mpsc::UnboundedSender<Outbound>,
 ) {
     let token = CancellationToken::new();
     calls.insert(id, token.clone());
-    let workspace = workspace.clone();
+    let cwd = config.workspace.clone();
     let outbound_tx = outbound_tx.clone();
     let timeout_ms = config.timeout_ms;
     let max_output_bytes = config.max_output_bytes;
     tokio::spawn(async move {
         let outcome = env::serve_call(
-            &workspace,
+            &cwd,
             &tool,
             &arguments,
             timeout_ms,
@@ -579,7 +577,7 @@ mod tests {
             token: "tok-1".to_owned(),
             thread: "th-1".to_owned(),
             role: Role::Environment,
-            workspace: std::env::temp_dir().join("nexus-client-test-workspace"),
+            workspace: std::env::temp_dir(),
             timeout_ms: 10_000,
             max_output_bytes: 4096,
         }
@@ -689,10 +687,7 @@ mod tests {
     async fn tool_call_round_trip_executes_locally() {
         let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let workspace = tempfile::tempdir().unwrap();
-        let mut cfg = config(port);
-        cfg.workspace = workspace.path().to_owned();
-        let (_client, mut events) = spawn(cfg);
+        let (_client, mut events) = spawn(config(port));
         let (mut ws, _) = accept(&listener).await;
         let _ = next_event(&mut events).await; // Connected
 
@@ -747,10 +742,7 @@ mod tests {
     async fn cancelled_notice_stops_a_long_call() {
         let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let workspace = tempfile::tempdir().unwrap();
-        let mut cfg = config(port);
-        cfg.workspace = workspace.path().to_owned();
-        let (_client, mut events) = spawn(cfg);
+        let (_client, mut events) = spawn(config(port));
         let (mut ws, _) = accept(&listener).await;
         let _ = next_event(&mut events).await; // Connected
 

@@ -8,9 +8,9 @@
 //! - [`protocol`]: the `"v":1` wire codec, both planes, pinned byte-exact
 //!   against the server's `node_protocol_test` shapes.
 //! - [`env`]: the four environment tools (`bash`, `read_file`,
-//!   `write_file`, `list_dir`) with the v1-floor execution semantics —
-//!   cwd default, wall-clock timeout, kill-tree on cancel/timeout, byte
-//!   caps enforced while reading, lexical path confinement.
+//!   `write_file`, `list_dir`) executed unsandboxed in the node's
+//!   working directory — wall-clock timeout, kill-tree on
+//!   cancel/timeout, byte caps enforced while reading.
 //! - [`pair`]: pairing-URL parsing and the public `POST /nodes/pair`
 //!   exchange.
 //! - [`state`]: the 0600 credential state file, keyed per
