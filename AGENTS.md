@@ -45,6 +45,9 @@ Cheapest first, and scope to the crate you touched while iterating:
 - `just lint` - `cargo clippy --all --all-targets -- -D warnings`
 - `just test` - `cargo nextest run --workspace`
 
+Before pushing: `just ci` — the same gates CI runs (fmt-check, lint, test,
+machete). Don't let CI be the first thing that runs rustfmt.
+
 Read `justfile` for more.
 
 Dev builds skip debug info for deps and vendored C (our crates keep it); to debug into a dep set `[profile.dev.package.<name>] debug = true`.
