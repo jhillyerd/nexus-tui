@@ -66,8 +66,8 @@ impl Cli {
 }
 
 /// The default node identity: `<user>-<host>`, lowercased and folded
-/// onto the server's charset (an `@` cannot ride the wire, so
-/// `james@nixos` pairs as `james-nixos`).
+/// onto the server's charset (a `USER` carrying `@` pairs as
+/// `user@host` — the charset allows it).
 fn default_node() -> String {
     sanitize_node_name(&format!("{}-{}", default_user(), default_host()).to_lowercase())
 }

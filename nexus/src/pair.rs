@@ -91,7 +91,8 @@ fn invalid(message: String) -> PairError {
 
 /// Validate a proposed node name before the exchange (the server's
 /// `env.valid_target_name` rule, same wording): non-empty, `workspace`
-/// reserved, `^[a-zA-Z0-9_-]+$`.
+/// reserved, `^[a-zA-Z0-9_@-]+$` (`@` so a node can register as
+/// `user@host`).
 pub fn validate_node_name(name: &str) -> Result<(), String> {
     match name {
         "" => Err("target name must not be empty".to_owned()),
@@ -101,7 +102,7 @@ pub fn validate_node_name(name: &str) -> Result<(), String> {
                 Ok(())
             } else {
                 Err(format!(
-                    "target name must match ^[a-zA-Z0-9_-]+$ (got \"{name}\")"
+                    "target name must match ^[a-zA-Z0-9_@-]+$ (got \"{name}\")"
                 ))
             }
         }
@@ -109,7 +110,7 @@ pub fn validate_node_name(name: &str) -> Result<(), String> {
 }
 
 /// Fold a name onto the server's charset: every character outside
-/// `^[a-zA-Z0-9_-]+$` becomes `-`. The counterpart to
+/// `^[a-zA-Z0-9_@-]+$` becomes `-`. The counterpart to
 /// [`validate_node_name`] for derived defaults, which never collide
 /// with the reserved word.
 pub fn sanitize_node_name(name: &str) -> String {
@@ -119,7 +120,7 @@ pub fn sanitize_node_name(name: &str) -> String {
 }
 
 fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '-')
 }
 
 /// The exchange request body; `thread` rides only when overridden.
@@ -251,6 +252,8 @@ mod tests {
     #[test]
     fn node_name_validation_matches_the_server_rule() {
         assert_eq!(validate_node_name("proxmox-2"), Ok(()));
+        // `@` is allowed: a node can register as user@host.
+        assert_eq!(validate_node_name("james@vps"), Ok(()));
         assert_eq!(
             validate_node_name(""),
             Err("target name must not be empty".to_owned())
@@ -261,13 +264,13 @@ mod tests {
         );
         assert_eq!(
             validate_node_name("proxmox 2"),
-            Err("target name must match ^[a-zA-Z0-9_-]+$ (got \"proxmox 2\")".to_owned())
+            Err("target name must match ^[a-zA-Z0-9_@-]+$ (got \"proxmox 2\")".to_owned())
         );
     }
 
     #[test]
     fn sanitize_folds_onto_the_server_charset() {
-        assert_eq!(sanitize_node_name("james@nixos"), "james-nixos");
+        assert_eq!(sanitize_node_name("james@nixos"), "james@nixos");
         assert_eq!(sanitize_node_name("JAMES.NixOS"), "JAMES-NixOS");
         assert_eq!(sanitize_node_name("proxmox-2"), "proxmox-2");
         assert!(validate_node_name(&sanitize_node_name("a b@c.d")).is_ok());

@@ -53,7 +53,9 @@ pub struct Credential {
 
 /// Filename-safe key: every character outside `[a-zA-Z0-9._-]` becomes
 /// `-`, then one trailing `-` is dropped (the launcher's
-/// `tr -c … '-' | sed 's/-$//'`).
+/// `tr -c … '-' | sed 's/-$//'`). Authority and thread segments only —
+/// the legacy collapse is kept byte-identical so stored files under
+/// those keys keep resolving.
 fn name_key(raw: &str) -> String {
     let mut key: String = raw
         .chars()
@@ -69,6 +71,25 @@ fn name_key(raw: &str) -> String {
         key.pop();
     }
     key
+}
+
+/// Node segment key — injective over the server's name charset
+/// (`[a-zA-Z0-9_@-]`, the launcher's `node_key`): `@` becomes `%40`
+/// before the collapse, and `%` is never a name character, so
+/// `user@host` and `user-host` cannot share a state file and one
+/// pairing cannot overwrite the other's credential. No trailing-dash
+/// strip either (`node-` must not share `node`'s key).
+fn node_key(node: &str) -> String {
+    node.replace('@', "%40")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '~' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// The server base's filename key: scheme stripped, authority up to
@@ -88,7 +109,7 @@ pub fn state_path(root: &Path, server: &str, node: &str, thread: &str) -> PathBu
     root.join(format!(
         "{FILE_PREFIX}{}-{}-{}{FILE_SUFFIX}",
         authority_key(server),
-        name_key(node),
+        node_key(node),
         name_key(thread)
     ))
 }
@@ -241,6 +262,17 @@ mod tests {
         assert_eq!(
             path,
             Path::new("/state/nexus/tui-boss-8080-proxmox-2-th-1.json")
+        );
+        // The node segment is injective: `user@host` must not collapse
+        // onto `user-host` (one pairing would overwrite the other).
+        let at_host = state_path(root, "http://boss:8080", "james@vps", "th-1");
+        assert_eq!(
+            at_host,
+            Path::new("/state/nexus/tui-boss-8080-james%40vps-th-1.json")
+        );
+        assert_ne!(
+            at_host,
+            state_path(root, "http://boss:8080", "james-vps", "th-1")
         );
     }
 
