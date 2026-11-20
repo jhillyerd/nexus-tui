@@ -301,7 +301,11 @@ pub const KEYBINDS: &[Keybind] = &[
     )
     .on(Platform::MacOnly),
     single(key::KILL_LINE.label, "Delete to end of line", Ctx::Editing).on(Platform::MacOnly),
-    single(key::KILL_LINE_START.label, "Delete to start of line", Ctx::Editing),
+    single(
+        key::KILL_LINE_START.label,
+        "Delete to start of line",
+        Ctx::Editing,
+    ),
     single(
         key::DELETE.label,
         "Delete character at cursor, or exit when empty",
