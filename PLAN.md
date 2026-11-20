@@ -22,11 +22,13 @@ plane) and `nexus/docs/plans/tui-pairing.md` (pairing, state file).
 5. **Serve the tool plane** (env role): execute `bash`, `read_file`,
    `write_file`, `list_dir` locally when `tools/call` arrives; answer
    `call_response`; honor `notifications/cancelled`. The `target` arg names
-   this node — rewrite to the local path and run. Local execution semantics
-   must match nexus's v1 floor: cwd + wall-clock timeout (`NEXUS_ENV_TIMEOUT_MS`),
-   kill-tree on cancel/timeout, byte caps enforced *while reading*
-   (`NEXUS_ENV_MAX_OUTPUT_BYTES`), lexical path confinement, non-zero exit is
-   data (`"exit status N\n" <> output`), over-cap kill returns Ok with an
+   this node — rewrite to the local path and run. No sandbox, no per-thread
+   directory: the TUI is the operator's own host (the watching human is the
+   control surface), so tools run in the launch directory and paths resolve
+   anywhere on it. Server-side floors still apply: wall-clock timeout
+   (`NEXUS_ENV_TIMEOUT_MS`), kill-tree on cancel/timeout, byte caps enforced
+   *while reading* (`NEXUS_ENV_MAX_OUTPUT_BYTES`), non-zero exit is data
+   (`"exit status N\n" <> output`), over-cap kill returns Ok with an
    omission note.
 6. **Exit codes**: 4 on WS 401 (credential rejected → re-pair if we hold a
    pairing URL), 2 on other connect failures.

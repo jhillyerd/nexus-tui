@@ -1,21 +1,22 @@
 //! The local tool plane (environments plan, the v1 floor): execute the
 //! four environment tools — `bash`, `read_file`, `write_file`,
-//! `list_dir` — in this node's own workspace.
+//! `list_dir` — on this host, in the node's working directory.
 //!
 //! A `tools/call` arrived HERE because the server routed it to this
 //! node, so the arguments' `target` names this node; [`serve_call`]
 //! validates it and runs the local path — the node-side twin of the
-//! server's remote dispatch, matching the server's own workspace
-//! executor semantics:
+//! server's remote dispatch. The node runs on the operator's host with
+//! NO sandbox (the watching human is the control surface):
 //!
-//! - cwd default (the workspace directory), stdin on the null device
+//! - cwd default (the directory the TUI launched in), stdin on the
+//!   null device
 //! - per-call wall-clock timeout (`NEXUS_ENV_TIMEOUT_MS`, floor 1000)
 //! - kill-tree on cancel/timeout (process group + `killpg`; `taskkill
 //!   /T` elsewhere)
 //! - byte caps enforced WHILE READING (`NEXUS_ENV_MAX_OUTPUT_BYTES`,
 //!   floor 1024) — post-hoc truncation does not bound memory
-//! - lexical path confinement for the fs tools (symlinks are NOT
-//!   resolved — hygiene, not a security boundary)
+//! - fs paths resolve against the working directory; absolute paths
+//!   land where they point on the host
 //! - a bash non-zero exit status is DATA (`"exit status N\n" + output`)
 //! - an over-cap kill answers Ok with the capped output plus an
 //!   omission note; timeout and cancel remain errors carrying partial
@@ -66,81 +67,18 @@ const INVALID_WRITE_FILE_ARGS: &str =
 const INVALID_LIST_DIR_ARGS: &str = "invalid list_dir arguments: {\"target\", \"path\"}";
 
 // ---------------------------------------------------------------------------
-// The workspace handle
+// Path resolution
 // ---------------------------------------------------------------------------
 
-/// The node's local workspace: a per-thread directory under a root, the
-/// same shape the server freezes for its own workspace
-/// (`<root>/<thread id>`).
-#[derive(Debug, Clone)]
-pub struct Workspace {
-    root: PathBuf,
-    thread_id: String,
-}
-
-impl Workspace {
-    pub fn new(root: impl Into<PathBuf>, thread_id: impl Into<String>) -> Self {
-        Self {
-            root: root.into(),
-            thread_id: thread_id.into(),
-        }
-    }
-
-    /// `<root>/<thread id>` — the working directory every tool runs in.
-    pub fn dir(&self) -> PathBuf {
-        self.root.join(&self.thread_id)
-    }
-
-    /// Create the workspace directory (idempotent) — called before
-    /// every tool execution, the lazy-create rule.
-    fn ensure(&self) -> Result<(), String> {
-        fs::create_dir_all(self.dir()).map_err(|e| format!("workspace unavailable: {e}"))
-    }
-
-    /// Resolve `user_path` against the workspace directory and refuse
-    /// escapes: `..` segments fold LEXICALLY, absolute paths must
-    /// already live inside the workspace, and the normalized result
-    /// must be the workspace dir or under it. Symlinks are NOT
-    /// resolved (the accepted v1 posture).
-    fn confined(&self, user_path: &str) -> Result<PathBuf, String> {
-        let dir = normalize(&self.dir().to_string_lossy());
-        let joined = if user_path.starts_with('/') {
-            user_path.to_owned()
-        } else {
-            format!("{dir}/{user_path}")
-        };
-        let normalized = normalize(&joined);
-        if normalized == dir || normalized.starts_with(&format!("{dir}/")) {
-            Ok(PathBuf::from(normalized))
-        } else {
-            Err(format!("path escapes the workspace: {user_path}"))
-        }
-    }
-}
-
-/// Lexical normalization: split on '/', fold '.' and '' away, pop on
-/// '..' (never above the root), keep the leading '/' for absolute
-/// paths. The workspace dir itself never contains '..' segments (the
-/// root is operator config, the id registry-minted), so the fold is
-/// stable. '/'-based by construction — the same lexical rule the
-/// server applies.
-fn normalize(path: &str) -> String {
-    let absolute = path.starts_with('/');
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
-        }
-    }
-    let folded = segments.join("/");
-    if absolute {
-        format!("/{folded}")
+/// Resolve a tool path against the working directory; absolute paths
+/// pass through untouched. No confinement: this node executes on the
+/// operator's host wherever the work lives.
+fn resolve(cwd: &Path, user_path: &str) -> PathBuf {
+    let path = Path::new(user_path);
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        folded
+        cwd.join(path)
     }
 }
 
@@ -191,7 +129,7 @@ fn clamp_knob(raw: Option<&str>, default: u64, floor: u64) -> u64 {
 /// `isError:true` response carrying the message. Unknown tool names
 /// refuse: a node serves the four compiled env tools only.
 pub async fn serve_call(
-    workspace: &Workspace,
+    cwd: &Path,
     tool: &str,
     arguments: &Value,
     timeout_ms: u64,
@@ -207,21 +145,12 @@ pub async fn serve_call(
             if args.command.trim().is_empty() {
                 return Err("bash requires a non-empty `command`".to_owned());
             }
-            bash_local(
-                workspace,
-                &args.command,
-                timeout_ms,
-                max_output_bytes,
-                cancel,
-            )
-            .await
+            bash_local(cwd, &args.command, timeout_ms, max_output_bytes, cancel).await
         }
         "read_file" => {
             let args: PathArgs = parse(arguments, INVALID_READ_FILE_ARGS)?;
             require_target(&args.target, "read_file")?;
-            workspace.ensure()?;
-            let path = workspace.confined(&args.path)?;
-            read_file_local(&args.path, &path, max_output_bytes)
+            read_file_local(&args.path, &resolve(cwd, &args.path), max_output_bytes)
         }
         "write_file" => {
             let args: WriteArgs = parse(arguments, INVALID_WRITE_FILE_ARGS)?;
@@ -229,16 +158,12 @@ pub async fn serve_call(
             if args.path.trim().is_empty() {
                 return Err("write_file requires a non-empty `path`".to_owned());
             }
-            workspace.ensure()?;
-            let path = workspace.confined(&args.path)?;
-            write_file_local(&args.path, &path, &args.content)
+            write_file_local(&args.path, &resolve(cwd, &args.path), &args.content)
         }
         "list_dir" => {
             let args: PathArgs = parse(arguments, INVALID_LIST_DIR_ARGS)?;
             require_target(&args.target, "list_dir")?;
-            workspace.ensure()?;
-            let path = workspace.confined(&args.path)?;
-            list_dir_local(&args.path, &path)
+            list_dir_local(&args.path, &resolve(cwd, &args.path))
         }
         _ => Err(format!("this node does not serve the tool \"{tool}\"")),
     }
@@ -283,21 +208,29 @@ struct WriteArgs {
 // bash: capped streaming with kill-tree
 // ---------------------------------------------------------------------------
 
-/// Run one bash command in the workspace directory. stdout and stderr
+/// Run one bash command in the working directory. stdout and stderr
 /// are merged into one stream (the port behavior the server renders);
 /// the accumulated output is cap-checked per chunk; the process tree
 /// dies on cancel, timeout, and over-cap.
 async fn bash_local(
-    workspace: &Workspace,
+    cwd: &Path,
     command: &str,
     timeout_ms: u64,
     max_output_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
-    workspace.ensure()?;
+    // The working directory must exist (boot captures it from
+    // `current_dir()`); a vanished dir surfaces here, not as a
+    // misleading "no bash on PATH" from the spawn's NotFound.
+    if !cwd.is_dir() {
+        return Err(format!(
+            "bash: working directory unavailable: {}",
+            cwd.display()
+        ));
+    }
     // The std Command carries the unix prelude (process group + the
     // dup2 merge); tokio wraps it for the async read and reaping.
-    let std_command = build_bash(command, workspace).map_err(|e| format!("bash: {e}"))?;
+    let std_command = build_bash(command, cwd).map_err(|e| format!("bash: {e}"))?;
     let mut spawned = tokio::process::Command::from(std_command);
     // The executor task owning the child can be dropped mid-flight
     // (reconnect cleanup) — the child must not outlive it.
@@ -381,14 +314,14 @@ async fn collect_stderr(output: &mut Output, task: Option<tokio::task::JoinHandl
 }
 
 #[cfg(unix)]
-fn build_bash(command_line: &str, workspace: &Workspace) -> std::io::Result<Command> {
+fn build_bash(command_line: &str, cwd: &Path) -> std::io::Result<Command> {
     use std::os::unix::process::CommandExt;
 
     let mut command = Command::new("bash");
     command
         .arg("-c")
         .arg(command_line)
-        .current_dir(workspace.dir())
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -410,12 +343,12 @@ fn build_bash(command_line: &str, workspace: &Workspace) -> std::io::Result<Comm
 }
 
 #[cfg(not(unix))]
-fn build_bash(command_line: &str, workspace: &Workspace) -> std::io::Result<Command> {
+fn build_bash(command_line: &str, cwd: &Path) -> std::io::Result<Command> {
     let mut command = Command::new("bash");
     command
         .arg("-c")
         .arg(command_line)
-        .current_dir(workspace.dir())
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -632,12 +565,12 @@ impl Streams {
 // The fs tools
 // ---------------------------------------------------------------------------
 
-/// Read a workspace file, capped WHILE READING. Non-UTF-8 bytes are
+/// Read a host file, capped WHILE READING. Non-UTF-8 bytes are
 /// decoded lossily (never a crash on binary content).
 fn read_file_local(display: &str, path: &Path, max_output_bytes: usize) -> Result<String, String> {
-    // REGULAR FILES ONLY: a workspace FIFO or device node would block
-    // the read indefinitely — `bash` can create either inside the
-    // workspace, so the guard is not hypothetical. Unreadable and
+    // REGULAR FILES ONLY: a FIFO or device node would block
+    // the read indefinitely — `bash` can create either anywhere on
+    // the host, so the guard is not hypothetical. Unreadable and
     // nonexistent paths fall through to the open, which answers its
     // own honest error.
     match fs::metadata(path) {
@@ -668,7 +601,7 @@ fn read_file_local(display: &str, path: &Path, max_output_bytes: usize) -> Resul
     }
 }
 
-/// Write a workspace file (whole-content replace), creating parent
+/// Write a host file (whole-content replace), creating parent
 /// directories as needed.
 fn write_file_local(display: &str, path: &Path, content: &str) -> Result<String, String> {
     // An EXISTING non-regular target (a FIFO `bash` made) would block
@@ -691,7 +624,7 @@ fn write_file_local(display: &str, path: &Path, content: &str) -> Result<String,
 /// `list_dir_entry_cap`).
 const LIST_DIR_ENTRY_CAP: usize = 500;
 
-/// List a workspace directory: sorted entries, directories suffixed
+/// List a directory: sorted entries, directories suffixed
 /// '/', capped entries with an omission note.
 fn list_dir_local(display: &str, path: &Path) -> Result<String, String> {
     if !path.is_dir() {
@@ -732,21 +665,13 @@ fn list_dir_local(display: &str, path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_case::test_case;
 
     const SHORT_TIMEOUT_MS: u64 = 800;
     const SHORT_CAP: usize = 1024;
 
-    fn workspace(dir: &std::path::Path) -> Workspace {
-        let ws = Workspace::new(dir, "thread-1");
-        // Tests stage files before the first call creates the dir.
-        std::fs::create_dir_all(ws.dir()).unwrap();
-        ws
-    }
-
-    async fn call(ws: &Workspace, tool: &str, arguments: Value) -> Result<String, String> {
+    async fn call(dir: &Path, tool: &str, arguments: Value) -> Result<String, String> {
         serve_call(
-            ws,
+            dir,
             tool,
             &arguments,
             SHORT_TIMEOUT_MS,
@@ -765,21 +690,19 @@ mod tests {
     // ---------------------------------------------------------
 
     #[tokio::test]
-    async fn bash_runs_in_workspace_and_captures_stdout() {
+    async fn bash_runs_in_working_directory_and_captures_stdout() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "bash", bash("pwd")).await,
-            Ok(ws.dir().to_string_lossy().into_owned())
+            call(dir.path(), "bash", bash("pwd")).await,
+            Ok(dir.path().to_string_lossy().into_owned())
         );
     }
 
     #[tokio::test]
     async fn bash_merges_stderr_into_the_stream() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "bash", bash("echo to-err 1>&2")).await,
+            call(dir.path(), "bash", bash("echo to-err 1>&2")).await,
             Ok("to-err".to_owned())
         );
     }
@@ -787,9 +710,8 @@ mod tests {
     #[tokio::test]
     async fn bash_non_zero_exit_status_is_data() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "bash", bash("echo out; exit 1")).await,
+            call(dir.path(), "bash", bash("echo out; exit 1")).await,
             Ok("exit status 1\nout".to_owned())
         );
     }
@@ -797,9 +719,8 @@ mod tests {
     #[tokio::test]
     async fn bash_empty_output_renders_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "bash", bash("true")).await,
+            call(dir.path(), "bash", bash("true")).await,
             Ok("(no output)".to_owned())
         );
     }
@@ -807,8 +728,7 @@ mod tests {
     #[tokio::test]
     async fn bash_over_cap_kill_answers_ok_with_omission_note() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
-        let result = call(&ws, "bash", bash("yes")).await.unwrap();
+        let result = call(dir.path(), "bash", bash("yes")).await.unwrap();
         // The rendered answer carries BOTH notes, like the server's:
         // render_output truncates (its note) and the over-cap kill adds
         // the omission note.
@@ -825,9 +745,8 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_is_error_carrying_partial_output() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         let arguments = bash("echo early; sleep 30");
-        let result = call(&ws, "bash", arguments).await;
+        let result = call(dir.path(), "bash", arguments).await;
         assert_eq!(
             result,
             Err(format!(
@@ -839,10 +758,9 @@ mod tests {
     #[tokio::test]
     async fn bash_cancel_is_error_carrying_partial_output() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let result = serve_call(&ws, "bash", &bash("sleep 30"), 30_000, SHORT_CAP, &cancel).await;
+        let result = serve_call(dir.path(), "bash", &bash("sleep 30"), 30_000, SHORT_CAP, &cancel).await;
         assert_eq!(
             result,
             Err("cancelled. partial output:\n(no output)".to_owned())
@@ -857,22 +775,20 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills_the_whole_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         let command = "touch started; sleep 2 && touch done";
-        let result = call(&ws, "bash", bash(command)).await;
+        let result = call(dir.path(), "bash", bash(command)).await;
         assert!(result.is_err());
         tokio::time::sleep(Duration::from_millis(2_500)).await;
-        assert!(ws.dir().join("started").exists());
-        assert!(!ws.dir().join("done").exists());
+        assert!(dir.path().join("started").exists());
+        assert!(!dir.path().join("done").exists());
     }
 
     #[tokio::test]
     async fn bash_argument_refusals_word_like_the_server() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "bash",
                 serde_json::json!({"target": "   ", "command": "ls"})
             )
@@ -880,12 +796,12 @@ mod tests {
             Err("bash requires a non-empty `target`".to_owned())
         );
         assert_eq!(
-            call(&ws, "bash", serde_json::json!({"command": "ls"})).await,
+            call(dir.path(), "bash", serde_json::json!({"command": "ls"})).await,
             Err("invalid bash arguments: {\"target\", \"command\"}".to_owned())
         );
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "bash",
                 serde_json::json!({"target": "me", "command": "   "})
             )
@@ -893,50 +809,22 @@ mod tests {
             Err("bash requires a non-empty `command`".to_owned())
         );
         assert_eq!(
-            call(&ws, "bash", serde_json::json!({"target": 4})).await,
+            call(dir.path(), "bash", serde_json::json!({"target": 4})).await,
             Err("invalid bash arguments: {\"target\", \"command\"}".to_owned())
         );
     }
 
     // ---------------------------------------------------------
-    // Path confinement
+    // Path resolution
     // ---------------------------------------------------------
 
     #[test]
-    fn confined_resolves_relative_and_inner_absolute_paths() {
+    fn resolve_joins_relative_and_passes_absolute_through() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
-        let inner = dir.path().join("thread-1").join("sub");
-        assert_eq!(
-            ws.confined("sub/notes.txt").unwrap(),
-            inner.join("notes.txt")
-        );
-        let absolute = inner.join("notes.txt").to_string_lossy().into_owned();
-        assert_eq!(ws.confined(&absolute).unwrap(), PathBuf::from(absolute));
-        assert_eq!(
-            ws.confined("./sub/../root.txt").unwrap(),
-            ws.dir().join("root.txt")
-        );
-    }
-
-    #[test_case("../outside.txt"; "parent escape")]
-    #[test_case("sub/../../outside.txt"; "deep escape")]
-    #[test_case("/etc/passwd"; "absolute outside")]
-    fn confined_refuses_escapes(user_path: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
-        assert_eq!(
-            ws.confined(user_path),
-            Err(format!("path escapes the workspace: {user_path}"))
-        );
-    }
-
-    #[test]
-    fn normalize_folds_lexically_like_the_server() {
-        assert_eq!(normalize("/a/./b//c"), "/a/b/c");
-        assert_eq!(normalize("/a/../b"), "/b");
-        assert_eq!(normalize("/.."), "/");
-        assert_eq!(normalize("a/b/.."), "a");
+        assert_eq!(resolve(dir.path(), "sub/notes.txt"), dir.path().join("sub/notes.txt"));
+        assert_eq!(resolve(dir.path(), "./sub/../root.txt"), dir.path().join("./sub/../root.txt"));
+        let absolute = dir.path().join("elsewhere.txt");
+        assert_eq!(resolve(dir.path(), absolute.to_str().unwrap()), absolute);
     }
 
     // ---------------------------------------------------------
@@ -944,31 +832,44 @@ mod tests {
     // ---------------------------------------------------------
 
     #[tokio::test]
-    async fn read_file_reads_and_refuses_escapes() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
-        fs::write(ws.dir().join("notes.txt"), "hello").unwrap();
+    async fn read_file_resolves_relative_parent_and_absolute_paths() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(parent.path()).unwrap();
+        fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        let sibling = parent.path().join("outside.txt");
+        fs::write(&sibling, "outside").unwrap();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "notes.txt"})
             )
             .await,
             Ok("hello".to_owned())
         );
+        // `..` resolves natively — the host is the workspace, no fence.
+        let sibling_name = sibling.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
-                serde_json::json!({"target": "workspace", "path": "../etc/passwd"})
+                serde_json::json!({"target": "workspace", "path": format!("../{sibling_name}")})
             )
             .await,
-            Err("path escapes the workspace: ../etc/passwd".to_owned())
+            Ok("outside".to_owned())
+        );
+        assert_eq!(
+            call(
+                dir.path(),
+                "read_file",
+                serde_json::json!({"target": "workspace", "path": sibling.to_string_lossy()})
+            )
+            .await,
+            Ok("outside".to_owned())
         );
         assert!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "missing.txt"})
             )
@@ -981,16 +882,15 @@ mod tests {
     #[tokio::test]
     async fn read_file_truncates_at_cap_with_note() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         let content = "a".repeat(SHORT_CAP + 100);
-        fs::write(ws.dir().join("big.txt"), &content).unwrap();
+        fs::write(dir.path().join("big.txt"), &content).unwrap();
         let expected = format!(
             "{}\n[... truncated at {SHORT_CAP} bytes ...]",
             "a".repeat(SHORT_CAP)
         );
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "big.txt"})
             )
@@ -1003,11 +903,10 @@ mod tests {
     #[tokio::test]
     async fn read_file_refuses_directories_and_non_regular_files() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
-        fs::create_dir(ws.dir().join("subdir")).unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "subdir"})
             )
@@ -1015,12 +914,12 @@ mod tests {
             Err("read_file: not a regular file: subdir".to_owned())
         );
         std::process::Command::new("mkfifo")
-            .arg(ws.dir().join("pipe"))
+            .arg(dir.path().join("pipe"))
             .status()
             .unwrap();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "pipe"})
             )
@@ -1029,22 +928,20 @@ mod tests {
         );
     }
 
-    /// Lexical confinement does NOT resolve symlinks (the recorded v1
-    /// posture): a link inside the workspace pointing out reads the
-    /// outside file — hygiene, not a security boundary.
+    /// Symlinks resolve like any host path — the OS follows them; the
+    /// node puts no fence in the way.
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_file_through_symlink_stays_lexical() {
+    async fn read_file_follows_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret.txt"), "outside").unwrap();
-        let ws = workspace(dir.path());
         #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), ws.dir().join("link.txt"))
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("link.txt"))
             .unwrap();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "read_file",
                 serde_json::json!({"target": "workspace", "path": "link.txt"})
             )
@@ -1060,25 +957,24 @@ mod tests {
     #[tokio::test]
     async fn write_file_creates_parents_and_reports_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         let content = "ping";
         assert_eq!(
-            call(&ws, "write_file", serde_json::json!({"target": "workspace", "path": "deep/dir/f.txt", "content": content})).await,
+            call(dir.path(), "write_file", serde_json::json!({"target": "workspace", "path": "deep/dir/f.txt", "content": content})).await,
             Ok(format!("wrote {} bytes to deep/dir/f.txt", content.len()))
         );
         assert_eq!(
-            fs::read_to_string(ws.dir().join("deep/dir/f.txt")).unwrap(),
+            fs::read_to_string(dir.path().join("deep/dir/f.txt")).unwrap(),
             content
         );
     }
 
     #[tokio::test]
-    async fn write_file_refuses_empty_path_and_escapes() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
+    async fn write_file_refuses_empty_path_and_writes_through_parent() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(parent.path()).unwrap();
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "write_file",
                 serde_json::json!({"target": "workspace", "path": "  ", "content": "x"})
             )
@@ -1087,12 +983,16 @@ mod tests {
         );
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "write_file",
-                serde_json::json!({"target": "workspace", "path": "../x", "content": "x"})
+                serde_json::json!({"target": "workspace", "path": "../outside.txt", "content": "x"})
             )
             .await,
-            Err("path escapes the workspace: ../x".to_owned())
+            Ok("wrote 1 bytes to ../outside.txt".to_owned())
+        );
+        assert_eq!(
+            fs::read_to_string(parent.path().join("outside.txt")).unwrap(),
+            "x"
         );
     }
 
@@ -1103,21 +1003,20 @@ mod tests {
     #[tokio::test]
     async fn list_dir_sorts_suffixes_directories_and_reports_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "list_dir", serde_json::json!({"target": "workspace"})).await,
+            call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"})).await,
             Ok("(empty)".to_owned())
         );
-        fs::create_dir(ws.dir().join("zeta")).unwrap();
-        fs::write(ws.dir().join("alpha.txt"), "").unwrap();
-        fs::write(ws.dir().join("mid.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("zeta")).unwrap();
+        fs::write(dir.path().join("alpha.txt"), "").unwrap();
+        fs::write(dir.path().join("mid.txt"), "").unwrap();
         assert_eq!(
-            call(&ws, "list_dir", serde_json::json!({"target": "workspace"})).await,
+            call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"})).await,
             Ok("alpha.txt\nmid.txt\nzeta/".to_owned())
         );
         assert_eq!(
             call(
-                &ws,
+                dir.path(),
                 "list_dir",
                 serde_json::json!({"target": "workspace", "path": "missing"})
             )
@@ -1129,11 +1028,10 @@ mod tests {
     #[tokio::test]
     async fn list_dir_omits_past_entry_cap_with_note() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         for i in 0..LIST_DIR_ENTRY_CAP + 3 {
-            fs::write(ws.dir().join(format!("f{i:04}")), "").unwrap();
+            fs::write(dir.path().join(format!("f{i:04}")), "").unwrap();
         }
-        let result = call(&ws, "list_dir", serde_json::json!({"target": "workspace"}))
+        let result = call(dir.path(), "list_dir", serde_json::json!({"target": "workspace"}))
             .await
             .unwrap();
         assert!(result.contains("[... 3 more entries omitted ...]"));
@@ -1147,9 +1045,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_refuses_like_the_server() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = workspace(dir.path());
         assert_eq!(
-            call(&ws, "web_search", serde_json::json!({})).await,
+            call(dir.path(), "web_search", serde_json::json!({})).await,
             Err("this node does not serve the tool \"web_search\"".to_owned())
         );
     }
