@@ -168,8 +168,7 @@ pub enum Discovery {
         credential: Credential,
     },
     /// Several files carry the same node name; the caller lists them
-    /// and disambiguates with the pairing URL, `NEXUS_URL`, or
-    /// `NEXUS_THREAD`.
+    /// and disambiguates with `NEXUS_THREAD` or `NEXUS_URL`.
     Ambiguous(Vec<(PathBuf, Credential)>),
     /// No stored credential under the name (or under the narrowing).
     Missing,
@@ -179,6 +178,7 @@ pub enum Discovery {
 /// the matching server's file qualifies; with a thread given, only the
 /// matching thread's.
 pub fn discover(root: &Path, node: &str, server: Option<&str>, thread: Option<&str>) -> Discovery {
+    let normalized_server = server.map(|base| base.trim_end_matches('/'));
     let mut matches: Vec<(PathBuf, Credential)> = fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -192,7 +192,9 @@ pub fn discover(root: &Path, node: &str, server: Option<&str>, thread: Option<&s
             let credential = load(&path)?;
             (credential.node == node).then_some((path, credential))
         })
-        .filter(|(_, credential)| server.is_none_or(|base| credential.server == base))
+        .filter(|(_, credential)| {
+            normalized_server.is_none_or(|base| credential.server.trim_end_matches('/') == base)
+        })
         .filter(|(_, credential)| thread.is_none_or(|t| credential.thread == t))
         .collect();
     // Deterministic order: the launcher's glob is shell-sorted.
@@ -342,9 +344,33 @@ mod tests {
             discover(root.path(), "proxmox-2", Some("http://boss:8080"), None),
             Discovery::Found { .. }
         ));
-        // The thread narrows too (names are per-thread).
+        // Trailing slash in NEXUS_URL still matches the stored base.
         assert!(matches!(
-            discover(root.path(), "proxmox-2", None, Some("th-2")),
+            discover(root.path(), "proxmox-2", Some("http://boss:8080/"), None),
+            Discovery::Found { .. }
+        ));
+        // Two threads on the same server are ambiguous until thread narrows.
+        save(
+            root.path(),
+            &credential("proxmox-2", "http://boss:8080", "th-2"),
+        )
+        .unwrap();
+        assert!(matches!(
+            discover(root.path(), "proxmox-2", Some("http://boss:8080"), None),
+            Discovery::Ambiguous(_)
+        ));
+        assert!(matches!(
+            discover(
+                root.path(),
+                "proxmox-2",
+                Some("http://boss:8080"),
+                Some("th-2")
+            ),
+            Discovery::Found { credential, .. } if credential.thread == "th-2"
+        ));
+        // Unrelated thread never matches.
+        assert!(matches!(
+            discover(root.path(), "proxmox-2", None, Some("th-99")),
             Discovery::Missing
         ));
         // Unrelated names never match.

@@ -3217,6 +3217,8 @@ dependencies = [
  "maki-ui",
  "nexus",
  "rustix",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
